@@ -17,7 +17,7 @@ Kill Switch tests below exercise the real decorator, same discipline as
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Generator, Literal
 
@@ -249,12 +249,14 @@ def redis_client() -> Generator[RedisClient, None, None]:
     RedisClient._instance = None
 
 
-@pytest.fixture
-def agent(redis_client: RedisClient) -> AlphaMarketMakerAgent:
-    instance = AlphaMarketMakerAgent(
-        "BTC/USDT", exchange_id="fake", manage_own_signals=False, manage_own_redis=False,
+def _make_agent(redis_client: RedisClient, **kwargs: Any) -> AlphaMarketMakerAgent:
+    """Shared construction, real fakeredis + a real minimal broker -- used by the `agent` fixture and any test that needs non-default constructor args (e.g. max_daily_loss_usd)."""
+    defaults: dict[str, Any] = dict(
+        exchange_id="fake", manage_own_signals=False, manage_own_redis=False,
         max_inventory_units=Decimal("0.5"), quote_size_units=Decimal("0.01"),
     )
+    defaults.update(kwargs)
+    instance = AlphaMarketMakerAgent("BTC/USDT", **defaults)
     instance._redis_client = redis_client
     instance._publisher = _RecordingZmqPublisher()  # type: ignore[assignment]
     instance._settings.mock_mode = False
@@ -263,6 +265,11 @@ def agent(redis_client: RedisClient) -> AlphaMarketMakerAgent:
     # same discipline as tests/test_alert_agent.py's send_sms_alert-skips-when-unconfigured test.
     instance._notifier = TelegramNotifier(instance._settings.telegram)
     return instance
+
+
+@pytest.fixture
+def agent(redis_client: RedisClient) -> AlphaMarketMakerAgent:
+    return _make_agent(redis_client)
 
 
 def _redis(agent: AlphaMarketMakerAgent) -> RedisClient:
@@ -414,3 +421,100 @@ async def test_telemetry_is_published_every_cycle(agent: AlphaMarketMakerAgent) 
     telemetry = json.loads(raw)
     assert telemetry["status"] == "LIVE"
     assert telemetry["symbol"] == "BTC/USDT"
+
+
+# =============================================================================
+# Circuit breakers -- module docstring points 8/9/10
+# =============================================================================
+
+
+def test_order_rate_limit_allows_normal_quoting_rate(agent: AlphaMarketMakerAgent) -> None:
+    """Routine two-sided quoting (2 calls/cycle) must never trip this -- see module docstring point 8."""
+    agent._max_order_rate_count = 10
+    agent._max_order_rate_window_seconds = 10.0
+    for _ in range(6):  # 3 cycles worth, well under the threshold
+        assert agent._check_order_rate_limit() is True
+
+
+def test_order_rate_limit_trips_on_a_real_runaway_burst(agent: AlphaMarketMakerAgent) -> None:
+    agent._max_order_rate_count = 5
+    agent._max_order_rate_window_seconds = 10.0
+    results = [agent._check_order_rate_limit() for _ in range(8)]
+    assert results[:5] == [True, True, True, True, True]
+    assert results[5:] == [False, False, False]
+
+
+@pytest.mark.asyncio
+async def test_order_rate_limit_breach_forces_engine_off(agent: AlphaMarketMakerAgent) -> None:
+    agent._max_order_rate_count = 1
+    fake = _broker(agent)
+    await _seed_fresh_market_metrics(agent)
+
+    await agent._run_cycle()  # first requote: 2 real order placements, already over the count=1 cap
+
+    assert agent.control_state == AgentControlState.OFF
+
+
+def test_fat_finger_check_allows_normal_size(agent: AlphaMarketMakerAgent) -> None:
+    assert agent._check_fat_finger(Decimal("0.01")) is True
+
+
+def test_fat_finger_check_blocks_oversized_order(agent: AlphaMarketMakerAgent) -> None:
+    """max_single_order_units defaults to 2x max_inventory_units (0.5 here) -- see __init__'s own docstring."""
+    assert agent._max_single_order_units == Decimal("1.0")
+    assert agent._check_fat_finger(Decimal("1.5")) is False
+
+
+@pytest.mark.asyncio
+async def test_fat_finger_blocked_order_never_reaches_the_broker_and_forces_off(
+    agent: AlphaMarketMakerAgent,
+) -> None:
+    fake = _broker(agent)
+    await agent._place_resting_order("buy", Decimal("100"), Decimal("65000"))  # absurdly oversized
+    assert fake.limit_orders == []
+    assert agent.control_state == AgentControlState.OFF
+
+
+@pytest.mark.asyncio
+async def test_max_daily_loss_forces_engine_off(redis_client: RedisClient) -> None:
+    agent = _make_agent(redis_client, max_daily_loss_usd=Decimal("-50"))
+    agent._baseline_qty = Decimal(0)
+    agent._last_known_total_qty = Decimal("0.01")
+    agent._own_avg_entry_price = Decimal("70000")  # bought high
+
+    # A fill that closes the position at a much lower price -- a real, large realized loss.
+    await agent._record_fill(Decimal("-0.01"), fill_price=Decimal("60000"))
+
+    assert agent._daily_realized_pnl_usd == Decimal("-100")  # 0.01 * (60000 - 70000)
+    assert agent.control_state == AgentControlState.OFF
+
+
+@pytest.mark.asyncio
+async def test_daily_pnl_survives_below_threshold_engine_stays_live(redis_client: RedisClient) -> None:
+    agent = _make_agent(redis_client, max_daily_loss_usd=Decimal("-500"))
+    agent._baseline_qty = Decimal(0)
+    agent._last_known_total_qty = Decimal("0.01")
+    agent._own_avg_entry_price = Decimal("70000")
+
+    await agent._record_fill(Decimal("-0.01"), fill_price=Decimal("60000"))  # -$100, under the -$500 ceiling
+
+    assert agent._daily_realized_pnl_usd == Decimal("-100")
+    assert agent.control_state == AgentControlState.LIVE
+
+
+def test_daily_pnl_resets_on_a_new_calendar_day(agent: AlphaMarketMakerAgent) -> None:
+    agent._daily_realized_pnl_usd = Decimal("-42")
+    agent._daily_pnl_date = date(2020, 1, 1)  # a real past date, guaranteed different from "today"
+
+    agent._roll_over_daily_pnl_if_new_day()
+
+    assert agent._daily_realized_pnl_usd == Decimal(0)
+    assert agent._daily_pnl_date == datetime.now(timezone.utc).date()
+
+
+def test_trade_timestamps_deque_has_a_maxlen_backstop(agent: AlphaMarketMakerAgent) -> None:
+    assert agent._trade_timestamps.maxlen == 100_000
+
+
+def test_order_placement_timestamps_deque_has_a_maxlen_backstop(agent: AlphaMarketMakerAgent) -> None:
+    assert agent._order_placement_timestamps.maxlen == 10_000

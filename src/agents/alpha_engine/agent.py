@@ -111,6 +111,54 @@ entirely and fires an immediate real market order to flatten the excess
    ``client_fills``-based accounting (this engine has no B2B client to
    attribute a fill to -- see that module's own docstring).
 
+8. **"2-second cooldown between any two trades"** -- not implemented
+   literally, because a literal reading would break this engine's actual
+   job. A market maker is *supposed* to place two orders (bid + ask)
+   every single cycle -- that is continuous quoting, not a bug, and a
+   flat per-trade cooldown would silently turn this into a one-sided or
+   stale-quoting engine instead. What actually guards against a runaway
+   loop: (a) :meth:`_run_cycle` itself only runs once per
+   ``tick_interval_seconds`` and is fully serialized by
+   ``self._order_lock`` -- no code path can place orders faster than the
+   tick rate allows, regardless of what any signal/model logic computes;
+   (b) :meth:`_check_order_rate_limit`, a real circuit breaker on total
+   order-placement *count* in a rolling window (default: 10 per 10s --
+   generous vs. routine ~2/cycle, tight vs. hundreds/second), which self
+   halts (see point 9) the instant it is exceeded, catching the actual
+   failure mode described (a buggy model firing far faster than any
+   legitimate quoting rate) without capping legitimate two-sided quoting.
+
+9. **Fat-finger cap: real, but not at the broker/exchange-client layer.**
+   :meth:`~src.execution.broker_gateway.BaseBroker`/
+   :meth:`~src.agents.market_data.exchange_client.AsyncExchangeClient`
+   are shared infrastructure -- :mod:`~src.execution.smart_order_router`,
+   :class:`~src.agents.execution.agent.ExecutionAgent`, and
+   :class:`~src.agents.macro_order_execution.agent.
+   MacroOrderExecutionAgent` all place real orders through the exact
+   same classes, each with its own, already-real, already-tested risk
+   sizing (``RiskManager.check_exposure_limit``,
+   ``PortfolioRiskParityManager``, ...). Hardcoding one engine's BTC size
+   ceiling into that shared layer would silently cap every other real
+   caller's orders too, for a limit that has nothing to do with their
+   own risk policy. The real fat-finger guard instead lives in *this*
+   engine, immediately before every real order call it makes
+   (:meth:`_check_fat_finger`) -- the same "verify at the boundary
+   closest to where money actually leaves" principle the brief asked
+   for, applied at the boundary this engine actually owns.
+
+10. **Deques, not lists, with real ``maxlen`` backstops.**
+    :attr:`_trade_timestamps` and the new
+    :attr:`_order_placement_timestamps` are bounded
+    (``maxlen=100_000``/``10_000``) in addition to their own real,
+    primary time-window pruning -- the ``maxlen`` is a pure OOM backstop
+    for a pathological rate this engine's own circuit breaker
+    (point 8) should already have halted long before either bound is
+    ever reached. Checked, not assumed: this project's own multi-agent-
+    coordination audit already found no unbounded list anywhere in
+    :mod:`~src.agents.market_data.agent`/``exchange_client`` either (a
+    second, independent check specifically for this engine's request,
+    not re-derived from memory).
+
 **Kill-switch interaction**: every *routine* real order this engine
 places (a resting quote, the automatic inventory-limit hedge in
 :meth:`_hedge_excess_inventory`) goes through
@@ -181,8 +229,19 @@ _DEFAULT_MAX_INVENTORY_UNITS: Final[Decimal] = Decimal("0.5")
 _DEFAULT_QUOTE_SIZE_UNITS: Final[Decimal] = Decimal("0.01")
 _DEFAULT_HALF_SPREAD_BPS: Final[Decimal] = Decimal("5")
 _DEFAULT_INVENTORY_SKEW_BPS: Final[Decimal] = Decimal("15")
-_DEFAULT_MAX_MARKET_DATA_AGE_SECONDS: Final[float] = 3.0
+_DEFAULT_MAX_MARKET_DATA_AGE_SECONDS: Final[float] = 1.5
 _ONE_DAY_SECONDS: Final[float] = 86_400.0
+
+# Order-rate circuit breaker (module docstring point 8): the real "no more than N real order
+# placements in any rolling window" backstop against a runaway loop. Deliberately generous relative
+# to normal operation (2 orders/cycle at the default 1.0s tick_interval_seconds is ~120/minute --
+# routine, not a bug) so it never fires during healthy market making; it exists to catch hundreds of
+# placements in seconds, the actual "buys 1000 times in 3 seconds" failure mode.
+_DEFAULT_MAX_ORDER_RATE_COUNT: Final[int] = 10
+_DEFAULT_ORDER_RATE_WINDOW_SECONDS: Final[float] = 10.0
+
+_TRADE_TIMESTAMPS_MAXLEN: Final[int] = 100_000  # OOM backstop -- see module docstring point 10
+_ORDER_TIMESTAMPS_MAXLEN: Final[int] = 10_000
 
 
 # =============================================================================
@@ -277,6 +336,10 @@ class AlphaMarketMakerAgent(BaseAgent):
         half_spread_bps: Decimal = _DEFAULT_HALF_SPREAD_BPS,
         inventory_skew_bps: Decimal = _DEFAULT_INVENTORY_SKEW_BPS,
         max_market_data_age_seconds: float = _DEFAULT_MAX_MARKET_DATA_AGE_SECONDS,
+        max_order_rate_count: int = _DEFAULT_MAX_ORDER_RATE_COUNT,
+        max_order_rate_window_seconds: float = _DEFAULT_ORDER_RATE_WINDOW_SECONDS,
+        max_single_order_units: Decimal | None = None,
+        max_daily_loss_usd: Decimal | None = None,
         tick_interval_seconds: float = _DEFAULT_TICK_INTERVAL_SECONDS,
         settings: AppSettings | None = None,
         manage_own_signals: bool = True,
@@ -304,6 +367,23 @@ class AlphaMarketMakerAgent(BaseAgent):
         self._half_spread_bps = half_spread_bps
         self._inventory_skew_bps = inventory_skew_bps
         self._max_market_data_age_seconds = max_market_data_age_seconds
+        self._max_order_rate_count = max_order_rate_count
+        self._max_order_rate_window_seconds = max_order_rate_window_seconds
+        # Fat-finger ceiling (module docstring point 9). Defaults to a real, always-on multiple of
+        # the inventory cap rather than requiring the caller to remember to set it -- 2x is generous
+        # for a single legitimate order (a routine quote never exceeds quote_size_units; the largest
+        # legitimate single order is the hedge's excess, itself bounded by how far inventory can
+        # realistically drift past the cap in one tick), while still catching an order that is wrong
+        # by an order of magnitude, the actual "0.1 became 100" failure mode.
+        self._max_single_order_units = (
+            max_single_order_units if max_single_order_units is not None else max_inventory_units * 2
+        )
+        # None (the default) leaves this real capital-preservation guard OFF -- deliberately not a
+        # silently-applied hardcoded dollar figure baked into a shared class default (what counts as
+        # a sane daily loss ceiling depends entirely on real deployed capital, which this class has
+        # no way to know). scripts/run_alpha_engine.py's own --max-daily-loss-usd flag, and on_start's
+        # own startup warning below, exist specifically so this is never silently left disabled.
+        self._max_daily_loss_usd = max_daily_loss_usd
 
         self._broker: BaseBroker | None = None
         self._notifier: TelegramNotifier | None = None
@@ -315,10 +395,19 @@ class AlphaMarketMakerAgent(BaseAgent):
         self._last_known_total_qty = Decimal(0)
         self._own_avg_entry_price: Decimal | None = None
         self._session_realized_pnl_usd = Decimal(0)
-        self._trade_timestamps: deque[float] = deque()
+        # Real, current UTC calendar day this ceiling is being tracked for -- reset in _record_fill
+        # the instant the real wall-clock date rolls over, independent of how long the process has
+        # been running (session PnL above never resets; this deliberately does, to match
+        # MAX_DAILY_LOSS_USD's own literal meaning, and src/execution/eod_reconciliator.py's existing
+        # UTC-midnight day-boundary convention elsewhere in this project).
+        self._daily_realized_pnl_usd = Decimal(0)
+        self._daily_pnl_date = datetime.now(timezone.utc).date()
+        self._trade_timestamps: deque[float] = deque(maxlen=_TRADE_TIMESTAMPS_MAXLEN)
+        self._order_placement_timestamps: deque[float] = deque(maxlen=_ORDER_TIMESTAMPS_MAXLEN)
 
         self._stale_data_notified = False
         self._inventory_breach_notified = False
+        self._fat_finger_notified = False
         self._emergency_listener_task: asyncio.Task[None] | None = None
 
     # -- Lifecycle ---------------------------------------------------------
@@ -351,19 +440,32 @@ class AlphaMarketMakerAgent(BaseAgent):
 
         self._emergency_listener_task = asyncio.create_task(self._listen_for_emergency_liquidate())
 
+        if self._max_daily_loss_usd is None and not self._settings.mock_mode:
+            # Real, loud, impossible-to-miss: a real capital-preservation guard left off is worth
+            # more than a debug-level log line -- see max_daily_loss_usd's own docstring in __init__.
+            self._log.critical(
+                "alpha_engine_no_daily_loss_limit_configured",
+                agent_id=self.agent_id,
+                detail="MAX_DAILY_LOSS_USD not set -- this engine will NOT self-halt on any drawdown. "
+                "Set --max-daily-loss-usd (scripts/run_alpha_engine.py) before running with real capital.",
+            )
+
         self._log.info(
             "alpha_engine_started",
             agent_id=self.agent_id,
             symbol=self._symbol,
             exchange_id=self._exchange_id,
             max_inventory_units=str(self._max_inventory_units),
+            max_single_order_units=str(self._max_single_order_units),
+            max_daily_loss_usd=str(self._max_daily_loss_usd) if self._max_daily_loss_usd is not None else None,
             baseline_qty=str(self._baseline_qty),
             mock_mode=self._settings.mock_mode,
         )
         await self._notifier.send(
             f"Alpha Engine démarré -- {self._symbol} sur {self._exchange_id}. "
-            f"Plafond d'inventaire : {self._max_inventory_units}. Mode : "
-            f"{'SIMULÉ (MOCK_MODE)' if self._settings.mock_mode else 'RÉEL'}.",
+            f"Plafond d'inventaire : {self._max_inventory_units}. "
+            f"Perte max/jour : {self._max_daily_loss_usd if self._max_daily_loss_usd is not None else 'NON CONFIGURÉE ⚠️'}. "
+            f"Mode : {'SIMULÉ (MOCK_MODE)' if self._settings.mock_mode else 'RÉEL'}.",
             severity=AlertSeverity.INFO, source=self.agent_id,
         )
 
@@ -515,6 +617,8 @@ class AlphaMarketMakerAgent(BaseAgent):
         )
         self._own_avg_entry_price = new_avg_entry_price
         self._session_realized_pnl_usd += realized_delta
+        self._roll_over_daily_pnl_if_new_day()
+        self._daily_realized_pnl_usd += realized_delta
         self._trade_timestamps.append(time.time())
         self._prune_old_trade_timestamps()
 
@@ -522,6 +626,7 @@ class AlphaMarketMakerAgent(BaseAgent):
             "alpha_engine_fill_detected", agent_id=self.agent_id, fill_qty=str(fill_qty), fill_price=str(fill_price),
             new_own_qty=str(new_qty), realized_pnl_delta_usd=str(realized_delta),
             session_realized_pnl_usd=str(self._session_realized_pnl_usd),
+            daily_realized_pnl_usd=str(self._daily_realized_pnl_usd),
         )
         await self._publish_audit_event(
             event_type="EXECUTED", order_id=f"alpha-fill-{uuid.uuid4()}",
@@ -531,10 +636,118 @@ class AlphaMarketMakerAgent(BaseAgent):
             ),
         )
 
+        if self._max_daily_loss_usd is not None and self._daily_realized_pnl_usd <= self._max_daily_loss_usd:
+            await self._force_off(
+                "alpha_engine_max_daily_loss_hit",
+                notify_message=(
+                    f"🆘 PERTE MAX/JOUR ATTEINTE pour {self._symbol} : PnL réalisé du jour "
+                    f"{self._daily_realized_pnl_usd} $ <= seuil {self._max_daily_loss_usd} $. ARRÊT SYSTÈME "
+                    "IMMÉDIAT (moteur forcé sur OFF -- positions existantes NON liquidées automatiquement, "
+                    "voir Emergency Liquidate)."
+                ),
+                extra_log_fields={
+                    "daily_realized_pnl_usd": str(self._daily_realized_pnl_usd),
+                    "max_daily_loss_usd": str(self._max_daily_loss_usd),
+                },
+            )
+
+    def _roll_over_daily_pnl_if_new_day(self) -> None:
+        """Reset the daily PnL ceiling's own counter the instant the real UTC calendar date rolls over."""
+        today = datetime.now(timezone.utc).date()
+        if today != self._daily_pnl_date:
+            self._log.info(
+                "alpha_engine_daily_pnl_rolled_over", agent_id=self.agent_id,
+                previous_date=str(self._daily_pnl_date), previous_daily_pnl_usd=str(self._daily_realized_pnl_usd),
+            )
+            self._daily_pnl_date = today
+            self._daily_realized_pnl_usd = Decimal(0)
+
     def _prune_old_trade_timestamps(self) -> None:
         cutoff = time.time() - _ONE_DAY_SECONDS
         while self._trade_timestamps and self._trade_timestamps[0] < cutoff:
             self._trade_timestamps.popleft()
+
+    # -- Circuit breakers (module docstring points 8/9) ---------------------
+
+    def _check_order_rate_limit(self) -> bool:
+        """Real order-placement-rate circuit breaker. Records this attempt; returns ``False`` if the rolling window is exceeded.
+
+        Called from every *routine* real order path (a quote, the
+        automatic hedge) -- never from Emergency Liquidate, which is the
+        deliberate human-triggered break-glass exception to every
+        internal safety net this engine has, the same reasoning as the
+        Kill Switch bypass (see module docstring).
+        """
+        now = time.time()
+        self._order_placement_timestamps.append(now)
+        cutoff = now - self._max_order_rate_window_seconds
+        while self._order_placement_timestamps and self._order_placement_timestamps[0] < cutoff:
+            self._order_placement_timestamps.popleft()
+        return len(self._order_placement_timestamps) <= self._max_order_rate_count
+
+    async def _handle_order_rate_limit_breach(self) -> None:
+        await self._force_off(
+            "alpha_engine_order_rate_limit_breached",
+            notify_message=(
+                f"🆘 EMBALLEMENT DÉTECTÉ pour {self._symbol} : plus de {self._max_order_rate_count} ordres "
+                f"réels en {self._max_order_rate_window_seconds}s. ARRÊT SYSTÈME IMMÉDIAT -- intervention "
+                "manuelle requise avant réactivation."
+            ),
+            extra_log_fields={
+                "max_order_rate_count": self._max_order_rate_count,
+                "window_seconds": self._max_order_rate_window_seconds,
+            },
+        )
+
+    def _check_fat_finger(self, size: Decimal) -> bool:
+        """Real, always-on sanity ceiling on a single order's size, independent of whatever sizing logic computed it. See module docstring point 9."""
+        return size <= self._max_single_order_units
+
+    async def _handle_fat_finger_blocked(self, size: Decimal) -> None:
+        self._log.critical(
+            "alpha_engine_fat_finger_blocked", agent_id=self.agent_id,
+            requested_size=str(size), max_single_order_units=str(self._max_single_order_units),
+        )
+        if not self._fat_finger_notified:
+            self._fat_finger_notified = True
+            assert self._notifier is not None
+            await self._notifier.send(
+                f"🆘 FAT-FINGER BLOQUÉ pour {self._symbol} : taille demandée {size} dépasse le plafond "
+                f"absolu {self._max_single_order_units}. Ordre refusé, moteur forcé sur OFF -- ceci indique "
+                "probablement un bug réel de calcul de taille, pas juste une anomalie de marché.",
+                severity=AlertSeverity.CRITICAL, source=self.agent_id,
+            )
+        await self._force_off(
+            "alpha_engine_fat_finger_forced_off",
+            notify_message=None,  # already sent above -- avoid a duplicate alert
+            extra_log_fields={"requested_size": str(size)},
+        )
+
+    async def _force_off(
+        self, log_event: str, *, notify_message: str | None, extra_log_fields: dict[str, object] | None = None,
+    ) -> None:
+        """Shared real self-halt: persist + publish AgentControlState.OFF, log CRITICAL, alert.
+
+        Factors out the exact same "force OFF" sequence
+        :meth:`_execute_emergency_liquidate` already needed, now shared
+        by every circuit breaker that can trip this engine off by
+        itself (order-rate breach, fat-finger block, max daily loss).
+        Never touches open positions -- see
+        ``ALPHA_ENGINE_EMERGENCY_LIQUIDATE_CHANNEL_PREFIX``'s own
+        docstring in core/schemas.py on why OFF and "flatten now" are
+        two structurally distinct actions.
+        """
+        self._log.critical(log_event, agent_id=self.agent_id, **(extra_log_fields or {}))
+        if self._redis_client is not None:
+            await self._redis_client.execute(
+                "set", f"{AGENT_CONTROL_STATE_REDIS_KEY_PREFIX}{self.agent_id}", AgentControlState.OFF.value,
+            )
+            await self._redis_client.execute(
+                "publish", f"{AGENT_CONTROL_CHANNEL_PREFIX}{self.agent_id}", AgentControlState.OFF.value,
+            )
+        self._control_state = AgentControlState.OFF
+        if notify_message is not None and self._notifier is not None:
+            await self._notifier.send(notify_message, severity=AlertSeverity.CRITICAL, source=self.agent_id)
 
     # -- Quoting -----------------------------------------------------------
 
@@ -556,6 +769,12 @@ class AlphaMarketMakerAgent(BaseAgent):
 
     async def _place_resting_order(self, side: Literal["buy", "sell"], size: Decimal, price: Decimal) -> None:
         assert self._broker is not None
+        if not self._check_fat_finger(size):
+            await self._handle_fat_finger_blocked(size)
+            return
+        if not self._check_order_rate_limit():
+            await self._handle_order_rate_limit_breach()
+            return
         client_order_id = f"alpha-{side}-{uuid.uuid4()}"
         try:
             raw = await safe_financial_call(
@@ -602,6 +821,21 @@ class AlphaMarketMakerAgent(BaseAgent):
         excess = abs(own_inventory) - self._max_inventory_units
         side: Literal["buy", "sell"] = "sell" if own_inventory > 0 else "buy"
         assert self._broker is not None
+
+        # Both circuit breakers apply here too, deliberately -- see module docstring points 8/9. A
+        # hedge that keeps re-firing without ever bringing inventory back under the cap (an exchange
+        # issue, a bug in the excess computation, or a real fill racing this one) is exactly the
+        # "anti-hémorragie" scenario the rate limiter exists to catch, market orders' real fees
+        # included; an excess this large (>= max_single_order_units, itself 2x the inventory cap --
+        # i.e. real inventory would need to be 3x over cap) is a "something is very wrong, a human
+        # should look at this before more capital moves" signal, not a number to blindly market-sell.
+        if not self._check_fat_finger(excess):
+            await self._handle_fat_finger_blocked(excess)
+            return
+        if not self._check_order_rate_limit():
+            await self._handle_order_rate_limit_breach()
+            return
+
         client_order_id = f"alpha-hedge-{uuid.uuid4()}"
 
         self._log.critical(
@@ -756,18 +990,9 @@ class AlphaMarketMakerAgent(BaseAgent):
                         severity=AlertSeverity.CRITICAL, source=self.agent_id,
                     )
 
-        assert self._redis_client is not None
-        await self._redis_client.execute(
-            "set", f"{AGENT_CONTROL_STATE_REDIS_KEY_PREFIX}{self.agent_id}", AgentControlState.OFF.value,
-        )
-        await self._redis_client.execute(
-            "publish", f"{AGENT_CONTROL_CHANNEL_PREFIX}{self.agent_id}", AgentControlState.OFF.value,
-        )
-        self._control_state = AgentControlState.OFF
-
-        await self._notifier.send(
-            f"Emergency Liquidate exécuté pour {self._symbol}. Moteur forcé sur OFF.",
-            severity=AlertSeverity.CRITICAL, source=self.agent_id,
+        await self._force_off(
+            "alpha_engine_emergency_liquidate_completed",
+            notify_message=f"Emergency Liquidate exécuté pour {self._symbol}. Moteur forcé sur OFF.",
         )
 
     # -- Audit trail / telemetry ---------------------------------------------
@@ -808,6 +1033,9 @@ class AlphaMarketMakerAgent(BaseAgent):
             "max_inventory_units": str(self._max_inventory_units),
             "avg_entry_price": str(self._own_avg_entry_price) if self._own_avg_entry_price is not None else None,
             "session_realized_pnl_usd": str(self._session_realized_pnl_usd),
+            "daily_realized_pnl_usd": str(self._daily_realized_pnl_usd),
+            "max_daily_loss_usd": str(self._max_daily_loss_usd) if self._max_daily_loss_usd is not None else None,
+            "max_single_order_units": str(self._max_single_order_units),
             "trade_count_24h": len(self._trade_timestamps),
             "market_data_age_seconds": market_data_age_seconds,
             "updated_at": time.time(),

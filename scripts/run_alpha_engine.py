@@ -59,6 +59,29 @@ def _parse_args() -> argparse.Namespace:
         "--tick-interval", type=float, default=1.0,
         help="Seconds between cycles (default: 1.0 -- see AlphaMarketMakerAgent's module docstring point 5 on why not lower without colocation).",
     )
+    parser.add_argument(
+        "--max-order-rate-count", type=int, default=10,
+        help="Order-rate circuit breaker: max real order placements allowed per --max-order-rate-window-seconds (default: 10). See module docstring point 8.",
+    )
+    parser.add_argument(
+        "--max-order-rate-window-seconds", type=float, default=10.0,
+        help="Rolling window (seconds) the order-rate circuit breaker counts over (default: 10.0).",
+    )
+    parser.add_argument(
+        "--max-single-order-units", type=Decimal, default=None,
+        help="Fat-finger ceiling on any single real order, in base asset units (default: 2x --max-inventory). See module docstring point 9.",
+    )
+    parser.add_argument(
+        "--max-daily-loss-usd", type=Decimal, default=None,
+        help=(
+            "Real capital-preservation ceiling: self-halts (forces OFF) the instant today's realized "
+            "PnL drops to or below this (a negative number, e.g. -50). Left unset (the default), this "
+            "guard is OFF -- a loud CRITICAL log fires at startup if so with real capital in play. "
+            "There is no library-wide sane default: what counts as an acceptable daily loss depends "
+            "entirely on the real capital actually deployed, which this script has no way to know for "
+            "you. Set this explicitly before running with real capital."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -69,6 +92,10 @@ async def main() -> None:
     agent = AlphaMarketMakerAgent(
         args.symbol, exchange_id=args.exchange, max_inventory_units=args.max_inventory,
         quote_size_units=args.quote_size, tick_interval_seconds=args.tick_interval,
+        max_order_rate_count=args.max_order_rate_count,
+        max_order_rate_window_seconds=args.max_order_rate_window_seconds,
+        max_single_order_units=args.max_single_order_units,
+        max_daily_loss_usd=args.max_daily_loss_usd,
     )
     _log.info(
         "alpha_engine_launcher_starting", symbol=args.symbol, exchange=args.exchange,

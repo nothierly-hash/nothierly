@@ -152,6 +152,19 @@ else:
     col3.metric("PnL réalisé (session)", f"${float(pnl):,.2f}" if pnl is not None else "N/A")
     col4.metric("Trades (24h)", telemetry.get("trade_count_24h", "N/A"))
 
+    col5, col6, col7 = st.columns(3)
+    daily_pnl = telemetry.get("daily_realized_pnl_usd")
+    col5.metric("PnL réalisé (jour)", f"${float(daily_pnl):,.2f}" if daily_pnl is not None else "N/A")
+    max_daily_loss = telemetry.get("max_daily_loss_usd")
+    col6.metric("Plafond perte/jour", f"${float(max_daily_loss):,.2f}" if max_daily_loss is not None else "⚠️ NON CONFIGURÉ")
+    max_single_order = telemetry.get("max_single_order_units")
+    col7.metric("Plafond fat-finger", f"{max_single_order} {base_currency}" if max_single_order is not None else "N/A")
+    if max_daily_loss is None:
+        st.warning(
+            "⚠️ **Aucune limite de perte quotidienne configurée** -- ce moteur ne s'arrêtera jamais "
+            "automatiquement sur drawdown. Voir `--max-daily-loss-usd` dans `scripts/run_alpha_engine.py`."
+        )
+
     status = telemetry.get("status", "?")
     if status in ("STALE_DATA", "HEDGING"):
         status_badge_kind: Literal["SAFE", "PANIC", "PENDING"] = "PANIC"
