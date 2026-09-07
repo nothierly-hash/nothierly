@@ -475,6 +475,19 @@ CLIENT_ORDERS_TOPIC: Final[str] = "CLIENT_ORDERS"
 # tamper-evidence (not tamper-prevention) guarantee this actually provides.
 ORDER_AUDIT_EVENTS_TOPIC: Final[str] = "ORDER_AUDIT_EVENTS"
 
+# ZMQ Pub/Sub topic core.exception_manager broadcasts a fatal, unhandled exception's traceback onto
+# (event loop's own last-resort loop.set_exception_handler) or core.watchdog broadcasts a triggered
+# shutdown reason onto -- see both modules' own docstrings. **Deliberately NOT ORDER_AUDIT_EVENTS_TOPIC
+# above**: OrderAuditEvent's schema is order-lifecycle-shaped (a required order_id, a closed
+# event_type Literal of SUBMITTED/EXECUTED/REJECTED/CANCELLED) and CryptographicAuditLedger's real
+# hash chain is a compliance record for order events specifically -- a system-fatal exception is
+# neither an order event nor something that schema can honestly represent, so this gets its own topic
+# rather than a forced-fit `event_type`. **Real, disclosed gap**: no consumer/persister exists for
+# this topic yet (unlike ORDER_AUDIT_EVENTS_TOPIC's CryptographicAuditLedger) -- this is a real,
+# functional ZMQ broadcast any future subscriber can pick up, not yet chained into durable WORM
+# storage the way order events are.
+SYSTEM_FATAL_EXCEPTION_TOPIC: Final[str] = "SYSTEM_FATAL_EXCEPTION"
+
 # Redis STRING key prefix (+ order_id), real, short-TTL marker --
 # api_middleware/gateway.py's cancel_order route sets this the moment a
 # client really cancels an order; MacroOrderExecutionAgent checks it

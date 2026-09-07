@@ -202,40 +202,65 @@ services:
         condition: service_healthy
       nothierly-agents:
         condition: service_healthy
+    # Real, strict resource ceiling (crash-prevention Mission 3) -- honored by plain `docker compose up`
+    # on the modern Compose v2 CLI plugin (this file's own lack of a top-level `version:` key already
+    # marks it as a Compose Specification file, not a legacy `version: "3.x"` one) *without* Swarm; only
+    # legacy `docker-compose` (the old standalone Python v1 tool) silently ignores `deploy:` outside
+    # Swarm mode. core.watchdog.SystemWatchdog reads this exact 1 GiB figure back via the real cgroup
+    # v2/v1 files this limit produces (/sys/fs/cgroup/memory.max) -- see that module's own docstring on
+    # why psutil.virtual_memory() alone cannot see a cgroup limit at all.
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
     healthcheck:
-      # Same real heartbeat:{agent_id} liveness proxy as nothierly-agents' own healthcheck, scoped to
-      # this one engine's specific agent_id (see core/base_agent.py's _write_heartbeat) rather than "any
-      # agent's heartbeat exists" -- this container has exactly one agent to be healthy about.
-      test:
-        - "CMD"
-        - "python"
-        - "-c"
-        - "import redis,sys; r=redis.Redis(host='redis-broker',port=6379,password='${REDIS_PASSWORD}'); sys.exit(0 if r.get('heartbeat:alpha-engine-btc-usdt') else 1)"
+      # Real file-based liveness (crash-prevention Mission 3), written every healthy tick by
+      # core.watchdog.SystemWatchdog -- checked entirely inside this container's own filesystem, no
+      # volume mount needed. Deliberately replaces the previous Redis-based
+      # `heartbeat:alpha-engine-btc-usdt` check (kept working, but coupled this container's own health
+      # to Redis's availability too: if Redis blipped, THIS check would also report unhealthy even for
+      # a perfectly fine engine process, autoheal-restarting something that didn't need it) -- a stale
+      # local file now means exactly one thing: this specific process stopped ticking, which is what a
+      # container healthcheck should actually be answering. `find -mmin -1` = modified within the last
+      # 60s, comfortably above SystemWatchdog's own 10s check_interval_seconds default.
+      test: ["CMD-SHELL", "find /tmp/nothierly_heartbeat.txt -mmin -1 | grep -q . || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 5
       start_period: 30s
-    # restart: always (not unless-stopped, unlike every other service here) -- the brief's own explicit
-    # requirement for a 24/7 autonomous engine, and safe specifically because this engine's real safety
-    # state (AgentControlState LIVE/SHADOW/OFF -- the Master Toggle) lives in Redis, not in the process:
-    # `always` also restarts a container after a Docker daemon restart even if an operator had run
-    # `docker stop` on it deliberately (the one real behavioral difference from `unless-stopped`, which
-    # respects that manual stop across daemon restarts) -- but on_start() reads the persisted control
-    # state back from Redis before ever placing an order, so a restart resumes into whatever state an
-    # operator last set (including OFF), never defaults to trading just because the container came back.
-    restart: always
+    # restart: on-failure:5 (crash-prevention Mission 3's own explicit requirement) -- NOT `always`
+    # (this service's previous policy, see git history): a genuinely broken build should stop retrying
+    # after 5 consecutive failed attempts instead of crash-looping forever. Safe for the same reason
+    # `always` was: this engine's real safety state (AgentControlState LIVE/SHADOW/OFF) lives in Redis,
+    # not the process, so on_start() resumes into whatever an operator last set on every real restart.
+    # **Real, disclosed limit of this exact policy, not papered over**: Docker cannot distinguish "the
+    # code is genuinely broken" from "core.watchdog/core.exception_manager deliberately exited to
+    # protect capital during a transient Redis/RAM incident" -- both are a nonzero process exit to
+    # Compose. Five consecutive *legitimate* self-protective shutdowns (e.g. a flaky Redis host on a bad
+    # day) would exhaust this budget and leave the engine down exactly like five real crashes would.
+    # Compose's restart policy has no finer-grained signal than "exit code was nonzero" to work with --
+    # this is the real tradeoff `on-failure:5` makes, not a gap unique to this file. The `autoheal`
+    # label above still matters for the one failure mode neither Python-side layer can self-detect: a
+    # fully deadlocked event loop never runs core.watchdog's own task either, so it never exits on its
+    # own at all -- only the external healthcheck-driven restart below can recover that case.
+    restart: on-failure:5
 
   # The real, disclosed gap this closes: a `healthcheck:` block alone (see alpha-engine's above)
   # only makes `docker ps` report "unhealthy" -- plain Docker Compose does NOT itself restart a
-  # container just because its healthcheck starts failing, only on real process exit (which
-  # `restart: always` already reacts to). A genuine asyncio deadlock (the process still running,
-  # just no longer making progress -- core/base_agent.py's heartbeat write simply stops) would
-  # sit there marked "unhealthy" forever without this. `willfarrell/autoheal` is the standard,
-  # widely-used real answer for plain Docker/Compose (no Swarm/Kubernetes liveness probes here):
-  # it watches the Docker socket and force-kills any container Docker has marked unhealthy, which
-  # `restart: always` then genuinely restarts. Scoped to only the alpha-engine container via the
+  # container just because its healthcheck starts failing, only on real process exit. A genuine
+  # asyncio deadlock (the process still running, just no longer making progress -- core.watchdog's
+  # own task stops ticking along with everything else sharing that frozen event loop) would sit
+  # there marked "unhealthy" forever without this -- `alpha-engine`'s own `restart: on-failure:5`
+  # above only fires on a real process exit, which a true deadlock never produces on its own.
+  # `willfarrell/autoheal` is the standard, widely-used real answer for plain Docker/Compose (no
+  # Swarm/Kubernetes liveness probes here): it watches the Docker socket and force-restarts any
+  # container Docker has marked unhealthy. Scoped to only the alpha-engine container via the
   # `autoheal: "true"` label above + AUTOHEAL_CONTAINER_LABEL below -- nothierly-agents/-dashboard
-  # are untouched, not silently opted in.
+  # are untouched, not silently opted in. **Real, disclosed limit**: unlike `on-failure:5` above,
+  # autoheal's own restarts are not bounded by that retry count -- it keeps restarting on every
+  # unhealthy status it observes, indefinitely. A genuinely broken build that never recovers would
+  # still crash-loop forever via this path even though the Python-side restart budget is capped.
   autoheal:
     image: willfarrell/autoheal:latest
     container_name: nothierly-${CLIENT_ID:?Set CLIENT_ID}-autoheal
