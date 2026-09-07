@@ -29,6 +29,10 @@ from core.logger import get_logger
 _log = get_logger(__name__)
 
 _DEFAULT_MODEL_NAME: Final[str] = "ProsusAI/finbert"
+# Pinned so a future push to the model's `main` branch on the Hub can never
+# silently change the weights this process loads on next restart -- see
+# https://huggingface.co/api/models/ProsusAI/finbert for the current sha.
+_DEFAULT_MODEL_REVISION: Final[str] = "4556d13015211d73dccd3fdd39d39232506f3e43"
 _MAX_SEQUENCE_LENGTH: Final[int] = 512
 
 
@@ -53,22 +57,32 @@ class SentimentEngine:
     # event loop thread) would not protect against.
     _instance_lock: ClassVar[threading.Lock] = threading.Lock()
 
-    def __init__(self, model_name: str = _DEFAULT_MODEL_NAME) -> None:
+    def __init__(self, model_name: str = _DEFAULT_MODEL_NAME, revision: str | None = None) -> None:
         """Load the tokenizer and model. Expensive -- prefer :meth:`get_instance`.
 
         Args:
             model_name: HuggingFace Hub model identifier to load.
+            revision: Exact Hub commit sha to pin. Defaults to this
+                module's pinned FinBERT revision when ``model_name`` is
+                left at its default, so a push to that model's ``main``
+                branch can never silently change the weights this process
+                loads on next restart. Left unpinned (``None``) for any
+                other ``model_name``, since a hardcoded FinBERT sha has no
+                meaning for a different model -- pass one explicitly if
+                the caller needs the same protection there.
         """
+        if revision is None and model_name == _DEFAULT_MODEL_NAME:
+            revision = _DEFAULT_MODEL_REVISION
         self._model_name = model_name
         self._log = get_logger(f"{__name__}.{model_name}")
-        self._log.info("sentiment_engine_loading_model", model_name=model_name)
+        self._log.info("sentiment_engine_loading_model", model_name=model_name, revision=revision)
 
         # AutoTokenizer.from_pretrained is a dynamically-dispatched
         # classmethod that transformers' own type stubs don't fully
         # annotate (unlike AutoModelForSequenceClassification.from_pretrained,
         # just below, which mypy resolves fine).
-        self._tokenizer = AutoTokenizer.from_pretrained(model_name)  # type: ignore[no-untyped-call]
-        self._model = AutoModelForSequenceClassification.from_pretrained(model_name)
+        self._tokenizer = AutoTokenizer.from_pretrained(model_name, revision=revision)  # type: ignore[no-untyped-call]
+        self._model = AutoModelForSequenceClassification.from_pretrained(model_name, revision=revision)
         self._model.eval()
 
         num_labels: int = self._model.config.num_labels

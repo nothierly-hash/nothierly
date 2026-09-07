@@ -57,6 +57,7 @@ from types import TracebackType
 from typing import TYPE_CHECKING, Any, Final, Literal
 
 from core.config import AppSettings, get_settings
+from core.logger import get_logger
 from core.nothierly_ontology import AssetClass, MarginSnapshot, UniversalAsset, UniversalPosition
 from core.redis_client import RedisClient, RedisUnavailableError
 from core.schemas import OrderBookSnapshot
@@ -77,6 +78,8 @@ if TYPE_CHECKING:
 _IBKR_KNOWN_CRYPTO_BASES: Final[frozenset[str]] = frozenset({"BTC", "ETH", "LTC", "BCH"})
 from src.execution.data_normalizer import normalize_l2_update
 from src.execution.security_vault import SecurityVault
+
+_log = get_logger(__name__)
 
 OrderSide = Literal["buy", "sell"]
 
@@ -277,8 +280,20 @@ class CcxtBrokerAdapter(BaseBroker):
             pair_symbol = f"{asset_code}/USDT"
             try:
                 mark_price = await self._client.get_current_price(pair_symbol)
-            except Exception:
-                continue  # no real price reference for this asset against USDT -- skip, never fabricate one
+            except Exception as exc:
+                # No real price reference for this asset against USDT -- skip,
+                # never fabricate one. Logged at WARNING (not silently
+                # dropped): this position still holds real money and is
+                # about to vanish from every downstream exposure/risk view.
+                _log.warning(
+                    "broker_position_price_lookup_failed_position_omitted",
+                    broker_id=self.broker_id,
+                    asset_code=asset_code,
+                    pair_symbol=pair_symbol,
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
+                continue
             asset = UniversalAsset(
                 symbol=pair_symbol, asset_class=AssetClass.CRYPTO_SPOT, base_currency=asset_code, quote_currency="USDT",
                 tick_size=Decimal("0.01"), lot_size=Decimal("0.00000001"),
@@ -594,8 +609,13 @@ async def _resolve_ccxt_credentials(
                 record = json.loads(raw)
                 vault = SecurityVault(settings.vault.master_key.get_secret_value())
                 return vault.decrypt(record["api_key"]), vault.decrypt(record["api_secret"])
-            except Exception:  # noqa: BLE001 -- any decode/decrypt failure falls back, never crashes order flow
-                pass
+            except Exception as exc:  # noqa: BLE001 -- any decode/decrypt failure falls back, never crashes order flow
+                _log.warning(
+                    "broker_credential_override_decrypt_failed",
+                    exchange_id=exchange_id,
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
 
     if settings.broker.api_key.get_secret_value():
         return settings.broker.api_key.get_secret_value(), settings.broker.api_secret.get_secret_value()
