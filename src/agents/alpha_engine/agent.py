@@ -515,6 +515,14 @@ class AlphaMarketMakerAgent(BaseAgent):
         metrics, age_seconds = await self._read_fresh_market_metrics()
         if metrics is None:
             await self._cancel_all_resting_orders()
+            # Logged every cycle it's true (unlike the once-per-outage Telegram alert below): the
+            # only real record of every real stale-data cycle, for a post-run log analysis (see
+            # scripts/analyze_shadow_run.py) to count -- the Redis telemetry this also feeds is
+            # ephemeral (short TTL) and gone by the time anyone reads it after the fact.
+            self._log.warning(
+                "alpha_engine_stale_data_detected", agent_id=self.agent_id, symbol=self._symbol,
+                market_data_age_seconds=age_seconds, max_market_data_age_seconds=self._max_market_data_age_seconds,
+            )
             if not self._stale_data_notified:
                 self._stale_data_notified = True
                 assert self._notifier is not None
