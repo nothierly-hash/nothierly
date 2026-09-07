@@ -298,6 +298,7 @@ import zmq.asyncio
 from core.asset_universe import AssetUniverseEntry, get_asset_universe_entry, is_spread_acceptable
 from core.base_agent import AgentControlState, BaseAgent
 from core.config import AppSettings
+from core.exception_manager import install_global_exception_handler
 from core.logger import get_logger
 from core.nothierly_ontology import AssetClass, UniversalAsset
 from core.notifier import AlertSeverity, TelegramNotifier
@@ -314,6 +315,7 @@ from core.schemas import (
 )
 from core.security import FinancialCallAbortedError, KillSwitchActiveError, safe_financial_call
 from core.session_manager import MarketSessionManager
+from core.watchdog import SystemWatchdog
 from network.resilience_mesh import RateLimitMesh
 from src.execution.audit_ledger import OrderAuditEvent
 from src.execution.broker_gateway import BaseBroker, BrokerFactory
@@ -534,6 +536,7 @@ class AlphaMarketMakerAgent(BaseAgent):
         self._inventory_breach_notified = False
         self._fat_finger_notified = False
         self._emergency_listener_task: asyncio.Task[None] | None = None
+        self._watchdog: SystemWatchdog | None = None
 
     # -- Lifecycle ---------------------------------------------------------
 
@@ -596,6 +599,21 @@ class AlphaMarketMakerAgent(BaseAgent):
             f"Mode : {'SIMULÉ (MOCK_MODE)' if self._settings.mock_mode else 'RÉEL'}.",
             severity=AlertSeverity.INFO, source=self.agent_id,
         )
+
+        # ---- System-level crash prevention (core.exception_manager / core.watchdog). Wired here,
+        # inside on_start(), rather than left to whatever launcher script constructs this agent -- every
+        # real run of this engine gets this protection by construction, not only if a caller remembers
+        # to wire it. self._publisher always exists (set in BaseAgent.__init__, never None); redis is
+        # required above; the broker/exchange ping is real only when a real broker is connected.
+        install_global_exception_handler(
+            asyncio.get_running_loop(), self.cancel_all_orders_for_shutdown,
+            sender_id=self.agent_id, publisher=self._publisher, notifier=self._notifier,
+        )
+        self._watchdog = SystemWatchdog(
+            redis_client=self._redis_client, shutdown_callback=self.cancel_all_orders_for_shutdown,
+            exchange_ping=self.ping_exchange if self._broker is not None else None,
+        )
+        self._watchdog.start()
 
     async def _bootstrap_cold_start_sanitizer(self) -> None:
         """Real pre-flight cleanup before this engine ever trusts its own in-memory state. See module docstring point 11.
@@ -679,6 +697,9 @@ class AlphaMarketMakerAgent(BaseAgent):
             )
 
     async def on_shutdown(self) -> None:
+        if self._watchdog is not None:
+            await self._watchdog.stop()
+
         if self._emergency_listener_task is not None:
             self._emergency_listener_task.cancel()
             try:
@@ -1087,6 +1108,50 @@ class AlphaMarketMakerAgent(BaseAgent):
                     order_id=order_id, error=str(exc),
                 )
             self._resting_order_ids[side] = None
+
+    # -- System-level crash prevention (core.exception_manager / core.watchdog) --------------------
+
+    async def cancel_all_orders_for_shutdown(self) -> None:
+        """The real ``shutdown_callback`` for both :func:`~core.exception_manager.install_global_exception_handler` and :attr:`_watchdog`.
+
+        Deliberately narrower than :meth:`on_shutdown` (this engine's
+        normal, orderly stop): a fatal exception or a resource-exhaustion
+        event is exactly the situation where this process's own in-memory
+        bookkeeping (:attr:`_resting_order_ids`) might itself be
+        untrustworthy, so this calls the broker's real, comprehensive
+        :meth:`~src.execution.broker_gateway.BaseBroker.cancel_all_open_orders`
+        -- the same real API call :meth:`_bootstrap_cold_start_sanitizer`
+        already trusts for exactly this reason -- instead of only
+        cancelling what this engine happens to still think is resting.
+        Does **not** flatten any open position: that is Emergency
+        Liquidate's own, deliberately separate, human-triggered action
+        (see module docstring's "Kill-switch interaction" section) --
+        conflating the two here would silently turn every crash into a
+        forced market sell, which is not what either mission asked for.
+        A no-op under ``MOCK_MODE`` (no real broker ever connected).
+        """
+        if self._broker is None:
+            return
+        try:
+            await self._broker.cancel_all_open_orders(self._symbol)
+        except NotImplementedError:
+            self._log.warning(
+                "alpha_engine_shutdown_cancel_all_not_supported", agent_id=self.agent_id,
+                detail="This broker adapter has no real cancel_all_open_orders implemented -- any "
+                "resting order was NOT cancelled by this emergency shutdown path.",
+            )
+
+    async def ping_exchange(self) -> None:
+        """Real, lightweight REST call for :attr:`_watchdog`'s exchange vital sign.
+
+        Raises on failure -- :class:`~core.watchdog.SystemWatchdog` only
+        cares whether this completes; it measures its own wall-clock
+        latency around the call, this method does not self-report one.
+        Never wired in under ``MOCK_MODE`` (see :meth:`on_start`, no real
+        broker exists to ping).
+        """
+        assert self._broker is not None  # on_start only passes this method to SystemWatchdog when real
+        await self._broker.get_current_price(self._symbol)
 
     # -- Inventory-limit hedge ---------------------------------------------
 

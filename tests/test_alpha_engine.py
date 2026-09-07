@@ -726,3 +726,103 @@ def test_unregistered_symbol_refuses_construction() -> None:
     """A real configuration gap (module docstring point 14) -- fails at construction, not deep inside a live cycle."""
     with pytest.raises(KeyError, match="not registered"):
         AlphaMarketMakerAgent("DOGE/USDT", exchange_id="fake", manage_own_signals=False, manage_own_redis=False)
+
+
+# =============================================================================
+# System-level crash prevention (core.exception_manager / core.watchdog) wiring
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_cancel_all_orders_for_shutdown_calls_the_real_broker_api(agent: AlphaMarketMakerAgent) -> None:
+    await agent.cancel_all_orders_for_shutdown()
+    fake = _broker(agent)
+    assert fake.cancel_all_open_orders_calls == ["BTC/USDT"]
+
+
+@pytest.mark.asyncio
+async def test_cancel_all_orders_for_shutdown_is_a_noop_without_a_broker(agent: AlphaMarketMakerAgent) -> None:
+    agent._broker = None
+    await agent.cancel_all_orders_for_shutdown()  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_cancel_all_orders_for_shutdown_tolerates_a_broker_with_no_real_cancel_all(
+    agent: AlphaMarketMakerAgent,
+) -> None:
+    agent._broker = _FakeBroker(supports_cancel_all=False)
+    await agent.cancel_all_orders_for_shutdown()  # logs a warning, must not raise
+
+
+@pytest.mark.asyncio
+async def test_ping_exchange_calls_the_real_broker_api(agent: AlphaMarketMakerAgent) -> None:
+    await agent.ping_exchange()  # _FakeBroker.get_current_price returns a plain float -- must not raise
+
+
+@pytest.mark.asyncio
+async def test_on_start_installs_the_exception_handler_and_starts_the_watchdog_under_mock_mode(
+    redis_client: RedisClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real end-to-end through on_start() itself -- MOCK_MODE skips BrokerFactory.create() entirely,
+    so this needs no real exchange/network dependency to exercise the actual wiring code path."""
+    installed: list[dict[str, Any]] = []
+    started: list[_FakeSystemWatchdog] = []
+
+    def fake_install_handler(loop: Any, shutdown_callback: Any, *, sender_id: str, publisher: Any = None, notifier: Any = None, **kwargs: Any) -> None:
+        installed.append({"sender_id": sender_id, "publisher": publisher, "notifier": notifier})
+
+    monkeypatch.setattr("src.agents.alpha_engine.agent.install_global_exception_handler", fake_install_handler)
+    monkeypatch.setattr("src.agents.alpha_engine.agent.SystemWatchdog", lambda **kwargs: _record_watchdog(started, **kwargs))
+
+    instance = AlphaMarketMakerAgent("BTC/USDT", exchange_id="fake", manage_own_signals=False, manage_own_redis=False)
+    instance._redis_client = redis_client
+    instance._publisher = _RecordingZmqPublisher()  # type: ignore[assignment]
+    instance._settings.mock_mode = True
+    # Real fakeredis pubsub.listen() does not reliably honor task.cancel() the way a real Redis
+    # server's connection does -- irrelevant to what this test is actually verifying (the exception
+    # handler/watchdog wiring), so the emergency listener is replaced with an instantly-completing
+    # no-op rather than fighting that unrelated, pre-existing fakeredis limitation in cleanup below.
+    instance._listen_for_emergency_liquidate = _noop_coroutine  # type: ignore[method-assign]
+
+    try:
+        await instance.on_start()
+
+        assert len(installed) == 1
+        assert installed[0]["sender_id"] == instance.agent_id
+        assert installed[0]["publisher"] is instance._publisher
+        assert installed[0]["notifier"] is instance._notifier
+
+        assert len(started) == 1
+        assert started[0].started is True
+        assert started[0].kwargs["redis_client"] is redis_client
+        assert started[0].kwargs["exchange_ping"] is None  # no real broker under MOCK_MODE
+    finally:
+        # The real, full BaseAgent teardown sequence (cancels the emergency listener, calls
+        # on_shutdown() -- which stops self._watchdog -- closes the real ZMQ publisher/subscriber
+        # sockets this constructor opened, and terminates this instance's own owned ZMQ context).
+        # Skipping this (an earlier draft only cancelled the emergency listener task by hand) left a
+        # real, unclosed ZMQ context behind -- harmless for this one test's own assertions, but it
+        # left pytest's process unable to exit cleanly afterward once nothing else joined it.
+        await instance._shutdown()
+
+
+async def _noop_coroutine() -> None:
+    pass
+
+
+class _FakeSystemWatchdog:
+    def __init__(self, **kwargs: Any) -> None:
+        self.kwargs = kwargs
+        self.started = False
+
+    def start(self) -> None:
+        self.started = True
+
+    async def stop(self) -> None:
+        self.started = False
+
+
+def _record_watchdog(sink: list[_FakeSystemWatchdog], **kwargs: Any) -> _FakeSystemWatchdog:
+    watchdog = _FakeSystemWatchdog(**kwargs)
+    sink.append(watchdog)
+    return watchdog
