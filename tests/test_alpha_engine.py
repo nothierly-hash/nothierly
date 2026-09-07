@@ -599,3 +599,31 @@ async def test_bootstrap_tolerates_a_broker_without_cancel_all_support(agent: Al
     await agent._bootstrap_cold_start_sanitizer()  # must not raise -- logs and proceeds to baseline handling
 
     assert agent._baseline_qty == Decimal(0)
+
+
+# =============================================================================
+# _last_api_latency_ms -- real, measured, never fabricated (dashboard's "Latence API")
+# =============================================================================
+
+
+def test_api_latency_starts_as_none_before_any_real_cycle(agent: AlphaMarketMakerAgent) -> None:
+    assert agent._last_api_latency_ms is None
+
+
+@pytest.mark.asyncio
+async def test_read_total_inventory_measures_a_real_non_negative_latency(agent: AlphaMarketMakerAgent) -> None:
+    await agent._read_total_inventory()
+
+    assert agent._last_api_latency_ms is not None
+    assert agent._last_api_latency_ms >= 0.0
+
+
+@pytest.mark.asyncio
+async def test_telemetry_includes_the_real_measured_latency(agent: AlphaMarketMakerAgent) -> None:
+    await _seed_fresh_market_metrics(agent)
+    await agent._run_cycle()  # a real LIVE cycle calls _read_total_inventory internally
+
+    raw = await _redis(agent).execute("get", f"{ALPHA_ENGINE_TELEMETRY_REDIS_KEY_PREFIX}{agent.agent_id}")
+    telemetry = json.loads(raw)
+    assert telemetry["api_latency_ms"] is not None
+    assert telemetry["api_latency_ms"] >= 0.0

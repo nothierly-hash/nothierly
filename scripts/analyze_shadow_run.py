@@ -45,6 +45,13 @@ project's established discipline):
    :mod:`~src.execution.smart_order_router` at all; "Rollback"/leg-risk
    are a different component's real concepts, not this one's.
 
+**Reusable, not just a CLI script**: :func:`compute_diagnostics` is the
+real, pure analysis core (no I/O, no printing) -- both this file's own
+``main()`` and :mod:`~src.dashboard.ems_pages.shadow_run_analytics`'s
+dashboard page call it, so the dashboard's "GO/NO-GO" reading is computed
+by the exact same logic as this script's, never a second,
+independently-drifting reimplementation.
+
 Usage::
 
     # Overnight, in its own terminal (stdout only -- no file handler is configured by
@@ -54,6 +61,8 @@ Usage::
 
     # The next morning:
     python scripts/analyze_shadow_run.py logs/alpha_shadow_run.log
+
+    # Or from the dashboard: src/dashboard/ems_pages/shadow_run_analytics.py
 """
 
 from __future__ import annotations
@@ -62,9 +71,10 @@ import argparse
 import json
 import sys
 from collections import Counter
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator, Literal
 
 # Real, verified-not-assumed bug this line fixes: Windows' default console codepage (cp1252) cannot
 # encode the emoji this report prints (confirmed live -- a bare `print()` of "🔬" raises
@@ -109,37 +119,58 @@ _NO_DAILY_LOSS_LIMIT_EVENT = "alpha_engine_no_daily_loss_limit_configured"
 _GAP_MULTIPLE_OF_TICK_INTERVAL = 10.0
 _STALE_DATA_ATTENTION_THRESHOLD = 50  # matches this brief's own real-world-reasonable threshold
 
+Verdict = Literal["GO", "ATTENTION", "NO_GO"]
 
-def _iter_log_records(path: Path) -> Iterator[tuple[int, dict[str, Any] | None, str]]:
+
+@dataclass
+class ShadowRunDiagnostics:
+    """The real, structured result of analyzing one log -- both the CLI and the dashboard page render this, never a second parallel computation."""
+
+    total_json_lines: int
+    total_duration_hours: float
+    simulated_quote_count: int
+    stale_data_count: int
+    daily_loss_limit_configured: bool
+    mixed_mock_mode_seen: set[bool]
+    event_counts: Counter[str]
+    unexpected_failures: list[tuple[int, str, str]] = field(default_factory=list)
+    guardrail_trips: list[tuple[int, str, str]] = field(default_factory=list)
+    unparseable_lines: list[tuple[int, str]] = field(default_factory=list)
+    gaps: list[tuple[datetime, float]] = field(default_factory=list)
+    verdict: Verdict = "NO_GO"
+    verdict_reason: str = ""
+
+    @property
+    def exit_code(self) -> int:
+        return {"GO": 0, "ATTENTION": 1, "NO_GO": 2}[self.verdict]
+
+
+def _iter_log_records(lines: Iterable[str]) -> Iterator[tuple[int, dict[str, Any] | None, str]]:
     """Yield ``(line_number, parsed_json_or_None, raw_line)`` for every non-blank line."""
-    with path.open("r", encoding="utf-8", errors="replace") as f:
-        for line_number, raw_line in enumerate(f, start=1):
-            stripped = raw_line.rstrip("\n")
-            if not stripped.strip():
-                continue
-            try:
-                record: dict[str, Any] | None = json.loads(stripped)
-            except json.JSONDecodeError:
-                record = None
-            yield line_number, record, stripped
+    for line_number, raw_line in enumerate(lines, start=1):
+        stripped = raw_line.rstrip("\n")
+        if not stripped.strip():
+            continue
+        try:
+            record: dict[str, Any] | None = json.loads(stripped)
+        except json.JSONDecodeError:
+            record = None
+        yield line_number, record, stripped
 
 
-def analyze(path: Path) -> int:
-    """Run the real diagnostic. Returns a process exit code (0 = GO, 1 = ATTENTION, 2 = NO-GO)."""
-    print(f"🔬 [DIAGNOSTIC] Analyse du run réel : {path}\n")
-
+def compute_diagnostics(lines: Iterable[str]) -> ShadowRunDiagnostics:
+    """The real, pure analysis core -- no I/O, no printing. See module docstring."""
     event_counts: Counter[str] = Counter()
     unexpected_failures: list[tuple[int, str, str]] = []
     guardrail_trips: list[tuple[int, str, str]] = []
     stale_data_count = 0
     simulated_quote_count = 0
     daily_loss_limit_configured = True  # innocent until the startup warning says otherwise
-    started_at: datetime | None = None
     timestamps: list[datetime] = []
     unparseable_lines: list[tuple[int, str]] = []
     mixed_mock_mode_seen: set[bool] = set()
 
-    for line_number, record, raw_line in _iter_log_records(path):
+    for line_number, record, raw_line in _iter_log_records(lines):
         if record is None:
             # A line that isn't valid JSON at all -- most likely a raw Python traceback that
             # bypassed structlog (e.g. a crash before configure_logging ran, or asyncio's own
@@ -161,7 +192,6 @@ def analyze(path: Path) -> int:
                 pass
 
         if event == _STARTED_EVENT:
-            started_at = timestamps[-1] if timestamps else started_at
             if "mock_mode" in record:
                 mixed_mock_mode_seen.add(bool(record["mock_mode"]))
         elif event == _NO_DAILY_LOSS_LIMIT_EVENT:
@@ -186,89 +216,58 @@ def analyze(path: Path) -> int:
     )
     gaps = _find_timestamp_gaps(timestamps)
 
-    # ---- Report ----
-    print("=" * 60)
-    print("📊 RAPPORT D'AUDIT -- SHADOW RUN (données réelles, aucune valeur simulée)")
-    print("=" * 60)
-    print(f"Lignes de log JSON valides analysées : {sum(event_counts.values())}")
-    print(f"Durée réelle observée (1er -> dernier timestamp) : {total_duration_hours:.1f}h")
-    if mixed_mock_mode_seen and True in mixed_mock_mode_seen and False in mixed_mock_mode_seen:
-        print("⚠️  Ce fichier contient plusieurs démarrages, certains en MOCK_MODE et d'autres non -- "
-              "vérifie qu'il ne mélange pas plusieurs runs différents.")
-    print(f"Cotations simulées calculées (mode SHADOW réel) : {simulated_quote_count}")
-    print("-" * 60)
+    diagnostics = ShadowRunDiagnostics(
+        total_json_lines=sum(event_counts.values()),
+        total_duration_hours=total_duration_hours,
+        simulated_quote_count=simulated_quote_count,
+        stale_data_count=stale_data_count,
+        daily_loss_limit_configured=daily_loss_limit_configured,
+        mixed_mock_mode_seen=mixed_mock_mode_seen,
+        event_counts=event_counts,
+        unexpected_failures=unexpected_failures,
+        guardrail_trips=guardrail_trips,
+        unparseable_lines=unparseable_lines,
+        gaps=gaps,
+    )
+    diagnostics.verdict, diagnostics.verdict_reason = _decide_verdict(diagnostics)
+    return diagnostics
 
-    print("🛡️  GUARDRAILS -- voir module docstring point 3 : structurellement inatteignables en SHADOW,")
-    print("    donc TOUTE occurrence ici est une vraie anomalie à investiguer, pas un test réussi.")
-    if guardrail_trips:
-        for line_number, event, label in guardrail_trips:
-            print(f"   ⚠️  Ligne {line_number} [{event}] : {label}")
-    else:
-        print("   Aucun déclenchement -- attendu et correct pour un run en SHADOW.")
-    print(f"Coupures de flux de marché détectées (staleness réelle) : {stale_data_count}")
-    print("-" * 60)
 
-    print(f"❌ ÉCHECS RÉELS NON ATTENDUS : {len(unexpected_failures)}")
-    for line_number, event, label in unexpected_failures[:10]:
-        print(f"   > Ligne {line_number} [{event}] : {label}")
-    if len(unexpected_failures) > 10:
-        print(f"   ... et {len(unexpected_failures) - 10} de plus (voir le fichier de log directement).")
-
-    if unparseable_lines:
-        print(f"\n⚠️  {len(unparseable_lines)} ligne(s) ressemblant à une trace Python brute (hors JSON) :")
-        for line_number, preview in unparseable_lines[:5]:
-            print(f"   > Ligne {line_number} : {preview}")
-
-    if gaps:
-        print(f"\n⚠️  {len(gaps)} interruption(s) suspecte(s) dans le flux de logs (processus probablement figé/relancé) :")
-        for gap_start, gap_seconds in gaps[:5]:
-            print(f"   > Vers {gap_start.isoformat()} : silence de {gap_seconds / 60:.1f} minutes")
-
-    print("-" * 60)
-    print(f"MAX_DAILY_LOSS_USD configuré au démarrage : {'✅ Oui' if daily_loss_limit_configured else '⚠️ NON -- voir alpha_engine_no_daily_loss_limit_configured'}")
-    print("=" * 60)
-
-    # ---- Verdict ----
-    if unexpected_failures or unparseable_lines:
-        print("🚨 VERDICT : NO-GO (ROUGE).")
-        print("Des échecs réels et non attendus sont apparus. Investigue chaque ligne listée ci-dessus "
-              "avant d'envisager du capital réel.")
-        return 2
-
-    if guardrail_trips:
-        print("🚨 VERDICT : NO-GO (ROUGE).")
-        print("Un guardrail s'est déclenché alors qu'il devrait être structurellement inatteignable en "
-              "SHADOW -- soit le moteur n'était pas réellement en SHADOW/MOCK_MODE pendant tout le run, "
-              "soit c'est un vrai bug. À investiguer avant tout capital réel.")
-        return 2
-
-    if total_duration_hours < 20.0:
-        print("⚠️ VERDICT : ATTENTION (JAUNE).")
-        print(f"Seulement {total_duration_hours:.1f}h de run réellement observées -- relance un vrai "
-              "cycle complet de 24h avant de conclure.")
-        return 1
-
-    if stale_data_count > _STALE_DATA_ATTENTION_THRESHOLD:
-        print("⚠️ VERDICT : ATTENTION (JAUNE).")
-        print(f"{stale_data_count} coupures de flux détectées -- connexion réseau/API pas assez stable "
-              "pour du live pendant qu'un flux réel doit rester à jour.")
-        return 1
-
-    if gaps:
-        print("⚠️ VERDICT : ATTENTION (JAUNE).")
-        print("Des interruptions du flux de logs sont apparues (voir ci-dessus) -- confirme qu'il ne "
-              "s'agit pas d'un vrai plantage silencieux avant de continuer.")
-        return 1
-
-    print("✅ VERDICT (PARTIEL) : GO pour ce que ce run peut réellement prouver.")
-    print("Stabilité du processus, détection de staleness, et connectivité Redis/Telegram : propres sur "
-          f"{total_duration_hours:.1f}h réelles.")
-    print("Rappel honnête (voir module docstring point 3) : ce run ne prouve RIEN sur le fat-finger cap, "
-          "le coupe-circuit de débit, ou l'arrêt sur perte max/jour -- ces trois-là sont validés par les "
-          "31 tests réels de tests/test_alpha_engine.py, pas par ce run. Considère un passage en mode "
-          "sandbox/testnet de l'exchange (si supporté) pour exercer ces chemins de code réels sans "
-          "capital réel, avant le premier vrai LIVE.")
-    return 0
+def _decide_verdict(d: ShadowRunDiagnostics) -> tuple[Verdict, str]:
+    if d.unexpected_failures or d.unparseable_lines:
+        return "NO_GO", (
+            "Des échecs réels et non attendus sont apparus. Investigue chaque ligne listée "
+            "avant d'envisager du capital réel."
+        )
+    if d.guardrail_trips:
+        return "NO_GO", (
+            "Un guardrail s'est déclenché alors qu'il devrait être structurellement inatteignable "
+            "en SHADOW -- soit le moteur n'était pas réellement en SHADOW/MOCK_MODE pendant tout le "
+            "run, soit c'est un vrai bug. À investiguer avant tout capital réel."
+        )
+    if d.total_duration_hours < 20.0:
+        return "ATTENTION", (
+            f"Seulement {d.total_duration_hours:.1f}h de run réellement observées -- relance un vrai "
+            "cycle complet de 24h avant de conclure."
+        )
+    if d.stale_data_count > _STALE_DATA_ATTENTION_THRESHOLD:
+        return "ATTENTION", (
+            f"{d.stale_data_count} coupures de flux détectées -- connexion réseau/API pas assez "
+            "stable pour du live pendant qu'un flux réel doit rester à jour."
+        )
+    if d.gaps:
+        return "ATTENTION", (
+            "Des interruptions du flux de logs sont apparues -- confirme qu'il ne s'agit pas d'un "
+            "vrai plantage silencieux avant de continuer."
+        )
+    return "GO", (
+        "Stabilité du processus, détection de staleness, et connectivité Redis/Telegram : propres. "
+        "Rappel honnête (voir module docstring point 3) : ce run ne prouve RIEN sur le fat-finger "
+        "cap, le coupe-circuit de débit, ou l'arrêt sur perte max/jour -- ces trois-là sont validés "
+        "par les tests réels de tests/test_alpha_engine.py, pas par ce run. Considère un passage en "
+        "mode sandbox/testnet de l'exchange (si supporté) pour exercer ces chemins de code réels "
+        "sans capital réel, avant le premier vrai LIVE."
+    )
 
 
 def _find_timestamp_gaps(timestamps: list[datetime]) -> list[tuple[datetime, float]]:
@@ -285,6 +284,63 @@ def _find_timestamp_gaps(timestamps: list[datetime]) -> list[tuple[datetime, flo
     median_interval = sorted(intervals)[len(intervals) // 2] if intervals else 1.0
     threshold = max(median_interval * _GAP_MULTIPLE_OF_TICK_INTERVAL, 60.0)
     return [(ordered[i], intervals[i - 1]) for i in range(1, len(ordered)) if intervals[i - 1] > threshold]
+
+
+def print_report(d: ShadowRunDiagnostics, *, source_label: str) -> None:
+    """Render the exact same CLI report this script always has -- now from a ShadowRunDiagnostics instead of computing inline."""
+    print(f"🔬 [DIAGNOSTIC] Analyse du run réel : {source_label}\n")
+    print("=" * 60)
+    print("📊 RAPPORT D'AUDIT -- SHADOW RUN (données réelles, aucune valeur simulée)")
+    print("=" * 60)
+    print(f"Lignes de log JSON valides analysées : {d.total_json_lines}")
+    print(f"Durée réelle observée (1er -> dernier timestamp) : {d.total_duration_hours:.1f}h")
+    if len(d.mixed_mock_mode_seen) > 1:
+        print("⚠️  Ce fichier contient plusieurs démarrages, certains en MOCK_MODE et d'autres non -- "
+              "vérifie qu'il ne mélange pas plusieurs runs différents.")
+    print(f"Cotations simulées calculées (mode SHADOW réel) : {d.simulated_quote_count}")
+    print("-" * 60)
+
+    print("🛡️  GUARDRAILS -- voir module docstring point 3 : structurellement inatteignables en SHADOW,")
+    print("    donc TOUTE occurrence ici est une vraie anomalie à investiguer, pas un test réussi.")
+    if d.guardrail_trips:
+        for line_number, event, label in d.guardrail_trips:
+            print(f"   ⚠️  Ligne {line_number} [{event}] : {label}")
+    else:
+        print("   Aucun déclenchement -- attendu et correct pour un run en SHADOW.")
+    print(f"Coupures de flux de marché détectées (staleness réelle) : {d.stale_data_count}")
+    print("-" * 60)
+
+    print(f"❌ ÉCHECS RÉELS NON ATTENDUS : {len(d.unexpected_failures)}")
+    for line_number, event, label in d.unexpected_failures[:10]:
+        print(f"   > Ligne {line_number} [{event}] : {label}")
+    if len(d.unexpected_failures) > 10:
+        print(f"   ... et {len(d.unexpected_failures) - 10} de plus (voir le fichier de log directement).")
+
+    if d.unparseable_lines:
+        print(f"\n⚠️  {len(d.unparseable_lines)} ligne(s) ressemblant à une trace Python brute (hors JSON) :")
+        for line_number, preview in d.unparseable_lines[:5]:
+            print(f"   > Ligne {line_number} : {preview}")
+
+    if d.gaps:
+        print(f"\n⚠️  {len(d.gaps)} interruption(s) suspecte(s) dans le flux de logs (processus probablement figé/relancé) :")
+        for gap_start, gap_seconds in d.gaps[:5]:
+            print(f"   > Vers {gap_start.isoformat()} : silence de {gap_seconds / 60:.1f} minutes")
+
+    print("-" * 60)
+    print(f"MAX_DAILY_LOSS_USD configuré au démarrage : {'✅ Oui' if d.daily_loss_limit_configured else '⚠️ NON -- voir alpha_engine_no_daily_loss_limit_configured'}")
+    print("=" * 60)
+
+    verdict_label = {"GO": "✅ VERDICT (PARTIEL) : GO", "ATTENTION": "⚠️ VERDICT : ATTENTION (JAUNE)", "NO_GO": "🚨 VERDICT : NO-GO (ROUGE)"}[d.verdict]
+    print(f"{verdict_label} pour ce que ce run peut réellement prouver." if d.verdict == "GO" else verdict_label + ".")
+    print(d.verdict_reason)
+
+
+def analyze(path: Path) -> int:
+    """CLI entry point: read ``path``, compute diagnostics, print the report. Returns the real exit code."""
+    with path.open("r", encoding="utf-8", errors="replace") as f:
+        diagnostics = compute_diagnostics(f)
+    print_report(diagnostics, source_label=str(path))
+    return diagnostics.exit_code
 
 
 def _parse_args() -> argparse.Namespace:

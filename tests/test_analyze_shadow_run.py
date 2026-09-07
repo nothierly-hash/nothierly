@@ -164,3 +164,57 @@ def test_a_random_blank_or_unrelated_non_json_line_is_not_flagged(tmp_path: Path
     exit_code = analyze_shadow_run.analyze(path)
 
     assert exit_code == 0
+
+
+# =============================================================================
+# compute_diagnostics -- the real, structured, reusable core the dashboard page
+# (src/dashboard/ems_pages/shadow_run_analytics.py) also calls directly
+# =============================================================================
+
+
+def test_compute_diagnostics_returns_structured_real_fields() -> None:
+    """Field-extraction correctness -- verdict logic itself is covered by the analyze()-level tests above."""
+    start = datetime(2026, 9, 7, tzinfo=timezone.utc)
+    lines = [
+        _line("alpha_engine_started", timestamp=_timestamps(start, 0)[0], mock_mode=True),
+        _line("alpha_engine_simulated_quote", timestamp=_timestamps(start, 100)[0]),
+        _line("alpha_engine_stale_data_detected", level="warning", timestamp=_timestamps(start, 200)[0]),
+        _line("alpha_engine_simulated_quote", timestamp=_timestamps(start, 300)[0]),
+    ]
+
+    diagnostics = analyze_shadow_run.compute_diagnostics(lines)
+
+    assert diagnostics.simulated_quote_count == 2
+    assert diagnostics.stale_data_count == 1
+    assert diagnostics.total_json_lines == 4
+    assert diagnostics.unexpected_failures == []
+    assert diagnostics.guardrail_trips == []
+    assert diagnostics.daily_loss_limit_configured is True  # no alpha_engine_no_daily_loss_limit_configured seen
+
+
+def test_compute_diagnostics_accepts_any_string_iterable_not_just_a_file() -> None:
+    """The real reason this is reusable from Streamlit's st.file_uploader (bytes decoded to a list of lines), not just Path.open()."""
+    start = datetime(2026, 9, 7, tzinfo=timezone.utc)
+    uploaded_text = "\n".join([
+        _line("alpha_engine_started", timestamp=_timestamps(start, 0)[0]),
+        _line("agent_tick_failed", level="error", timestamp=_timestamps(start, 60)[0]),
+    ])
+
+    diagnostics = analyze_shadow_run.compute_diagnostics(uploaded_text.splitlines())
+
+    assert diagnostics.verdict == "NO_GO"
+    assert len(diagnostics.unexpected_failures) == 1
+
+
+def test_compute_diagnostics_flags_missing_daily_loss_limit() -> None:
+    start = datetime(2026, 9, 7, tzinfo=timezone.utc)
+    lines = [
+        _line("alpha_engine_started", timestamp=_timestamps(start, 0)[0]),
+        _line("alpha_engine_no_daily_loss_limit_configured", level="critical", timestamp=_timestamps(start, 1)[0]),
+        _line("alpha_engine_simulated_quote", timestamp=_timestamps(start, 24 * 3600)[0]),
+    ]
+
+    diagnostics = analyze_shadow_run.compute_diagnostics(lines)
+
+    assert diagnostics.daily_loss_limit_configured is False
+    assert diagnostics.verdict == "GO"  # this alone doesn't block a GO -- it's a separate, real, surfaced warning

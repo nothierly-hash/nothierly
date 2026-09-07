@@ -159,6 +159,16 @@ else:
     col6.metric("Plafond perte/jour", f"${float(max_daily_loss):,.2f}" if max_daily_loss is not None else "⚠️ NON CONFIGURÉ")
     max_single_order = telemetry.get("max_single_order_units")
     col7.metric("Plafond fat-finger", f"{max_single_order} {base_currency}" if max_single_order is not None else "N/A")
+
+    # Real, measured on every cycle's get_open_positions() REST call (see
+    # AlphaMarketMakerAgent._read_total_inventory) -- never populated under MOCK_MODE/SIMULATED,
+    # which never makes that call. Shown as "N/A", not a fabricated number, until a real cycle runs.
+    api_latency_ms = telemetry.get("api_latency_ms")
+    st.metric(
+        "Latence API (dernier cycle)",
+        f"{api_latency_ms:.0f} ms" if api_latency_ms is not None else "N/A (mode simulé ou pas encore mesurée)",
+    )
+
     if max_daily_loss is None:
         st.warning(
             "⚠️ **Aucune limite de perte quotidienne configurée** -- ce moteur ne s'arrêtera jamais "

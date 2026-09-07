@@ -469,6 +469,9 @@ class AlphaMarketMakerAgent(BaseAgent):
         # Real, only registered once connected in on_start (not under MOCK_MODE, which never places
         # a real order and so never needs pacing) -- see module docstring point 13.
         self._rate_limit_mesh: RateLimitMesh | None = None
+        # Real, measured on every _read_total_inventory() call (a real REST round-trip) -- None
+        # until the first one completes (MOCK_MODE never sets it, since it's never called).
+        self._last_api_latency_ms: float | None = None
         self._order_lock = asyncio.Lock()
         self._resting_order_ids: dict[Literal["buy", "sell"], str | None] = {"buy": None, "sell": None}
 
@@ -774,9 +777,18 @@ class AlphaMarketMakerAgent(BaseAgent):
     # -- Inventory / fills -------------------------------------------------
 
     async def _read_total_inventory(self) -> Decimal:
-        """Real, current TOTAL account balance of this symbol's base asset. See module docstring point 6."""
+        """Real, current TOTAL account balance of this symbol's base asset. See module docstring point 6.
+
+        Also times this real REST round-trip and stores it in
+        :attr:`_last_api_latency_ms` -- called every real cycle, so this
+        is a fresh, real per-cycle exchange latency reading (not a
+        fabricated placeholder), surfaced on the dashboard's telemetry
+        panel.
+        """
         assert self._broker is not None
+        started_at = time.monotonic()
         positions = await self._broker.get_open_positions()
+        self._last_api_latency_ms = (time.monotonic() - started_at) * 1000.0
         for position in positions:
             if position.asset.symbol == self._symbol:
                 return position.quantity
@@ -1225,6 +1237,7 @@ class AlphaMarketMakerAgent(BaseAgent):
             "max_single_order_units": str(self._max_single_order_units),
             "trade_count_24h": len(self._trade_timestamps),
             "market_data_age_seconds": market_data_age_seconds,
+            "api_latency_ms": self._last_api_latency_ms,
             "updated_at": time.time(),
         }
         try:
