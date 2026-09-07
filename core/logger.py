@@ -52,7 +52,18 @@ _SENSITIVE_KEY_PATTERN: Final[re.Pattern[str]] = re.compile(
 # matching above remains the precise, primary defense; this is
 # defense-in-depth only, so losing coverage for the rare vendor token
 # format that embeds a hyphen/underscore is an acceptable trade-off.
-_SENSITIVE_VALUE_PATTERN: Final[re.Pattern[str]] = re.compile(r"^(?=.{24,})[A-Za-z0-9\/+=]+$")
+#
+# Unanchored (no leading/trailing '^'/'$'): a red-team audit found the
+# previous whole-value-only anchoring let a real secret slip through
+# whenever it was embedded mid-sentence in a longer human-readable
+# message rather than being the field's entire value -- exactly the
+# shape of `error=str(exc)` for a caught ccxt AuthenticationError (see
+# src/agents/market_data/exchange_client.py, and CcxtBrokerAdapter in
+# src/execution/broker_gateway.py, which delegates to the same client).
+# Matching anywhere in the value still requires the same 24+-char
+# unbroken run, so it stays precise for the same reason the anchored
+# version was.
+_SENSITIVE_VALUE_PATTERN: Final[re.Pattern[str]] = re.compile(r"[A-Za-z0-9\/+=]{24,}")
 _REDACTED: Final[str] = "***REDACTED***"
 
 _listener: logging.handlers.QueueListener | None = None
@@ -65,10 +76,12 @@ def _redact_secrets(
 
     Any key whose name looks sensitive (e.g. ``api_key``, ``password``,
     ``authorization``) has its value fully redacted. Additionally, any
-    string value that looks like a bare secret (a long unbroken token of
-    alphanumeric/base64-like characters, e.g. a leaked API key logged
-    under an innocuous key name) is redacted as a defense-in-depth
-    measure.
+    string value *containing* what looks like a bare secret (a long
+    unbroken token of alphanumeric/base64-like characters -- anywhere in
+    the value, not just when the value is nothing else, e.g. a leaked API
+    key embedded mid-sentence in a caught exception's own message logged
+    under an innocuous key name) has just that token redacted in place,
+    as a defense-in-depth measure.
 
     Args:
         logger: The wrapped stdlib logger (unused, required by the
@@ -85,8 +98,8 @@ def _redact_secrets(
             continue
         if _SENSITIVE_KEY_PATTERN.search(key):
             event_dict[key] = _REDACTED
-        elif isinstance(value, str) and _SENSITIVE_VALUE_PATTERN.match(value):
-            event_dict[key] = _REDACTED
+        elif isinstance(value, str) and _SENSITIVE_VALUE_PATTERN.search(value):
+            event_dict[key] = _SENSITIVE_VALUE_PATTERN.sub(_REDACTED, value)
     return event_dict
 
 
