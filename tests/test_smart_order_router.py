@@ -35,6 +35,7 @@ from src.execution.smart_order_router import (
     build_allocation_plan,
     execute_allocation_plan,
     log_routing_decision,
+    normalize_signal_size,
 )
 
 _ASSET = UniversalAsset(
@@ -104,6 +105,43 @@ def test_effective_price_buy_adds_fee_on_top() -> None:
 
 def test_effective_price_sell_deducts_fee() -> None:
     assert _effective_price(100.0, 0.01, OrderSide.SELL) == pytest.approx(99.0)
+
+
+# =============================================================================
+# normalize_signal_size -- Mission 4 of the cross-asset mutation
+# =============================================================================
+
+
+def test_normalize_signal_size_direct_quantity_for_crypto() -> None:
+    """BTC/USDT: DIRECT_QUANTITY, lot_size=0.00001 -- "1" maps straight to 1 BTC."""
+    assert normalize_signal_size("BTC/USDT", Decimal("1")) == Decimal("1")
+
+
+def test_normalize_signal_size_lot_based_for_forex() -> None:
+    """EUR_USD: LOT_BASED, lot_multiplier=100,000 -- the brief's own explicit example."""
+    assert normalize_signal_size("EUR_USD", Decimal("1")) == Decimal("100000")
+
+
+def test_normalize_signal_size_lot_based_scales_with_signal_magnitude() -> None:
+    assert normalize_signal_size("EUR_USD", Decimal("0.5")) == Decimal("50000")
+
+
+def test_normalize_signal_size_direct_quantity_for_commodity() -> None:
+    """XAU_USD/BCO_USD: DIRECT_QUANTITY -- no lot *multiplier* convention (see core/asset_universe.py module
+    docstring point 3), but both are still OANDA-routed, whole-unit instruments (lot_size=1, see that same
+    docstring's point 4) -- a whole-number signal passes through unchanged."""
+    assert normalize_signal_size("XAU_USD", Decimal("2")) == Decimal("2")
+    assert normalize_signal_size("BCO_USD", Decimal("10")) == Decimal("10")
+
+
+def test_normalize_signal_size_quantizes_down_never_up() -> None:
+    """A fractional OANDA unit is truncated down (lot_size=1) -- never rounded up into a larger real order than the signal asked for."""
+    assert normalize_signal_size("XAU_USD", Decimal("2.999")) == Decimal("2")
+
+
+def test_normalize_signal_size_raises_for_an_unregistered_symbol() -> None:
+    with pytest.raises(KeyError, match="not registered"):
+        normalize_signal_size("DOGE/USDT", Decimal("1"))
 
 
 # =============================================================================

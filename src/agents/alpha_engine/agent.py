@@ -219,6 +219,39 @@ entirely and fires an immediate real market order to flatten the excess
     rejection; the circuit breaker *halts the engine* on a genuinely
     pathological burst. Different jobs, both real, kept both.
 
+14. **Cross-asset session/spread gating -- real, wired in, and a genuine
+    no-op for this engine's actual crypto instrument today.** Two new
+    real checks in :meth:`_run_cycle`, both resolved through
+    :mod:`core.asset_universe`/:class:`~core.session_manager.
+    MarketSessionManager` by ``self._symbol`` alone -- neither branches
+    on symbol identity (no ``if self._symbol == "BTC/USDT"`` anywhere):
+    (a) the Friday Unwind (:meth:`~core.session_manager.
+    MarketSessionManager.is_unwind_period`) cancels quotes, blocks new
+    entries, and forces :meth:`_hedge_excess_inventory` down to a real
+    zero-inventory target (``cap=Decimal(0)``, not just back under the
+    normal cap) for the whole real weekly closed window, not only the
+    trigger instant; (b) the anti-spread-manipulation filter
+    (:func:`~core.asset_universe.is_spread_acceptable`) silently rejects
+    the cycle -- cancels quotes, places nothing -- the instant
+    :attr:`~core.schemas.MarketMetrics.spread` exceeds this asset's real
+    configured ceiling, *before* :meth:`_requote` ever computes a price.
+    Both are real, live checks against ``self._symbol``'s actual
+    :class:`~core.asset_universe.AssetUniverseEntry` (resolved once, in
+    ``__init__`` -- see that method) -- for ``BTC/USDT``,
+    ``is_unwind_period`` is always ``False`` (crypto has
+    ``trading_hours=None``) and the ``$5.00`` spread ceiling is wide
+    enough that this is real, inert infrastructure today, not a
+    behavior change to this engine's actual current operation. It
+    becomes real protection the day this class is ever constructed
+    against ``EUR_USD``/``XAU_USD``/``BCO_USD`` instead -- which it can
+    be, unchanged, because nothing about ``_run_cycle``'s new gating
+    logic assumes crypto. **Deliberately scoped to this one engine in
+    this pass**: :class:`~src.agents.rl_signal.agent.RlSignalAgent` and
+    :class:`~src.agents.market_data.agent.MarketDataAgent` are separate,
+    already-live, already-tested production agents this same change did
+    not also touch -- a larger, separate integration, not silently
+    assumed done here.
+
 **Kill-switch interaction**: every *routine* real order this engine
 places (a resting quote, the automatic inventory-limit hedge in
 :meth:`_hedge_excess_inventory`) goes through
@@ -262,6 +295,7 @@ from typing import Any, Final, Literal
 
 import zmq.asyncio
 
+from core.asset_universe import AssetUniverseEntry, get_asset_universe_entry, is_spread_acceptable
 from core.base_agent import AgentControlState, BaseAgent
 from core.config import AppSettings
 from core.logger import get_logger
@@ -279,6 +313,7 @@ from core.schemas import (
     MarketMetrics,
 )
 from core.security import FinancialCallAbortedError, KillSwitchActiveError, safe_financial_call
+from core.session_manager import MarketSessionManager
 from network.resilience_mesh import RateLimitMesh
 from src.execution.audit_ledger import OrderAuditEvent
 from src.execution.broker_gateway import BaseBroker, BrokerFactory
@@ -435,6 +470,11 @@ class AlphaMarketMakerAgent(BaseAgent):
         )
         base_currency, _, quote_currency = symbol.partition("/")
         self._symbol = symbol
+        # Real, fail-fast registry lookup -- see module docstring point 14 (cross-asset session/spread
+        # gating). Resolved once here, not per-cycle: a symbol with no real AssetUniverseEntry is a
+        # configuration gap to catch at construction time, not something to silently skip or
+        # re-discover as a KeyError deep inside the first real trading cycle.
+        self._universe_entry: AssetUniverseEntry = get_asset_universe_entry(symbol)
         self._exchange_id = exchange_id
         self._asset = UniversalAsset(
             symbol=symbol, asset_class=AssetClass.CRYPTO_SPOT, base_currency=base_currency,
@@ -705,17 +745,39 @@ class AlphaMarketMakerAgent(BaseAgent):
             return
         self._stale_data_notified = False
 
+        # ---- The Friday Unwind (module docstring point 14 / Mission 2). Always False for this
+        # engine's real BTC/USDT instrument (crypto has no trading_hours) -- real, inert
+        # infrastructure today, real protection the day this class trades EUR_USD/XAU_USD/BCO_USD.
+        if MarketSessionManager.is_unwind_period(self._symbol):
+            await self._cancel_all_resting_orders()
+            self._log.warning(
+                "alpha_engine_weekend_unwind_active", agent_id=self.agent_id, symbol=self._symbol,
+            )
+            if not simulate:
+                own_inventory = await self._sync_real_inventory(metrics)
+                if own_inventory != 0:
+                    await self._hedge_excess_inventory(own_inventory, cap=Decimal(0))
+            await self._publish_telemetry(status="WEEKEND_UNWIND", market_data_age_seconds=age_seconds, inventory=None)
+            return
+
+        # ---- Anti-spread-manipulation filter (module docstring point 14 / Mission 3). Rejects the
+        # cycle silently -- no order placed -- before any quote price is ever computed.
+        current_spread = Decimal(str(metrics.spread))
+        if not is_spread_acceptable(self._symbol, current_spread):
+            await self._cancel_all_resting_orders()
+            self._log.warning(
+                "alpha_engine_spread_rejected", agent_id=self.agent_id, symbol=self._symbol,
+                spread=str(current_spread), max_allowable_spread=str(self._universe_entry.max_allowable_spread),
+            )
+            await self._publish_telemetry(status="SPREAD_REJECTED", market_data_age_seconds=age_seconds, inventory=None)
+            return
+
         if simulate:
             await self._run_simulated_cycle(metrics)
             return
 
         # ---- Real inventory, read from the broker -- source of truth. See module docstring point 6.
-        total_qty = await self._read_total_inventory()
-        fill_qty = total_qty - self._last_known_total_qty
-        if fill_qty != 0:
-            await self._record_fill(fill_qty, fill_price=Decimal(str(metrics.mid_price)))
-        self._last_known_total_qty = total_qty
-        own_inventory = total_qty - self._baseline_qty
+        own_inventory = await self._sync_real_inventory(metrics)
 
         if abs(own_inventory) > self._max_inventory_units:
             await self._cancel_all_resting_orders()
@@ -775,6 +837,21 @@ class AlphaMarketMakerAgent(BaseAgent):
         return metrics, age_seconds
 
     # -- Inventory / fills -------------------------------------------------
+
+    async def _sync_real_inventory(self, metrics: MarketMetrics) -> Decimal:
+        """Real inventory read + fill detection -- shared by the normal path and the Friday Unwind path (module docstring point 14).
+
+        Extracted so both real-money code paths detect and price a fill
+        exactly once, the same way, rather than the Friday Unwind path
+        either duplicating this logic or skipping fill detection
+        entirely on a cycle that happens to also be a real fill.
+        """
+        total_qty = await self._read_total_inventory()
+        fill_qty = total_qty - self._last_known_total_qty
+        if fill_qty != 0:
+            await self._record_fill(fill_qty, fill_price=Decimal(str(metrics.mid_price)))
+        self._last_known_total_qty = total_qty
+        return total_qty - self._baseline_qty
 
     async def _read_total_inventory(self) -> Decimal:
         """Real, current TOTAL account balance of this symbol's base asset. See module docstring point 6.
@@ -1013,8 +1090,18 @@ class AlphaMarketMakerAgent(BaseAgent):
 
     # -- Inventory-limit hedge ---------------------------------------------
 
-    async def _hedge_excess_inventory(self, own_inventory: Decimal) -> None:
-        excess = abs(own_inventory) - self._max_inventory_units
+    async def _hedge_excess_inventory(self, own_inventory: Decimal, *, cap: Decimal | None = None) -> None:
+        """Flatten ``own_inventory`` back down to ``cap`` (defaults to :attr:`_max_inventory_units`).
+
+        ``cap=Decimal(0)`` is the Friday Unwind's real full-flatten case
+        (module docstring point 14) -- a *scheduled*, expected weekly
+        event, not a panic, so it deliberately reuses this normal, Kill-
+        Switch-gated hedge path rather than the break-glass
+        :meth:`_execute_emergency_liquidate` bypass, which exists for a
+        genuine emergency only.
+        """
+        effective_cap = self._max_inventory_units if cap is None else cap
+        excess = abs(own_inventory) - effective_cap
         side: Literal["buy", "sell"] = "sell" if own_inventory > 0 else "buy"
         assert self._broker is not None
         assert self._rate_limit_mesh is not None
@@ -1038,7 +1125,7 @@ class AlphaMarketMakerAgent(BaseAgent):
 
         self._log.critical(
             "alpha_engine_inventory_limit_breached_hedging", agent_id=self.agent_id,
-            inventory=str(own_inventory), max_inventory=str(self._max_inventory_units),
+            inventory=str(own_inventory), max_inventory=str(effective_cap),
             excess=str(excess), side=side,
         )
         try:
@@ -1054,7 +1141,7 @@ class AlphaMarketMakerAgent(BaseAgent):
             )
             await self._notify_inventory_breach_once(
                 f"🆘 INTERVENTION MANUELLE REQUISE -- {self._symbol} : inventaire {own_inventory} dépasse le "
-                f"plafond {self._max_inventory_units}, et le Kill Switch global bloque la couverture "
+                f"plafond {effective_cap}, et le Kill Switch global bloque la couverture "
                 "automatique. Position NON couverte."
             )
             return
@@ -1073,7 +1160,7 @@ class AlphaMarketMakerAgent(BaseAgent):
         )
         await self._notify_inventory_breach_once(
             f"Limite d'inventaire atteinte pour {self._symbol} -- couverture automatique exécutée : "
-            f"{side} {excess}. Inventaire ramené sous {self._max_inventory_units}.",
+            f"{side} {excess}. Inventaire ramené sous {effective_cap}.",
             severity=AlertSeverity.WARNING,
         )
 

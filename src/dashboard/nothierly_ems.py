@@ -87,6 +87,7 @@ pages = {
     "🔴 Autonomous Trading": [
         st.Page(str(_PAGES_DIR / "autonomous_command_center.py"), title="Autonomous Command Center", icon="🔴"),
         st.Page(str(_PAGES_DIR / "shadow_run_analytics.py"), title="Shadow Run Analytics", icon="🌙"),
+        st.Page(str(_PAGES_DIR / "asset_universe_control.py"), title="Asset Universe Control", icon="🌐"),
     ],
     "📊 Execution & Routing": [
         st.Page(str(_PAGES_DIR / "command_center.py"), title="Command Center", icon="📊", default=True),

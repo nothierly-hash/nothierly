@@ -29,6 +29,7 @@ from core.config import RedisSettings
 from core.nothierly_ontology import AssetClass, MarginSnapshot, UniversalAsset, UniversalPosition
 from core.notifier import TelegramNotifier
 from core.redis_client import RedisClient
+from core.session_manager import MarketSessionManager
 from core.schemas import (
     AGENT_CONTROL_STATE_REDIS_KEY_PREFIX,
     ALPHA_ENGINE_BASELINE_QTY_REDIS_KEY_PREFIX,
@@ -298,11 +299,13 @@ def _broker(agent: AlphaMarketMakerAgent) -> _FakeBroker:
     return agent._broker
 
 
-async def _seed_fresh_market_metrics(agent: AlphaMarketMakerAgent, *, age_seconds: float = 0.0) -> None:
+async def _seed_fresh_market_metrics(
+    agent: AlphaMarketMakerAgent, *, age_seconds: float = 0.0, spread: float = 1.0,
+) -> None:
     timestamp = datetime.now(timezone.utc) - timedelta(seconds=age_seconds)
     await _redis(agent).execute(
         "set", f"{MARKET_METRICS_REDIS_KEY_PREFIX}BTC/USDT",
-        json.dumps({"symbol": "BTC/USDT", "timestamp": timestamp.isoformat(), "spread": 1.0, "order_book_imbalance": 0.0, "mid_price": 65000.0}),
+        json.dumps({"symbol": "BTC/USDT", "timestamp": timestamp.isoformat(), "spread": spread, "order_book_imbalance": 0.0, "mid_price": 65000.0}),
     )
 
 
@@ -627,3 +630,99 @@ async def test_telemetry_includes_the_real_measured_latency(agent: AlphaMarketMa
     telemetry = json.loads(raw)
     assert telemetry["api_latency_ms"] is not None
     assert telemetry["api_latency_ms"] >= 0.0
+
+
+# =============================================================================
+# Cross-asset session/spread gating (module docstring point 14 / Missions 2 & 3).
+# BTC/USDT's real registry entry (core/asset_universe.py) has trading_hours=None -- is_unwind_period
+# is unconditionally False for it, so the Friday Unwind tests below monkeypatch
+# MarketSessionManager.is_unwind_period directly rather than depending on the real wall clock ever
+# landing in a real Friday-21:00-UTC-through-Sunday-22:00-UTC window (see tests/test_session_manager.py
+# for that logic's own real-boundary parametrized coverage -- not re-tested here).
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_spread_within_ceiling_places_quotes_normally(agent: AlphaMarketMakerAgent) -> None:
+    await _seed_fresh_market_metrics(agent, spread=1.0)  # BTC/USDT's real ceiling is $5.00
+    await agent._run_cycle()
+    assert _broker(agent).limit_orders != []
+
+
+@pytest.mark.asyncio
+async def test_spread_wider_than_ceiling_is_rejected_silently(agent: AlphaMarketMakerAgent) -> None:
+    """Mission 3's own real scenario: a broker-widened spread rejects the cycle before any quote price is computed."""
+    await _seed_fresh_market_metrics(agent, spread=10.0)  # over BTC/USDT's real $5.00 ceiling
+    await agent._run_cycle()
+    fake = _broker(agent)
+    assert fake.limit_orders == []
+    assert fake.market_orders == []
+
+
+@pytest.mark.asyncio
+async def test_spread_rejected_cycle_publishes_spread_rejected_status(agent: AlphaMarketMakerAgent) -> None:
+    await _seed_fresh_market_metrics(agent, spread=10.0)
+    await agent._run_cycle()
+    raw = await _redis(agent).execute("get", f"{ALPHA_ENGINE_TELEMETRY_REDIS_KEY_PREFIX}{agent.agent_id}")
+    assert json.loads(raw)["status"] == "SPREAD_REJECTED"
+
+
+@pytest.mark.asyncio
+async def test_friday_unwind_cancels_quotes_and_blocks_new_entries(
+    agent: AlphaMarketMakerAgent, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mission 2's own explicit scenario: force liquidation, block new entries -- real, end-to-end through _run_cycle."""
+    monkeypatch.setattr(
+        MarketSessionManager, "is_unwind_period", staticmethod(lambda symbol, *, now=None: True),
+    )
+    await _seed_fresh_market_metrics(agent)
+    await agent._run_cycle()
+    assert _broker(agent).limit_orders == []
+
+
+@pytest.mark.asyncio
+async def test_friday_unwind_publishes_weekend_unwind_status(
+    agent: AlphaMarketMakerAgent, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        MarketSessionManager, "is_unwind_period", staticmethod(lambda symbol, *, now=None: True),
+    )
+    await _seed_fresh_market_metrics(agent)
+    await agent._run_cycle()
+    raw = await _redis(agent).execute("get", f"{ALPHA_ENGINE_TELEMETRY_REDIS_KEY_PREFIX}{agent.agent_id}")
+    assert json.loads(raw)["status"] == "WEEKEND_UNWIND"
+
+
+@pytest.mark.asyncio
+async def test_friday_unwind_flattens_existing_inventory_to_zero_not_just_under_the_normal_cap(
+    redis_client: RedisClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real distinction from the normal hedge: cap=Decimal(0), so even inventory well under the
+    normal 0.5 cap (0.2) is fully flattened -- a scheduled full unwind, not a partial cap-breach hedge."""
+    agent = _make_agent(redis_client)
+    agent._broker = _FakeBroker(position_qty=Decimal("0.2"))
+    monkeypatch.setattr(
+        MarketSessionManager, "is_unwind_period", staticmethod(lambda symbol, *, now=None: True),
+    )
+    await _seed_fresh_market_metrics(agent)
+    await agent._run_cycle()
+    fake = _broker(agent)
+    assert fake.market_orders == [("BTC/USDT", "sell", 0.2)]
+
+
+@pytest.mark.asyncio
+async def test_friday_unwind_does_nothing_when_already_flat(
+    agent: AlphaMarketMakerAgent, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        MarketSessionManager, "is_unwind_period", staticmethod(lambda symbol, *, now=None: True),
+    )
+    await _seed_fresh_market_metrics(agent)
+    await agent._run_cycle()
+    assert _broker(agent).market_orders == []
+
+
+def test_unregistered_symbol_refuses_construction() -> None:
+    """A real configuration gap (module docstring point 14) -- fails at construction, not deep inside a live cycle."""
+    with pytest.raises(KeyError, match="not registered"):
+        AlphaMarketMakerAgent("DOGE/USDT", exchange_id="fake", manage_own_signals=False, manage_own_redis=False)

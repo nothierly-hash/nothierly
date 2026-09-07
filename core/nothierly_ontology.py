@@ -1,13 +1,17 @@
 """Chapter 13, Étape 5.8, Pilier 1: a cross-asset order/position/instrument model.
 
 **Scope, stated honestly upfront**: this project touches exactly three
-real asset classes today -- crypto spot (via ``ccxt``,
-:class:`~src.execution.broker_gateway.CcxtBrokerAdapter`), forex (via
-OANDA, :class:`~src.execution.broker_gateway.OandaBrokerAdapter`), and
-now equities (via Interactive Brokers,
+real broker integrations today -- crypto spot (via ``ccxt``,
+:class:`~src.execution.broker_gateway.CcxtBrokerAdapter`), forex/
+commodity CFDs (via OANDA, :class:`~src.execution.broker_gateway.
+OandaBrokerAdapter` -- symbol-agnostic, so it already places a real
+:data:`AssetClass.COMMODITY` order (``XAU_USD``, ``BCO_USD``, ...)
+exactly the same way it places a ``FOREX`` one, see
+``core/asset_universe.py`` for the real registry that actually
+classifies them that way), and equities (via Interactive Brokers,
 :class:`~src.execution.broker_gateway.IBKRBrokerAdapter`, which can
 also reach forex/crypto through IBKR itself). This module's real job is
-unifying *those three*, each of which arrives from its underlying SDK
+unifying *those*, each of which arrives from its underlying SDK
 as a loosely-typed ``dict[str, Any]`` (raw ``ccxt``, raw OANDA v20, raw
 ``ib_async``) with a different field name for the same concept (ccxt's
 ``amount`` vs. OANDA's ``units`` vs. ``ib_async``'s ``totalQuantity``,
@@ -51,6 +55,9 @@ class AssetClass(str, Enum):
     CRYPTO_PERPETUAL = "CRYPTO_PERPETUAL"  # schema-complete; no adapter places these today
     FOREX = "FOREX"
     EQUITY = "EQUITY"
+    COMMODITY = "COMMODITY"  # real OANDA CFDs (XAU_USD, BCO_USD, ...) -- see core/asset_universe.py's
+    # module docstring: OandaBrokerAdapter already places these today (it is symbol-agnostic), they
+    # were just previously left unclassified/mislabeled as FOREX instead of getting their own value.
 
 
 class OrderSide(str, Enum):

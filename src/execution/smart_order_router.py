@@ -107,9 +107,10 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 from typing import Any, Awaitable, Final, Literal, Protocol, Sequence
 
+from core.asset_universe import PositionSizingConvention, get_asset_universe_entry
 from core.config import AppSettings, get_settings
 from core.logger import get_logger
 from core.nothierly_ontology import OrderSide, UniversalAsset, UniversalOrder, order_from_ccxt
@@ -155,6 +156,50 @@ class SmartOrderRouterVenue(Protocol):
 def _effective_price(level_price: float, taker_fee_rate: float, side: OrderSide) -> float:
     """Real fee-inclusive cost (BUY) or proceeds (SELL) per unit at one real order-book level."""
     return level_price * (1 + taker_fee_rate) if side == OrderSide.BUY else level_price * (1 - taker_fee_rate)
+
+
+def normalize_signal_size(symbol: str, generic_units: Decimal) -> Decimal:
+    """Translate a generic RL signal's abstract "N units" into a real, placeable order quantity. See Mission 4 of the cross-asset mutation.
+
+    The RL agent's own action space stays exactly as it is today -- an
+    abstract, asset-blind size -- per this mutation's own "agnostic
+    design" constraint (see ``core/asset_universe.py``'s module
+    docstring): it must never learn a per-broker unit convention. This
+    is the *one* real translation point from that abstract space to a
+    real order size, and it branches only on the *looked-up*
+    :class:`~core.asset_universe.PositionSizingConvention` enum value --
+    never on ``symbol`` identity (no ``if symbol == "EUR_USD"`` anywhere
+    here or in any of this function's real callers).
+
+    Args:
+        symbol: A symbol registered in :data:`core.asset_universe.ASSET_UNIVERSE`.
+        generic_units: The signal's own abstract size (e.g. ``Decimal("1")``
+            for "one full unit of conviction"). Always treated as a
+            magnitude -- side/direction is the already-existing, separate
+            :class:`~core.nothierly_ontology.OrderSide` concept, not
+            encoded here.
+
+    Returns:
+        A real order quantity in the asset's own base-currency units,
+        quantized *down* to a whole multiple of
+        :attr:`~core.nothierly_ontology.UniversalAsset.lot_size` -- e.g.
+        ``BTC/USDT``: ``1`` -> ``1`` BTC directly;
+        ``EUR_USD``: ``1`` -> ``100,000`` units (one standard lot). Always
+        rounds down, never up: see ``core/asset_universe.py``'s module
+        docstring point 4 on why OANDA's own real ``int(quantity)``
+        truncation makes rounding up an order size that broker would
+        itself silently shrink a real, avoidable mis-sizing.
+    """
+    entry = get_asset_universe_entry(symbol)
+    if entry.position_sizing_convention is PositionSizingConvention.LOT_BASED:
+        raw_quantity = generic_units * entry.lot_multiplier
+    else:
+        raw_quantity = generic_units
+
+    lot_size = entry.asset.lot_size
+    if lot_size <= 0:
+        return raw_quantity
+    return (raw_quantity / lot_size).to_integral_value(rounding=ROUND_DOWN) * lot_size
 
 
 @dataclass(frozen=True)

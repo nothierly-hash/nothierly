@@ -726,6 +726,21 @@ ALPHA_ENGINE_EMERGENCY_LIQUIDATE_CHANNEL_PREFIX: Final[str] = "alpha_engine_emer
 # inventory cap keep meaning what it says after a crash.
 ALPHA_ENGINE_BASELINE_QTY_REDIS_KEY_PREFIX: Final[str] = "alpha_engine_baseline_qty:"
 
+# Redis key prefix (+ registry symbol, e.g. "EUR_USD") src/dashboard/ems_pages/
+# asset_universe_control.py writes a real "ON"/"OFF" per-asset kill switch under. No TTL --
+# same reasoning as AGENT_CONTROL_STATE_REDIS_KEY_PREFIX: a real operator decision must survive a
+# Redis restart, not silently revert to "ON". **Not yet consumed by AlphaMarketMakerAgent** (which
+# still only trades one hardcoded self._symbol per process, gated solely by its own
+# AgentControlState) -- written here, real and functional, so a future multi-symbol engine (or a
+# per-symbol read added to _run_cycle) has a real key to read rather than needing this page rebuilt.
+ALPHA_ENGINE_ASSET_STATUS_REDIS_KEY_PREFIX: Final[str] = "alpha_engine_asset_status:"
+
+# Redis key prefix (+ registry symbol) the same page writes a real JSON
+# {"max_allowable_spread": "<Decimal str>", "max_position_size": "<Decimal str>", "updated_at": <float>}
+# dynamic risk override under -- meant to shadow (not replace) core.asset_universe.ASSET_UNIVERSE's
+# static config without a restart. Same "not yet consumed" honesty note as the key above.
+ALPHA_ENGINE_ASSET_RISK_OVERRIDE_REDIS_KEY_PREFIX: Final[str] = "alpha_engine_asset_risk_override:"
+
 
 class FeatureVector(BaseModel):
     """One instrument's latest normalized technical-indicator snapshot.
