@@ -276,6 +276,54 @@ class AsyncExchangeClient:
         Returns:
             The raw ccxt order structure returned by the exchange.
         """
+        return await self._create_market_order_impl(symbol, side, amount, client_order_id=client_order_id)
+
+    async def create_market_order_bypassing_kill_switch(
+        self, symbol: str, side: Literal["buy", "sell"], amount: float, *, client_order_id: str | None = None
+    ) -> dict[str, Any]:
+        """The real "break-glass" exception to the global Kill Switch -- identical to :meth:`create_market_order` in every way except it is NOT ``@requires_system_active``-gated.
+
+        Extends this project's own, already-established principle for
+        why cleanup/cancellation calls are never Kill-Switch-gated (see
+        :mod:`core.security`'s own module docstring: "blocking those
+        during an emergency would strand exposure instead of tearing it
+        down, which is the opposite of what a kill switch is for") to
+        cover a second real cleanup action: **closing a position that
+        already exists**, not just cancelling a resting order. Previously
+        left as "an undecided policy question" by
+        :mod:`~src.execution.smart_order_router`'s own auto-unwind
+        docstring (a tripped switch blocks that module's unwind attempt
+        too) -- this resolves it for exactly one real, narrow, disclosed
+        caller: :class:`~src.agents.alpha_engine.agent.
+        AlphaMarketMakerAgent`'s Emergency Liquidate, a human-triggered,
+        single, bounded flatten of an already-real position, never used
+        to open new exposure.
+
+        **Deliberately not exposed as a general-purpose escape hatch**:
+        no retry wrapper (:func:`core.security.safe_financial_call`), no
+        automatic caller anywhere else in this codebase, and a name that
+        says exactly what it does so a future reader searching for every
+        real Kill-Switch bypass in this system finds it by name. Every
+        other real order-placing call in this codebase remains fully
+        gated -- this one method, for this one caller, is the entire
+        surface of the exception.
+
+        Args:
+            symbol: Exchange trading pair symbol (e.g. ``"BTC/USDT"``).
+            side: ``"buy"`` or ``"sell"``.
+            amount: Order size in base-asset units.
+            client_order_id: Idempotency hint forwarded to the exchange.
+                Defaults to a fresh UUID4 if omitted.
+
+        Returns:
+            The raw ccxt order structure returned by the exchange.
+        """
+        return await self._create_market_order_impl(symbol, side, amount, client_order_id=client_order_id)
+
+    async def _create_market_order_impl(
+        self, symbol: str, side: Literal["buy", "sell"], amount: float, *, client_order_id: str | None = None
+    ) -> dict[str, Any]:
+        """Shared real implementation for :meth:`create_market_order` and its break-glass twin above -- one source of truth, two gates."""
         params = {"clientOrderId": client_order_id or str(uuid.uuid4())}
         order: dict[str, Any] = await self._exchange.create_order(symbol, "market", side, amount, None, params)
         return order

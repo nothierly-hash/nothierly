@@ -135,9 +135,15 @@ async def main() -> None:
     # multiply that fragile surface sixfold versus sharing one -- see
     # core/base_agent.py's zmq_context parameter docstring.
     shared_zmq_context = zmq.asyncio.Context()
+    # The broker BINDS broker_bind_frontend_address/_backend_address when set (a multi-container
+    # deployment's 0.0.0.0 wildcard, reachable from other containers -- see docker-compose.yml's
+    # alpha-engine service and ZmqSettings.broker_bind_frontend_address's own docstring for exactly
+    # why this must be a real, separate address from what agents connect to). Falls back to
+    # broker_frontend_address/_backend_address when unset -- the original, still-default,
+    # single-container topology where bind and connect addresses are identical, unchanged.
     broker = ZmqBroker(
-        zmq_settings.broker_frontend_address,
-        zmq_settings.broker_backend_address,
+        zmq_settings.broker_bind_frontend_address or zmq_settings.broker_frontend_address,
+        zmq_settings.broker_bind_backend_address or zmq_settings.broker_backend_address,
         context=shared_zmq_context,
     )
     # manage_own_signals=False on every agent: OS signal handler

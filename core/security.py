@@ -10,7 +10,13 @@ manual intervention -- and every money-*creating* call (placing an order,
 renting a GPU) checks before acting. Cleanup/cancellation calls (cancelling
 orders, destroying a rented instance) deliberately never check it: blocking
 those during an emergency would strand exposure instead of tearing it down,
-which is the opposite of what a kill switch is for.
+which is the opposite of what a kill switch is for. The same principle now
+has a second, real instance -- closing a position that already exists, not
+just cancelling a resting order -- see :meth:`~src.agents.market_data.
+exchange_client.AsyncExchangeClient.create_market_order_bypassing_kill_switch`,
+used by exactly one real, disclosed, human-triggered caller
+(:class:`~src.agents.alpha_engine.agent.AlphaMarketMakerAgent`'s Emergency
+Liquidate), not a general-purpose escape hatch.
 
 Reuses the project's single :class:`~core.redis_client.RedisClient`
 connection pool (never a second, independent Redis connection): Redis

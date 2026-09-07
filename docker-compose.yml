@@ -122,8 +122,20 @@ services:
       REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD}
       TIMESCALE_HOST: timescaledb
       TIMESCALE_PORT: "5432"
-      ZMQ_BROKER_FRONTEND_ADDRESS: tcp://127.0.0.1:5559
-      ZMQ_BROKER_BACKEND_ADDRESS: tcp://127.0.0.1:5560
+      # What every publisher/subscriber CONNECTS to -- this container's own agents (unchanged: a
+      # container can always reach its own published service name over the Compose network) AND
+      # alpha-engine's separate container, both alike. Resolved via Compose's embedded DNS (the
+      # service name below is also its automatic network alias, independent of container_name above).
+      ZMQ_BROKER_FRONTEND_ADDRESS: tcp://nothierly-agents:5559
+      ZMQ_BROKER_BACKEND_ADDRESS: tcp://nothierly-agents:5560
+      # What the broker itself BINDS -- deliberately a DIFFERENT address (0.0.0.0, not
+      # nothierly-agents): 0.0.0.0 is only ever valid to bind, never to connect to (see
+      # ZmqSettings.broker_bind_frontend_address's own docstring). Without this, the connect-facing
+      # addresses above would have nothing real listening cross-container -- the fix this whole split
+      # exists for (see src/agents/alpha_engine/agent.py's _publish_audit_event docstring for the gap
+      # this closes: the ORDER_AUDIT_EVENTS_TOPIC publish previously reached no subscriber).
+      ZMQ_BROKER_BIND_FRONTEND_ADDRESS: tcp://0.0.0.0:5559
+      ZMQ_BROKER_BIND_BACKEND_ADDRESS: tcp://0.0.0.0:5560
     depends_on:
       redis-broker:
         condition: service_healthy
@@ -148,6 +160,66 @@ services:
       retries: 5
       start_period: 30s
     restart: unless-stopped
+
+  alpha-engine:
+    build: .
+    container_name: nothierly-${CLIENT_ID:?Set CLIENT_ID}-alpha-engine
+    # Deliberately its OWN container, not folded into nothierly-agents' shared 7-agent process -- see
+    # scripts/run_alpha_engine.py's own docstring: this project's multi-agent-coordination audit found
+    # that shared-process design's real blast-radius problem (one agent's crash kills every agent
+    # sharing that process). An autonomous engine placing real orders 24/7 gets its own failure domain.
+    command: ["python", "scripts/run_alpha_engine.py", "--symbol", "BTC/USDT", "--exchange", "binance"]
+    env_file:
+      - ${CLIENT_ENV_FILE:-.env}
+    environment:
+      CLIENT_ID: ${CLIENT_ID:?Set CLIENT_ID}
+      REDIS_HOST: redis-broker
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD}
+      # CONNECTS to nothierly-agents' real ZMQ broker across containers, resolved via Compose's
+      # embedded DNS (the service name is also nothierly-agents' automatic network alias) -- both
+      # services must share a network, which they do by default: neither this file nor any other
+      # service in it declares a custom `networks:` key, so Compose puts every service in this file on
+      # its one automatic default network already. This container never binds a broker itself -- only
+      # nothierly-agents does (see that service's own ZMQ_BROKER_BIND_*_ADDRESS) -- so no bind-facing
+      # vars are set here. This is what makes ORDER_AUDIT_EVENTS_TOPIC (see
+      # src/agents/alpha_engine/agent.py's _publish_audit_event) actually reach
+      # CryptographicAuditLedger and land in the real WORM ledger -- previously reached no subscriber;
+      # verified end-to-end (bind-wildcard + cross-process connect, this project's exact ZmqBroker/
+      # ZmqPublisher/ZmqSubscriber classes) before this was wired, not assumed. The one piece that
+      # genuinely could not be verified from this environment (no Docker available here) is Compose's
+      # own service-name DNS resolution itself -- standard, well-established behavior, but confirm with
+      # `docker compose logs alpha-engine` after first deploy that "zmq_publisher_connected" appears
+      # with no immediately-following connection error.
+      ZMQ_BROKER_FRONTEND_ADDRESS: tcp://nothierly-agents:5559
+      ZMQ_BROKER_BACKEND_ADDRESS: tcp://nothierly-agents:5560
+    depends_on:
+      redis-broker:
+        condition: service_healthy
+      nothierly-agents:
+        condition: service_healthy
+    healthcheck:
+      # Same real heartbeat:{agent_id} liveness proxy as nothierly-agents' own healthcheck, scoped to
+      # this one engine's specific agent_id (see core/base_agent.py's _write_heartbeat) rather than "any
+      # agent's heartbeat exists" -- this container has exactly one agent to be healthy about.
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - "import redis,sys; r=redis.Redis(host='redis-broker',port=6379,password='${REDIS_PASSWORD}'); sys.exit(0 if r.get('heartbeat:alpha-engine-btc-usdt') else 1)"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    # restart: always (not unless-stopped, unlike every other service here) -- the brief's own explicit
+    # requirement for a 24/7 autonomous engine, and safe specifically because this engine's real safety
+    # state (AgentControlState LIVE/SHADOW/OFF -- the Master Toggle) lives in Redis, not in the process:
+    # `always` also restarts a container after a Docker daemon restart even if an operator had run
+    # `docker stop` on it deliberately (the one real behavioral difference from `unless-stopped`, which
+    # respects that manual stop across daemon restarts) -- but on_start() reads the persisted control
+    # state back from Redis before ever placing an order, so a restart resumes into whatever state an
+    # operator last set (including OFF), never defaults to trading just because the container came back.
+    restart: always
 
   nothierly-dashboard:
     build: .

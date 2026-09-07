@@ -1,0 +1,416 @@
+"""Real, executable tests for src/agents/alpha_engine/agent.py.
+
+Same disciplines as this project's other agent tests: Redis is faked
+with ``fakeredis`` (fresh ``FakeServer()`` per test, see
+``tests/test_alert_agent.py``'s ``redis_client`` fixture, reused
+verbatim), ZMQ publishing is intercepted with a real recording stand-in
+(no mocking framework -- see ``tests/test_gateway.py``), and
+:class:`_FakeBroker` is a real, minimal :class:`~src.execution.
+broker_gateway.BaseBroker` implementation (not a mock) -- its
+``place_market_order``/``place_limit_order`` are genuinely
+``@requires_system_active``-decorated the same way the real
+``AsyncExchangeClient`` methods they stand in for actually are, so the
+Kill Switch tests below exercise the real decorator, same discipline as
+``tests/test_smart_order_router.py``'s ``_FakeVenue``.
+"""
+
+from __future__ import annotations
+
+import json
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+from typing import Any, Generator, Literal
+
+import fakeredis.aioredis
+import pytest
+
+from core.base_agent import AgentControlState
+from core.config import RedisSettings
+from core.nothierly_ontology import AssetClass, MarginSnapshot, UniversalAsset, UniversalPosition
+from core.notifier import TelegramNotifier
+from core.redis_client import RedisClient
+from core.schemas import (
+    AGENT_CONTROL_STATE_REDIS_KEY_PREFIX,
+    ALPHA_ENGINE_TELEMETRY_REDIS_KEY_PREFIX,
+    MARKET_METRICS_REDIS_KEY_PREFIX,
+)
+from core.security import requires_system_active, trip_kill_switch
+from src.agents.alpha_engine.agent import (
+    AlphaMarketMakerAgent,
+    _apply_fill,
+    _clamp_quote_sizes,
+    _skewed_quote_prices,
+)
+from src.execution.broker_gateway import BaseBroker
+
+_ASSET = UniversalAsset(
+    symbol="BTC/USDT", asset_class=AssetClass.CRYPTO_SPOT, base_currency="BTC", quote_currency="USDT",
+    tick_size=Decimal("0.01"), lot_size=Decimal("0.00001"),
+)
+
+
+# =============================================================================
+# _skewed_quote_prices
+# =============================================================================
+
+
+def test_skewed_quote_prices_symmetric_at_zero_inventory() -> None:
+    bid, ask = _skewed_quote_prices(
+        mid_price=Decimal("65000"), half_spread_bps=Decimal("5"),
+        inventory=Decimal(0), max_inventory=Decimal("0.5"), skew_bps=Decimal("15"),
+    )
+    mid = (bid + ask) / 2
+    assert mid == Decimal("65000")
+    assert ask > bid
+
+
+def test_skewed_quote_prices_long_inventory_leans_both_quotes_down() -> None:
+    bid_flat, ask_flat = _skewed_quote_prices(
+        mid_price=Decimal("65000"), half_spread_bps=Decimal("5"),
+        inventory=Decimal(0), max_inventory=Decimal("0.5"), skew_bps=Decimal("15"),
+    )
+    bid_long, ask_long = _skewed_quote_prices(
+        mid_price=Decimal("65000"), half_spread_bps=Decimal("5"),
+        inventory=Decimal("0.5"), max_inventory=Decimal("0.5"), skew_bps=Decimal("15"),
+    )
+    assert bid_long < bid_flat
+    assert ask_long < ask_flat
+
+
+# =============================================================================
+# _clamp_quote_sizes
+# =============================================================================
+
+
+def test_clamp_quote_sizes_both_sides_open_when_flat() -> None:
+    buy, sell = _clamp_quote_sizes(base_size=Decimal("0.01"), inventory=Decimal(0), max_inventory=Decimal("0.5"))
+    assert buy == Decimal("0.01")
+    assert sell == Decimal("0.01")
+
+
+def test_clamp_quote_sizes_buy_side_closes_at_cap() -> None:
+    buy, sell = _clamp_quote_sizes(base_size=Decimal("0.01"), inventory=Decimal("0.5"), max_inventory=Decimal("0.5"))
+    assert buy == Decimal(0)
+    assert sell == Decimal("0.01")
+
+
+def test_clamp_quote_sizes_sell_side_closes_at_negative_cap() -> None:
+    buy, sell = _clamp_quote_sizes(base_size=Decimal("0.01"), inventory=Decimal("-0.5"), max_inventory=Decimal("0.5"))
+    assert buy == Decimal("0.01")
+    assert sell == Decimal(0)
+
+
+# =============================================================================
+# _apply_fill
+# =============================================================================
+
+
+def test_apply_fill_opens_from_flat() -> None:
+    qty, avg_entry, realized = _apply_fill(
+        previous_qty=Decimal(0), previous_avg_entry_price=None, fill_qty=Decimal("0.01"), fill_price=Decimal("65000"),
+    )
+    assert qty == Decimal("0.01")
+    assert avg_entry == Decimal("65000")
+    assert realized == Decimal(0)
+
+
+def test_apply_fill_adds_same_direction_blends_cost_basis() -> None:
+    qty, avg_entry, realized = _apply_fill(
+        previous_qty=Decimal("0.01"), previous_avg_entry_price=Decimal("65000"),
+        fill_qty=Decimal("0.01"), fill_price=Decimal("66000"),
+    )
+    assert qty == Decimal("0.02")
+    assert avg_entry == Decimal("65500")
+    assert realized == Decimal(0)
+
+
+def test_apply_fill_partial_close_realizes_pnl_keeps_cost_basis() -> None:
+    qty, avg_entry, realized = _apply_fill(
+        previous_qty=Decimal("0.02"), previous_avg_entry_price=Decimal("65000"),
+        fill_qty=Decimal("-0.01"), fill_price=Decimal("66000"),
+    )
+    assert qty == Decimal("0.01")
+    assert avg_entry == Decimal("65000")  # unchanged -- remaining lot keeps its original cost basis
+    assert realized == Decimal("10")  # 0.01 * (66000 - 65000)
+
+
+def test_apply_fill_exact_close_clears_cost_basis() -> None:
+    qty, avg_entry, realized = _apply_fill(
+        previous_qty=Decimal("0.01"), previous_avg_entry_price=Decimal("65000"),
+        fill_qty=Decimal("-0.01"), fill_price=Decimal("64000"),
+    )
+    assert qty == Decimal(0)
+    assert avg_entry is None
+    assert realized == Decimal("-10")  # 0.01 * (64000 - 65000), a real loss
+
+
+def test_apply_fill_flips_through_flat_opens_new_lot() -> None:
+    qty, avg_entry, realized = _apply_fill(
+        previous_qty=Decimal("0.01"), previous_avg_entry_price=Decimal("65000"),
+        fill_qty=Decimal("-0.03"), fill_price=Decimal("64000"),
+    )
+    assert qty == Decimal("-0.02")
+    assert avg_entry == Decimal("64000")  # the new short lot's own entry price, not blended with the old long
+    assert realized == Decimal("-10")  # only the 0.01 that actually closed the old long realizes anything
+
+
+# =============================================================================
+# Agent-level tests -- real fakeredis + a real, minimal BaseBroker
+# =============================================================================
+
+
+class _RecordingZmqPublisher:
+    def __init__(self) -> None:
+        self.published: list[Any] = []
+
+    async def publish(self, payload: Any) -> None:
+        self.published.append(payload)
+
+    def close(self, linger_ms: int = 0) -> None:
+        pass
+
+
+class _FakeBroker(BaseBroker):
+    """A real, minimal BaseBroker -- see module docstring."""
+
+    def __init__(self, *, position_qty: Decimal = Decimal(0)) -> None:
+        self.broker_id = "fake"
+        self.position_qty = position_qty
+        self.limit_orders: list[tuple[str, Literal["buy", "sell"], float, float]] = []
+        self.market_orders: list[tuple[str, Literal["buy", "sell"], float]] = []
+        self.cancelled_order_ids: list[str] = []
+
+    async def connect(self) -> None:
+        pass
+
+    async def close(self) -> None:
+        pass
+
+    # The decorator's own Awaitable[...] wrapper type vs. BaseBroker's Coroutine[...] abstract signature
+    # below trips mypy's LSP override check -- not a real violation (same real, deliberate decoration
+    # AsyncExchangeClient.create_market_order carries).
+    @requires_system_active
+    async def place_market_order(  # type: ignore[override]
+        self, symbol: str, side: Literal["buy", "sell"], quantity: float, *, client_order_id: str | None = None
+    ) -> dict[str, Any]:
+        self.market_orders.append((symbol, side, quantity))
+        return {"id": client_order_id, "status": "closed", "filled": quantity}
+
+    async def emergency_flatten_market_order(
+        self, symbol: str, side: Literal["buy", "sell"], quantity: float, *, client_order_id: str | None = None
+    ) -> dict[str, Any]:
+        """Real override -- NOT @requires_system_active-decorated, mirroring CcxtBrokerAdapter's real one."""
+        self.market_orders.append((symbol, side, quantity))
+        return {"id": client_order_id, "status": "closed", "filled": quantity}
+
+    # Same note as place_market_order above.
+    @requires_system_active
+    async def place_limit_order(  # type: ignore[override]
+        self, symbol: str, side: Literal["buy", "sell"], quantity: float, price: float,
+        *, client_order_id: str | None = None,
+    ) -> dict[str, Any]:
+        self.limit_orders.append((symbol, side, quantity, price))
+        return {"id": client_order_id, "status": "open"}
+
+    async def cancel_order(self, order_id: str, *, symbol: str | None = None) -> dict[str, Any]:
+        self.cancelled_order_ids.append(order_id)
+        return {"id": order_id, "status": "cancelled"}
+
+    async def get_orderbook_snapshot(self, symbol: str, limit: int = 5) -> Any:
+        raise NotImplementedError
+
+    async def get_current_price(self, symbol: str) -> float:
+        return 65000.0
+
+    async def get_account_balance(self) -> float:
+        return 100_000.0
+
+    async def get_margin_snapshot(self) -> MarginSnapshot:
+        return MarginSnapshot(broker_id=self.broker_id, account_balance_usd=Decimal(100_000))
+
+    async def get_open_positions(self) -> list[UniversalPosition]:
+        if self.position_qty == 0:
+            return []
+        return [
+            UniversalPosition(
+                broker_id=self.broker_id, asset=_ASSET, quantity=self.position_qty,
+                avg_entry_price=Decimal("65000"), mark_price=Decimal("65000"), unrealized_pnl_usd=Decimal(0),
+            )
+        ]
+
+
+@pytest.fixture
+def redis_client() -> Generator[RedisClient, None, None]:
+    """Real fakeredis-backed RedisClient, also installed as the process singleton -- see tests/test_alert_agent.py."""
+    client = RedisClient(RedisSettings())
+    client._redis = fakeredis.aioredis.FakeRedis(server=fakeredis.FakeServer(), decode_responses=True)
+    RedisClient._instance = client
+    yield client
+    RedisClient._instance = None
+
+
+@pytest.fixture
+def agent(redis_client: RedisClient) -> AlphaMarketMakerAgent:
+    instance = AlphaMarketMakerAgent(
+        "BTC/USDT", exchange_id="fake", manage_own_signals=False, manage_own_redis=False,
+        max_inventory_units=Decimal("0.5"), quote_size_units=Decimal("0.01"),
+    )
+    instance._redis_client = redis_client
+    instance._publisher = _RecordingZmqPublisher()  # type: ignore[assignment]
+    instance._settings.mock_mode = False
+    instance._broker = _FakeBroker()
+    # Unconfigured (no bot_token/chat_id) -- .send() logs and returns False, never touches the network,
+    # same discipline as tests/test_alert_agent.py's send_sms_alert-skips-when-unconfigured test.
+    instance._notifier = TelegramNotifier(instance._settings.telegram)
+    return instance
+
+
+def _redis(agent: AlphaMarketMakerAgent) -> RedisClient:
+    assert agent._redis_client is not None
+    return agent._redis_client
+
+
+def _broker(agent: AlphaMarketMakerAgent) -> _FakeBroker:
+    assert isinstance(agent._broker, _FakeBroker)
+    return agent._broker
+
+
+async def _seed_fresh_market_metrics(agent: AlphaMarketMakerAgent, *, age_seconds: float = 0.0) -> None:
+    timestamp = datetime.now(timezone.utc) - timedelta(seconds=age_seconds)
+    await _redis(agent).execute(
+        "set", f"{MARKET_METRICS_REDIS_KEY_PREFIX}BTC/USDT",
+        json.dumps({"symbol": "BTC/USDT", "timestamp": timestamp.isoformat(), "spread": 1.0, "order_book_imbalance": 0.0, "mid_price": 65000.0}),
+    )
+
+
+@pytest.mark.asyncio
+async def test_read_fresh_market_metrics_missing_key(agent: AlphaMarketMakerAgent) -> None:
+    metrics, age = await agent._read_fresh_market_metrics()
+    assert metrics is None
+    assert age is None
+
+
+@pytest.mark.asyncio
+async def test_read_fresh_market_metrics_fresh(agent: AlphaMarketMakerAgent) -> None:
+    await _seed_fresh_market_metrics(agent, age_seconds=0.5)
+    metrics, age = await agent._read_fresh_market_metrics()
+    assert metrics is not None
+    assert age is not None and age < agent._max_market_data_age_seconds
+
+
+@pytest.mark.asyncio
+async def test_read_fresh_market_metrics_stale_is_rejected(agent: AlphaMarketMakerAgent) -> None:
+    """The exact real gap this engine's own multi-agent-coordination audit found missing everywhere else."""
+    await _seed_fresh_market_metrics(agent, age_seconds=agent._max_market_data_age_seconds + 1.0)
+    metrics, age = await agent._read_fresh_market_metrics()
+    assert metrics is None
+    assert age is not None and age > agent._max_market_data_age_seconds
+
+
+@pytest.mark.asyncio
+async def test_off_control_state_places_no_orders(agent: AlphaMarketMakerAgent) -> None:
+    await _seed_fresh_market_metrics(agent)
+    agent._control_state = AgentControlState.OFF
+    await agent._run_cycle()
+    fake = _broker(agent)
+    assert fake.limit_orders == []
+    assert fake.market_orders == []
+
+
+@pytest.mark.asyncio
+async def test_live_cycle_places_two_sided_quote_when_flat(agent: AlphaMarketMakerAgent) -> None:
+    await _seed_fresh_market_metrics(agent)
+    await agent._run_cycle()
+    fake = _broker(agent)
+    assert len(fake.limit_orders) == 2
+    sides = {order[1] for order in fake.limit_orders}
+    assert sides == {"buy", "sell"}
+
+
+@pytest.mark.asyncio
+async def test_inventory_breach_hedges_instead_of_quoting(agent: AlphaMarketMakerAgent) -> None:
+    """Real capital-preservation path: inventory over the cap gets a real flatten order, not a fresh quote."""
+    await _seed_fresh_market_metrics(agent)
+    fake = _broker(agent)
+    fake.position_qty = Decimal("0.6")  # over the 0.5 cap, baseline was 0 at construction time in this test
+    agent._baseline_qty = Decimal(0)
+    agent._last_known_total_qty = Decimal(0)
+
+    await agent._run_cycle()
+
+    assert fake.limit_orders == []  # no fresh quotes while over the cap
+    assert len(fake.market_orders) == 1
+    symbol, side, quantity = fake.market_orders[0]
+    assert side == "sell"  # long and over cap -> sell to reduce
+    assert quantity == pytest.approx(0.1)  # 0.6 - 0.5
+
+
+@pytest.mark.asyncio
+async def test_emergency_liquidate_flattens_position_and_forces_off(agent: AlphaMarketMakerAgent) -> None:
+    fake = _broker(agent)
+    fake.position_qty = Decimal("0.2")
+    agent._baseline_qty = Decimal(0)
+
+    await agent._execute_emergency_liquidate()
+
+    assert len(fake.market_orders) == 1
+    symbol, side, quantity = fake.market_orders[0]
+    assert side == "sell"
+    assert quantity == pytest.approx(0.2)
+    assert agent.control_state == AgentControlState.OFF
+
+    persisted = await _redis(agent).execute("get", f"{AGENT_CONTROL_STATE_REDIS_KEY_PREFIX}{agent.agent_id}")
+    # This installed fakeredis version returns raw bytes here despite decode_responses=True -- same real,
+    # separately-documented quirk as core/base_agent.py's own control-listener pubsub branch.
+    if isinstance(persisted, bytes):
+        persisted = persisted.decode()
+    assert persisted == AgentControlState.OFF.value
+
+
+@pytest.mark.asyncio
+async def test_emergency_liquidate_bypasses_a_tripped_global_kill_switch(agent: AlphaMarketMakerAgent) -> None:
+    """The real break-glass property: Emergency Liquidate still flattens even during a global PANIC.
+
+    A routine hedge/quote would be refused here (see
+    test_inventory_breach_hedges_instead_of_quoting's sibling scenario) --
+    this is the one, deliberate, disclosed exception.
+    """
+    await trip_kill_switch("test: simulating an unrelated global panic")
+
+    fake = _broker(agent)
+    fake.position_qty = Decimal("0.2")
+    agent._baseline_qty = Decimal(0)
+
+    await agent._execute_emergency_liquidate()
+
+    assert len(fake.market_orders) == 1
+    symbol, side, quantity = fake.market_orders[0]
+    assert side == "sell"
+    assert quantity == pytest.approx(0.2)
+    assert agent.control_state == AgentControlState.OFF
+
+
+@pytest.mark.asyncio
+async def test_routine_hedge_is_still_blocked_by_a_tripped_kill_switch(agent: AlphaMarketMakerAgent) -> None:
+    """Confirms the bypass is scoped to Emergency Liquidate only -- the routine auto-hedge stays gated."""
+    await trip_kill_switch("test: simulating an unrelated global panic")
+    await _seed_fresh_market_metrics(agent)
+    fake = _broker(agent)
+    fake.position_qty = Decimal("0.6")
+    agent._baseline_qty = Decimal(0)
+    agent._last_known_total_qty = Decimal(0)
+
+    await agent._run_cycle()
+
+    assert fake.market_orders == []  # blocked -- routine hedge never bypasses the Kill Switch
+
+
+@pytest.mark.asyncio
+async def test_telemetry_is_published_every_cycle(agent: AlphaMarketMakerAgent) -> None:
+    await _seed_fresh_market_metrics(agent)
+    await agent._run_cycle()
+    raw = await _redis(agent).execute("get", f"{ALPHA_ENGINE_TELEMETRY_REDIS_KEY_PREFIX}{agent.agent_id}")
+    assert raw is not None
+    telemetry = json.loads(raw)
+    assert telemetry["status"] == "LIVE"
+    assert telemetry["symbol"] == "BTC/USDT"

@@ -691,6 +691,28 @@ AUDIT_LEDGER_CHAIN_TIP_REDIS_KEY: Final[str] = "AUDIT_LEDGER_CHAIN_TIP"
 # automatically reprocessed).
 AUDIT_LEDGER_DEAD_LETTER_REDIS_KEY: Final[str] = "AUDIT_LEDGER_DEAD_LETTER_QUEUE"
 
+# Redis key prefix (+ agent_id) src.agents.alpha_engine.agent.AlphaMarketMakerAgent
+# writes a real, short-TTL JSON telemetry blob under, on every tick
+# (inventory, avg entry price, session realized/unrealized PnL, 24h trade
+# count, market-data staleness, current AgentControlState) -- read by
+# src/dashboard/ems_pages/autonomous_command_center.py. TTL'd like the
+# heartbeat above (not the no-TTL control-state key): a missing/expired
+# key here should read as "no live telemetry", not a stale last value
+# left behind after the engine crashed.
+ALPHA_ENGINE_TELEMETRY_REDIS_KEY_PREFIX: Final[str] = "alpha_engine_telemetry:"
+
+# Redis Pub/Sub channel prefix (+ agent_id) the dashboard's "Emergency
+# Liquidate" button PUBLISHes a one-shot command to -- deliberately a
+# *separate* channel from AGENT_CONTROL_CHANNEL_PREFIX above, not an
+# overload of AgentControlState.OFF: OFF only means "place no new
+# quotes", the same passive meaning every other agent already gives it
+# (see AgentControlState's own docstring) -- it does not, by itself,
+# mean "flatten every open position right now". Emergency Liquidate is
+# the strictly stronger, explicit action; AlphaMarketMakerAgent sets its
+# own control state to OFF as *part of* handling this message, it does
+# not treat OFF as implying it.
+ALPHA_ENGINE_EMERGENCY_LIQUIDATE_CHANNEL_PREFIX: Final[str] = "alpha_engine_emergency_liquidate:"
+
 
 class FeatureVector(BaseModel):
     """One instrument's latest normalized technical-indicator snapshot.

@@ -137,6 +137,31 @@ class BaseBroker(ABC):
     ) -> dict[str, Any]:
         """Place an immediate-fill (taker) order for ``quantity`` units of ``symbol``'s base asset."""
 
+    async def emergency_flatten_market_order(
+        self, symbol: str, side: OrderSide, quantity: float, *, client_order_id: str | None = None
+    ) -> dict[str, Any]:
+        """The real "break-glass" exception to the global Kill Switch -- see :mod:`core.security`'s own module docstring.
+
+        **Not abstract, deliberately**: the safe default just calls the
+        normal, fully-gated :meth:`place_market_order` -- a
+        :class:`BaseBroker` subclass that never overrides this behaves
+        exactly as if this method did not exist (fully gated, same as
+        every other real order call). Override only where a genuine,
+        disclosed, human-triggered "close an already-real position even
+        during a global panic" path exists and has been deliberately
+        built for that venue -- today, only :class:`CcxtBrokerAdapter`
+        (see its own override) -- so adding this method costs
+        :class:`OandaBrokerAdapter`/:class:`IBKRBrokerAdapter` nothing
+        and changes nothing about their behavior until someone
+        deliberately opts one of them in.
+
+        Never call this for anything other than closing a position that
+        already exists (a real Emergency Liquidate). It exists to let
+        capital already at risk be torn down during a panic, never to
+        let new exposure be opened around one.
+        """
+        return await self.place_market_order(symbol, side, quantity, client_order_id=client_order_id)
+
     @abstractmethod
     async def place_limit_order(
         self, symbol: str, side: OrderSide, quantity: float, price: float, *, client_order_id: str | None = None
@@ -230,6 +255,14 @@ class CcxtBrokerAdapter(BaseBroker):
         self, symbol: str, side: OrderSide, quantity: float, *, client_order_id: str | None = None
     ) -> dict[str, Any]:
         return await self._client.create_market_order(symbol, side, quantity, client_order_id=client_order_id)
+
+    async def emergency_flatten_market_order(
+        self, symbol: str, side: OrderSide, quantity: float, *, client_order_id: str | None = None
+    ) -> dict[str, Any]:
+        """Real break-glass override -- see :class:`BaseBroker`'s own docstring on this method."""
+        return await self._client.create_market_order_bypassing_kill_switch(
+            symbol, side, quantity, client_order_id=client_order_id
+        )
 
     async def place_limit_order(
         self, symbol: str, side: OrderSide, quantity: float, price: float, *, client_order_id: str | None = None

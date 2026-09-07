@@ -39,6 +39,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 _ZMQ_ADDRESS_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"^(?P<scheme>tcp|ipc|inproc)://(?P<host>[^:]+)(:(?P<port>\d+))?$"
 )
+# RFC 1123 hostname: dot-separated labels, each 1-63 chars, alphanumeric with internal hyphens only
+# (no leading/trailing hyphen per label) -- matches a real Docker Compose service name (e.g.
+# "nothierly-agents", what ZmqSettings.broker_frontend_address resolves to for a cross-container
+# ZMQ connection -- see that field's own docstring) as well as any real external DNS hostname.
+_HOSTNAME_LABEL: Final[str] = r"[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?"
+_HOSTNAME_PATTERN: Final[re.Pattern[str]] = re.compile(rf"^{_HOSTNAME_LABEL}(\.{_HOSTNAME_LABEL})*$")
 
 
 class ConfigurationError(RuntimeError):
@@ -87,10 +93,20 @@ def _validate_zmq_address(value: str) -> str:
     if scheme in ("tcp", "inproc") and host not in ("*", "localhost"):
         try:
             IPv4Address(host)
-        except AddressValueError as exc:
-            raise ValueError(
-                f"Invalid ZMQ host {host!r} in address {value!r}: {exc}"
-            ) from exc
+        except AddressValueError:
+            # Not a literal IPv4 address -- fall back to a real DNS-hostname check (e.g. a Docker
+            # Compose service name like "nothierly-agents", resolved at connect time by whatever
+            # resolver is actually in effect -- this validator only rejects something that could
+            # never be a real hostname either, it does not itself perform DNS resolution). Standard
+            # RFC 952/1123 disambiguation rule: a hostname whose LAST label is all-digits (e.g. a
+            # malformed almost-IP like "999.999.999.999") is rejected as neither a valid IP nor a
+            # real hostname, rather than silently accepted as one.
+            last_label = host.rsplit(".", 1)[-1]
+            if not _HOSTNAME_PATTERN.match(host) or len(host) > 253 or last_label.isdigit():
+                raise ValueError(
+                    f"Invalid ZMQ host {host!r} in address {value!r}: not '*', 'localhost', a valid "
+                    "IPv4 address, or a valid DNS hostname."
+                ) from None
 
     if scheme in ("tcp", "inproc"):
         if port is None:
@@ -179,6 +195,26 @@ class ZmqSettings(BaseSettings):
             "instead of sub_address."
         ),
     )
+    broker_bind_frontend_address: str | None = Field(
+        default=None,
+        description=(
+            "Address scripts.run_backend's real ZmqBroker actually BINDS its XSUB frontend to -- "
+            "distinct from broker_frontend_address (what every agent's publisher CONNECTS to), "
+            "because those two are not always the same reachable address. Real, disclosed reason this "
+            "split exists: a single-container deployment can bind and connect on the identical "
+            "127.0.0.1 address (the original, still-default topology, unchanged when this is left "
+            "unset -- falls back to broker_frontend_address, exactly the prior single-address "
+            "behavior). A multi-container deployment (see docker-compose.yml's alpha-engine service, "
+            "run in its own container) needs the broker to bind a wildcard address (0.0.0.0) reachable "
+            "from other containers, while every in-container connector (including nothierly-agents' "
+            "own agents) keeps connecting via the service's real DNS name, not 0.0.0.0 -- 0.0.0.0 is a "
+            "valid bind target, never a valid connect target."
+        ),
+    )
+    broker_bind_backend_address: str | None = Field(
+        default=None,
+        description="Same real bind/connect split as broker_bind_frontend_address, for the XPUB backend.",
+    )
     high_water_mark: int = Field(
         default=1000,
         ge=1,
@@ -190,7 +226,11 @@ class ZmqSettings(BaseSettings):
     def _check_address(cls, value: str) -> str:
         return _validate_zmq_address(value)
 
-    @field_validator("broker_frontend_address", "broker_backend_address", mode="before")
+    @field_validator(
+        "broker_frontend_address", "broker_backend_address",
+        "broker_bind_frontend_address", "broker_bind_backend_address",
+        mode="before",
+    )
     @classmethod
     def _blank_broker_address_means_unset(cls, value: str | None) -> str | None:
         # pydantic-settings maps an env var set to an empty string (e.g.
@@ -202,7 +242,10 @@ class ZmqSettings(BaseSettings):
         # deployment would fail validation on startup.
         return None if value == "" else value
 
-    @field_validator("broker_frontend_address", "broker_backend_address")
+    @field_validator(
+        "broker_frontend_address", "broker_backend_address",
+        "broker_bind_frontend_address", "broker_bind_backend_address",
+    )
     @classmethod
     def _check_broker_address(cls, value: str | None) -> str | None:
         return value if value is None else _validate_zmq_address(value)
@@ -562,6 +605,31 @@ class TwilioSettings(BaseSettings):
     )
 
 
+class TelegramSettings(BaseSettings):
+    """Credentials for ``core/notifier.py``'s push alerts (Autonomous Alpha Engine critical events).
+
+    Populated from environment variables prefixed with ``TELEGRAM_``. Same
+    all-optional, fail-soft shape as :class:`TwilioSettings`/
+    :class:`EmailSettings`: an unconfigured deployment can still run the
+    trading engine, it just cannot push a Telegram alert --
+    :meth:`~core.notifier.TelegramNotifier.send` logs and skips rather
+    than raising when either field is missing, so a misconfigured
+    notification channel never crashes the agent watching for a real
+    danger (same contract :func:`~src.agents.alert_agent.send_sms_alert`
+    already established).
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="TELEGRAM_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    bot_token: SecretStr | None = Field(default=None, description="Telegram Bot API token, from @BotFather.")
+    chat_id: str | None = Field(default=None, description="Destination chat/user/channel ID critical alerts are sent to.")
+
+
 class EmailSettings(BaseSettings):
     """SMTP credentials for ``src/execution/reporting_engine.py``'s monthly client report emails.
 
@@ -773,8 +841,9 @@ class AppSettings(BaseSettings):
     :class:`VastAiSettings`, :class:`MacroApiSettings`,
     :class:`NewsApiSettings`, :class:`TimescaleSettings`,
     :class:`GuardianSettings`, :class:`DashboardSettings`,
-    :class:`R2Settings`, and :class:`ApiMiddlewareSettings` groups, each
-    of which independently reads its own prefixed environment variables.
+    :class:`R2Settings`, :class:`ApiMiddlewareSettings`, and
+    :class:`TelegramSettings` groups, each of which independently reads
+    its own prefixed environment variables.
     """
 
     model_config = SettingsConfigDict(
@@ -824,6 +893,7 @@ class AppSettings(BaseSettings):
     twilio: TwilioSettings = Field(default_factory=TwilioSettings)
     vault: VaultSettings = Field(default_factory=VaultSettings)
     email: EmailSettings = Field(default_factory=EmailSettings)
+    telegram: TelegramSettings = Field(default_factory=TelegramSettings)
 
     @field_validator("log_level")
     @classmethod

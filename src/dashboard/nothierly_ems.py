@@ -84,6 +84,9 @@ render_theme_css(mode)
 # this app didn't have yet when this grouping was introduced; each is added to
 # its section as its own real page lands, not stubbed in ahead of time.
 pages = {
+    "🔴 Autonomous Trading": [
+        st.Page(str(_PAGES_DIR / "autonomous_command_center.py"), title="Autonomous Command Center", icon="🔴"),
+    ],
     "📊 Execution & Routing": [
         st.Page(str(_PAGES_DIR / "command_center.py"), title="Command Center", icon="📊", default=True),
         st.Page(str(_PAGES_DIR / "liquidity_routing.py"), title="Liquidity Routing", icon="🔌"),
