@@ -164,6 +164,10 @@ services:
   alpha-engine:
     build: .
     container_name: nothierly-${CLIENT_ID:?Set CLIENT_ID}-alpha-engine
+    # Read by the autoheal service below -- see that service's own comment for the real gap this
+    # closes (a failing healthcheck alone does not make plain Docker Compose restart a container).
+    labels:
+      autoheal: "true"
     # Deliberately its OWN container, not folded into nothierly-agents' shared 7-agent process -- see
     # scripts/run_alpha_engine.py's own docstring: this project's multi-agent-coordination audit found
     # that shared-process design's real blast-radius problem (one agent's crash kills every agent
@@ -220,6 +224,28 @@ services:
     # state back from Redis before ever placing an order, so a restart resumes into whatever state an
     # operator last set (including OFF), never defaults to trading just because the container came back.
     restart: always
+
+  # The real, disclosed gap this closes: a `healthcheck:` block alone (see alpha-engine's above)
+  # only makes `docker ps` report "unhealthy" -- plain Docker Compose does NOT itself restart a
+  # container just because its healthcheck starts failing, only on real process exit (which
+  # `restart: always` already reacts to). A genuine asyncio deadlock (the process still running,
+  # just no longer making progress -- core/base_agent.py's heartbeat write simply stops) would
+  # sit there marked "unhealthy" forever without this. `willfarrell/autoheal` is the standard,
+  # widely-used real answer for plain Docker/Compose (no Swarm/Kubernetes liveness probes here):
+  # it watches the Docker socket and force-kills any container Docker has marked unhealthy, which
+  # `restart: always` then genuinely restarts. Scoped to only the alpha-engine container via the
+  # `autoheal: "true"` label above + AUTOHEAL_CONTAINER_LABEL below -- nothierly-agents/-dashboard
+  # are untouched, not silently opted in.
+  autoheal:
+    image: willfarrell/autoheal:latest
+    container_name: nothierly-${CLIENT_ID:?Set CLIENT_ID}-autoheal
+    environment:
+      AUTOHEAL_CONTAINER_LABEL: autoheal
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      - alpha-engine
+    restart: unless-stopped
 
   nothierly-dashboard:
     build: .
