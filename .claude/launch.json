@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "gateway",
+      "runtimeExecutable": ".venv/Scripts/uvicorn.exe",
+      "runtimeArgs": ["api_middleware.gateway:app", "--host", "127.0.0.1", "--port", "8000", "--no-server-header"],
+      "port": 8000
+    },
+    {
+      "name": "nothierly-ems",
+      "runtimeExecutable": ".venv/Scripts/streamlit.exe",
+      "runtimeArgs": ["run", "src/dashboard/nothierly_ems.py", "--server.headless", "true", "--server.port", "8503"],
+      "port": 8503
+    }
+  ]
+}

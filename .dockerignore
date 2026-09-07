@@ -1,0 +1,26 @@
+# Version control
+.git
+.gitignore
+
+# Virtual environments
+.venv
+.venv_test
+venv
+env
+
+# Python cache/build artifacts
+__pycache__
+*.pyc
+*.pyo
+.mypy_cache
+.pytest_cache
+*.egg-info
+
+# Secrets -- never baked into an image; injected at runtime via
+# docker-compose's env_file instead (see docker-compose.yml).
+.env
+
+# Local-only artifacts not needed inside the image
+logs/
+models/
+.claude/
