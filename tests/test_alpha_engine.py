@@ -31,6 +31,7 @@ from core.notifier import TelegramNotifier
 from core.redis_client import RedisClient
 from core.schemas import (
     AGENT_CONTROL_STATE_REDIS_KEY_PREFIX,
+    ALPHA_ENGINE_BASELINE_QTY_REDIS_KEY_PREFIX,
     ALPHA_ENGINE_TELEMETRY_REDIS_KEY_PREFIX,
     MARKET_METRICS_REDIS_KEY_PREFIX,
 )
@@ -41,6 +42,7 @@ from src.agents.alpha_engine.agent import (
     _clamp_quote_sizes,
     _skewed_quote_prices,
 )
+from network.resilience_mesh import RateLimitMesh
 from src.execution.broker_gateway import BaseBroker
 
 _ASSET = UniversalAsset(
@@ -173,18 +175,27 @@ class _RecordingZmqPublisher:
 class _FakeBroker(BaseBroker):
     """A real, minimal BaseBroker -- see module docstring."""
 
-    def __init__(self, *, position_qty: Decimal = Decimal(0)) -> None:
+    def __init__(self, *, position_qty: Decimal = Decimal(0), supports_cancel_all: bool = True) -> None:
         self.broker_id = "fake"
         self.position_qty = position_qty
         self.limit_orders: list[tuple[str, Literal["buy", "sell"], float, float]] = []
         self.market_orders: list[tuple[str, Literal["buy", "sell"], float]] = []
         self.cancelled_order_ids: list[str] = []
+        self.supports_cancel_all = supports_cancel_all
+        self.orphaned_orders_to_report: list[dict[str, Any]] = []
+        self.cancel_all_open_orders_calls: list[str | None] = []
 
     async def connect(self) -> None:
         pass
 
     async def close(self) -> None:
         pass
+
+    async def cancel_all_open_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
+        if not self.supports_cancel_all:
+            raise NotImplementedError("this fake broker doesn't support it, for this one test")
+        self.cancel_all_open_orders_calls.append(symbol)
+        return self.orphaned_orders_to_report
 
     # The decorator's own Awaitable[...] wrapper type vs. BaseBroker's Coroutine[...] abstract signature
     # below trips mypy's LSP override check -- not a real violation (same real, deliberate decoration
@@ -261,6 +272,11 @@ def _make_agent(redis_client: RedisClient, **kwargs: Any) -> AlphaMarketMakerAge
     instance._publisher = _RecordingZmqPublisher()  # type: ignore[assignment]
     instance._settings.mock_mode = False
     instance._broker = _FakeBroker()
+    # A real RateLimitMesh, registered generously (1000/s) so no test is ever actually delayed by
+    # real pacing -- these tests exercise order-placement logic, not RateLimitMesh's own throttle
+    # timing (see tests/test_resilience_mesh.py for that).
+    instance._rate_limit_mesh = RateLimitMesh()
+    instance._rate_limit_mesh.register_broker("fake", requests_per_second=1000.0)
     # Unconfigured (no bot_token/chat_id) -- .send() logs and returns False, never touches the network,
     # same discipline as tests/test_alert_agent.py's send_sms_alert-skips-when-unconfigured test.
     instance._notifier = TelegramNotifier(instance._settings.telegram)
@@ -518,3 +534,68 @@ def test_trade_timestamps_deque_has_a_maxlen_backstop(agent: AlphaMarketMakerAge
 
 def test_order_placement_timestamps_deque_has_a_maxlen_backstop(agent: AlphaMarketMakerAgent) -> None:
     assert agent._order_placement_timestamps.maxlen == 10_000
+
+
+# =============================================================================
+# _bootstrap_cold_start_sanitizer -- module docstring point 11
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_cancels_real_orphaned_orders(agent: AlphaMarketMakerAgent) -> None:
+    fake = _broker(agent)
+    fake.orphaned_orders_to_report = [{"id": "orphan-1"}, {"id": "orphan-2"}]
+
+    await agent._bootstrap_cold_start_sanitizer()
+
+    assert fake.cancel_all_open_orders_calls == ["BTC/USDT"]
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_establishes_baseline_on_a_real_first_run(agent: AlphaMarketMakerAgent) -> None:
+    fake = _broker(agent)
+    fake.position_qty = Decimal("0.2")  # e.g. the operator's own initial sub-account funding
+
+    await agent._bootstrap_cold_start_sanitizer()
+
+    assert agent._baseline_qty == Decimal("0.2")
+    persisted = await _redis(agent).execute("get", f"{ALPHA_ENGINE_BASELINE_QTY_REDIS_KEY_PREFIX}{agent.agent_id}")
+    if isinstance(persisted, bytes):
+        persisted = persisted.decode()
+    assert persisted == "0.2"
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_restores_persisted_baseline_instead_of_recomputing(agent: AlphaMarketMakerAgent) -> None:
+    """The real bug this fixes: a restart must not 'forget' this engine's own prior real inventory."""
+    fake = _broker(agent)
+    # A previous real session persisted a baseline of 0.1 (its own starting point back then)...
+    await _redis(agent).execute("set", f"{ALPHA_ENGINE_BASELINE_QTY_REDIS_KEY_PREFIX}{agent.agent_id}", "0.1")
+    # ...and had legitimately accumulated up to 0.3 real BTC by the time it crashed.
+    fake.position_qty = Decimal("0.3")
+
+    await agent._bootstrap_cold_start_sanitizer()
+
+    assert agent._baseline_qty == Decimal("0.1")  # restored, NOT recomputed as "0.3, so 0 owned"
+    own_inventory = fake.position_qty - agent._baseline_qty
+    assert own_inventory == Decimal("0.2")  # the real, remembered exposure this engine is responsible for
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_refuses_to_start_when_already_over_cap(agent: AlphaMarketMakerAgent) -> None:
+    fake = _broker(agent)
+    await _redis(agent).execute("set", f"{ALPHA_ENGINE_BASELINE_QTY_REDIS_KEY_PREFIX}{agent.agent_id}", "0")
+    fake.position_qty = Decimal("0.9")  # own inventory 0.9 > the 0.5 cap, before any cycle ever ran
+
+    with pytest.raises(RuntimeError, match="already exceeds"):
+        await agent._bootstrap_cold_start_sanitizer()
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_tolerates_a_broker_without_cancel_all_support(agent: AlphaMarketMakerAgent) -> None:
+    fake = _broker(agent)
+    fake.supports_cancel_all = False
+
+    await agent._bootstrap_cold_start_sanitizer()  # must not raise -- logs and proceeds to baseline handling
+
+    assert agent._baseline_qty == Decimal(0)

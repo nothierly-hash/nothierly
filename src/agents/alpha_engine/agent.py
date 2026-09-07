@@ -159,6 +159,66 @@ entirely and fires an immediate real market order to flatten the excess
     second, independent check specifically for this engine's request,
     not re-derived from memory).
 
+11. **Cold-start sanitizer: real, and corrected on one real premise.**
+    :meth:`_bootstrap_cold_start_sanitizer` cancels every real orphaned
+    order left resting from a possible previous crashed session (via
+    :meth:`~src.execution.broker_gateway.BaseBroker.
+    cancel_all_open_orders`, itself delegating to
+    :meth:`~src.agents.market_data.exchange_client.
+    AsyncExchangeClient.cancel_all_orders`, which already existed for
+    exactly this before this engine did) and refuses to start if the
+    real starting inventory already exceeds the cap. The one real
+    premise this corrects: this engine never assumed inventory started
+    at zero on restart (:meth:`on_start` already re-read the real
+    broker balance every time) -- the actual, more subtle bug was that
+    re-deriving the baseline fresh on *every* restart silently forgot
+    whatever inventory this engine's own prior (crashed) session had
+    legitimately accumulated, treating it as pre-existing/cap-exempt
+    instead of counting it. Fixed by persisting the baseline once, in
+    Redis (:data:`~core.schemas.ALPHA_ENGINE_BASELINE_QTY_REDIS_KEY_PREFIX`,
+    no TTL -- must survive a restart), and reusing it across every
+    subsequent restart rather than recomputing it.
+
+12. **A private-WebSocket ``listenKey`` keepalive does not apply to this
+    engine, and would not be built the way briefed even if it did.**
+    This engine holds no private authenticated WebSocket stream at all
+    -- fills are detected by polling
+    :meth:`~src.execution.broker_gateway.BaseBroker.get_open_positions`
+    once per cycle (a real, disclosed approximation, see point 7), not
+    ``ccxt.pro``'s ``watchMyTrades``. There is therefore no
+    ``listenKey`` anywhere in this engine's real call graph to expire.
+    Were ``watchMyTrades`` added later for lower-latency fill detection,
+    ``ccxt.pro`` -- already this project's real WebSocket layer for
+    :class:`~src.agents.market_data.agent.MarketDataAgent`'s public
+    streams -- handles a private stream's exchange-specific session
+    refresh internally as part of what it abstracts; hand-rolling a
+    manual keepalive loop calling a raw ``ping_listen_key`` method that
+    does not exist on :class:`~src.agents.market_data.exchange_client.
+    AsyncExchangeClient` would duplicate, incorrectly, something the
+    library this project already depends on already does.
+
+13. **Rate-limit-ban protection: the real, already-built
+    :class:`~network.resilience_mesh.RateLimitMesh`, wired in at this
+    engine's own boundary, not the shared exchange-client layer.**
+    A real, already-tested ``TokenBucket``-based proactive throttle (+
+    real adaptive backoff on an actual ``ccxt`` ``RateLimitExceeded``/
+    ``DDoSProtection``) already existed in this codebase -- unwired,
+    unused by any caller, exactly the same "built the right thing,
+    never plugged it in" pattern this project's own operational-
+    blind-spots audit already found once. Wiring it project-wide (every
+    caller of :class:`~src.agents.market_data.exchange_client.
+    AsyncExchangeClient`, including :mod:`~src.execution.
+    smart_order_router` and :class:`~src.agents.execution.agent.
+    ExecutionAgent`) is a real, separate, larger change touching
+    already-live components this engine's own hardening pass should not
+    casually take on unasked -- scoped here to this engine's own real
+    order-placing calls only. See :meth:`_place_resting_order`/
+    :meth:`_hedge_excess_inventory`. Complements, does not duplicate,
+    point 8's order-rate circuit breaker: the mesh *paces* calls to stay
+    under the exchange's real published limit and *adapts* on an actual
+    rejection; the circuit breaker *halts the engine* on a genuinely
+    pathological burst. Different jobs, both real, kept both.
+
 **Kill-switch interaction**: every *routine* real order this engine
 places (a resting quote, the automatic inventory-limit hedge in
 :meth:`_hedge_excess_inventory`) goes through
@@ -211,6 +271,7 @@ from core.redis_client import RedisUnavailableError
 from core.schemas import (
     AGENT_CONTROL_CHANNEL_PREFIX,
     AGENT_CONTROL_STATE_REDIS_KEY_PREFIX,
+    ALPHA_ENGINE_BASELINE_QTY_REDIS_KEY_PREFIX,
     ALPHA_ENGINE_EMERGENCY_LIQUIDATE_CHANNEL_PREFIX,
     ALPHA_ENGINE_TELEMETRY_REDIS_KEY_PREFIX,
     MARKET_METRICS_REDIS_KEY_PREFIX,
@@ -218,6 +279,7 @@ from core.schemas import (
     MarketMetrics,
 )
 from core.security import FinancialCallAbortedError, KillSwitchActiveError, safe_financial_call
+from network.resilience_mesh import RateLimitMesh
 from src.execution.audit_ledger import OrderAuditEvent
 from src.execution.broker_gateway import BaseBroker, BrokerFactory
 
@@ -242,6 +304,21 @@ _DEFAULT_ORDER_RATE_WINDOW_SECONDS: Final[float] = 10.0
 
 _TRADE_TIMESTAMPS_MAXLEN: Final[int] = 100_000  # OOM backstop -- see module docstring point 10
 _ORDER_TIMESTAMPS_MAXLEN: Final[int] = 10_000
+
+# See module docstring point 11: bounds AsyncExchangeClient.cancel_all_orders' own indefinite retry
+# loop during startup specifically -- correct for that method's real intended caller (an
+# already-running process reacting to a transient blip), wrong for a fresh process that should fail
+# closed rather than hang indefinitely if the exchange is unreachable at the one moment it's trying
+# to confirm a clean starting state.
+_COLD_START_TIMEOUT_SECONDS: Final[float] = 30.0
+
+# See module docstring point 13. Binance spot's real published order-rate limit is ~50 orders/10s
+# (5/s) -- this defaults well under that (a real safety margin, not a value grazing the real limit),
+# and is comfortably above this engine's own routine ~2 orders/cycle at the default 1.0s
+# tick_interval_seconds. Confirm your venue's real published limit and tune via
+# --order-rate-limit-per-second (scripts/run_alpha_engine.py) rather than trusting this blindly for
+# a different exchange.
+_DEFAULT_ORDER_RATE_LIMIT_PER_SECOND: Final[float] = 3.0
 
 
 # =============================================================================
@@ -340,6 +417,7 @@ class AlphaMarketMakerAgent(BaseAgent):
         max_order_rate_window_seconds: float = _DEFAULT_ORDER_RATE_WINDOW_SECONDS,
         max_single_order_units: Decimal | None = None,
         max_daily_loss_usd: Decimal | None = None,
+        order_rate_limit_per_second: float = _DEFAULT_ORDER_RATE_LIMIT_PER_SECOND,
         tick_interval_seconds: float = _DEFAULT_TICK_INTERVAL_SECONDS,
         settings: AppSettings | None = None,
         manage_own_signals: bool = True,
@@ -384,9 +462,13 @@ class AlphaMarketMakerAgent(BaseAgent):
         # no way to know). scripts/run_alpha_engine.py's own --max-daily-loss-usd flag, and on_start's
         # own startup warning below, exist specifically so this is never silently left disabled.
         self._max_daily_loss_usd = max_daily_loss_usd
+        self._order_rate_limit_per_second = order_rate_limit_per_second
 
         self._broker: BaseBroker | None = None
         self._notifier: TelegramNotifier | None = None
+        # Real, only registered once connected in on_start (not under MOCK_MODE, which never places
+        # a real order and so never needs pacing) -- see module docstring point 13.
+        self._rate_limit_mesh: RateLimitMesh | None = None
         self._order_lock = asyncio.Lock()
         self._resting_order_ids: dict[Literal["buy", "sell"], str | None] = {"buy": None, "sell": None}
 
@@ -433,8 +515,11 @@ class AlphaMarketMakerAgent(BaseAgent):
                 self._exchange_id, settings=self._settings, redis_client=self._redis_client,
             )
             await self._broker.connect()
-            self._baseline_qty = await self._read_total_inventory()
-            self._last_known_total_qty = self._baseline_qty
+            self._rate_limit_mesh = RateLimitMesh()
+            self._rate_limit_mesh.register_broker(
+                self._exchange_id, requests_per_second=self._order_rate_limit_per_second,
+            )
+            await self._bootstrap_cold_start_sanitizer()
         else:
             self._log.info("alpha_engine_mock_mode_broker_not_connected", agent_id=self.agent_id)
 
@@ -468,6 +553,87 @@ class AlphaMarketMakerAgent(BaseAgent):
             f"Mode : {'SIMULÉ (MOCK_MODE)' if self._settings.mock_mode else 'RÉEL'}.",
             severity=AlertSeverity.INFO, source=self.agent_id,
         )
+
+    async def _bootstrap_cold_start_sanitizer(self) -> None:
+        """Real pre-flight cleanup before this engine ever trusts its own in-memory state. See module docstring point 11.
+
+        Called from :meth:`on_start`, only when a real broker is
+        connected (never under ``MOCK_MODE``, which has no real state to
+        sanitize). Two real, independent steps:
+
+        1. Cancel every real orphaned order left resting from a possible
+           previous crashed session -- this engine's own
+           ``_resting_order_ids`` is fresh, empty, in-memory state right
+           after a restart; it has no idea a previous process's quotes
+           might still be live on the exchange.
+        2. Restore (or, on a real first-ever run, establish) the
+           persisted inventory baseline, then refuse to start if the
+           real resulting owned inventory already exceeds the cap --
+           the real "position already too large, do not start trading
+           more on top of it" check.
+        """
+        assert self._broker is not None
+        assert self._notifier is not None
+        assert self._redis_client is not None
+
+        try:
+            cancelled = await asyncio.wait_for(
+                self._broker.cancel_all_open_orders(self._symbol), timeout=_COLD_START_TIMEOUT_SECONDS,
+            )
+            if cancelled:
+                self._log.warning(
+                    "alpha_engine_orphaned_orders_cancelled_at_startup",
+                    agent_id=self.agent_id, symbol=self._symbol, count=len(cancelled),
+                )
+        except NotImplementedError:
+            self._log.warning(
+                "alpha_engine_cancel_all_open_orders_not_supported", agent_id=self.agent_id,
+                detail="This broker adapter has no real orphaned-order cleanup implemented -- any "
+                "resting order left over from a previous crashed session was NOT cancelled.",
+            )
+        except TimeoutError:
+            raise RuntimeError(
+                f"{self.agent_id}: could not confirm a clean order-book state within "
+                f"{_COLD_START_TIMEOUT_SECONDS}s (cancel_all_open_orders timed out) -- refusing to "
+                "start with an unconfirmed set of possibly-orphaned resting orders."
+            ) from None
+
+        persisted_baseline_raw = await self._redis_client.execute(
+            "get", f"{ALPHA_ENGINE_BASELINE_QTY_REDIS_KEY_PREFIX}{self.agent_id}",
+        )
+        if isinstance(persisted_baseline_raw, bytes):
+            persisted_baseline_raw = persisted_baseline_raw.decode()
+        current_total = await self._read_total_inventory()
+
+        if persisted_baseline_raw is not None:
+            self._baseline_qty = Decimal(persisted_baseline_raw)
+            self._log.info(
+                "alpha_engine_baseline_restored_from_previous_session",
+                agent_id=self.agent_id, baseline_qty=str(self._baseline_qty),
+            )
+        else:
+            self._baseline_qty = current_total
+            await self._redis_client.execute(
+                "set", f"{ALPHA_ENGINE_BASELINE_QTY_REDIS_KEY_PREFIX}{self.agent_id}", str(self._baseline_qty),
+            )
+            self._log.info(
+                "alpha_engine_baseline_established_first_run",
+                agent_id=self.agent_id, baseline_qty=str(self._baseline_qty),
+            )
+        self._last_known_total_qty = current_total
+
+        own_inventory_at_startup = current_total - self._baseline_qty
+        if abs(own_inventory_at_startup) > self._max_inventory_units:
+            await self._notifier.send(
+                f"🆘 DÉMARRAGE REFUSÉ pour {self._symbol} : inventaire déjà détenu par ce moteur "
+                f"({own_inventory_at_startup}) dépasse le plafond {self._max_inventory_units} avant "
+                "même le premier cycle. Investigation manuelle requise.",
+                severity=AlertSeverity.CRITICAL, source=self.agent_id,
+            )
+            raise RuntimeError(
+                f"{self.agent_id}: real starting inventory {own_inventory_at_startup} already "
+                f"exceeds the cap {self._max_inventory_units} -- refusing to start."
+            )
 
     async def on_shutdown(self) -> None:
         if self._emergency_listener_task is not None:
@@ -777,6 +943,8 @@ class AlphaMarketMakerAgent(BaseAgent):
 
     async def _place_resting_order(self, side: Literal["buy", "sell"], size: Decimal, price: Decimal) -> None:
         assert self._broker is not None
+        assert self._rate_limit_mesh is not None
+        broker = self._broker
         if not self._check_fat_finger(size):
             await self._handle_fat_finger_blocked(size)
             return
@@ -785,9 +953,17 @@ class AlphaMarketMakerAgent(BaseAgent):
             return
         client_order_id = f"alpha-{side}-{uuid.uuid4()}"
         try:
+            # RateLimitMesh paces this call (and adapts on a real ccxt RateLimitExceeded/
+            # DDoSProtection) *before* safe_financial_call's own Kill-Switch/timeout semantics apply
+            # -- see module docstring point 13 on why this ordering (mesh as safe_financial_call's
+            # own api_function, not the other way around) is what lets the mesh's backoff logic
+            # actually see the real exception type instead of an already-wrapped one.
             raw = await safe_financial_call(
-                self._broker.place_limit_order, self._symbol, side, float(size), float(price),
-                client_order_id=client_order_id, retry_on_failure=False,
+                self._rate_limit_mesh.throttled_call, self._exchange_id,
+                lambda: broker.place_limit_order(
+                    self._symbol, side, float(size), float(price), client_order_id=client_order_id,
+                ),
+                retry_on_failure=False,
             )
         except KillSwitchActiveError:
             self._log.warning("alpha_engine_quote_blocked_by_kill_switch", agent_id=self.agent_id, side=side)
@@ -829,6 +1005,8 @@ class AlphaMarketMakerAgent(BaseAgent):
         excess = abs(own_inventory) - self._max_inventory_units
         side: Literal["buy", "sell"] = "sell" if own_inventory > 0 else "buy"
         assert self._broker is not None
+        assert self._rate_limit_mesh is not None
+        broker = self._broker
 
         # Both circuit breakers apply here too, deliberately -- see module docstring points 8/9. A
         # hedge that keeps re-firing without ever bringing inventory back under the cap (an exchange
@@ -853,8 +1031,9 @@ class AlphaMarketMakerAgent(BaseAgent):
         )
         try:
             raw = await safe_financial_call(
-                self._broker.place_market_order, self._symbol, side, float(excess),
-                client_order_id=client_order_id, retry_on_failure=False,
+                self._rate_limit_mesh.throttled_call, self._exchange_id,
+                lambda: broker.place_market_order(self._symbol, side, float(excess), client_order_id=client_order_id),
+                retry_on_failure=False,
             )
         except KillSwitchActiveError:
             self._log.critical(

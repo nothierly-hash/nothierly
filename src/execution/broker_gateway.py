@@ -162,6 +162,33 @@ class BaseBroker(ABC):
         """
         return await self.place_market_order(symbol, side, quantity, client_order_id=client_order_id)
 
+    async def cancel_all_open_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
+        """Cancel every open order, optionally scoped to one symbol -- the real cold-start orphan cleanup.
+
+        **Not abstract, deliberately** -- same "safe, no-op-shaped default
+        costs every other adapter nothing" reasoning as
+        :meth:`emergency_flatten_market_order` above, but the default
+        here is the opposite direction: it *raises*
+        :class:`NotImplementedError` rather than silently returning an
+        empty list, because a caller relying on this for a real safety
+        sweep (see :meth:`~src.agents.alpha_engine.agent.
+        AlphaMarketMakerAgent.on_start`) needs to know explicitly that no
+        real cleanup happened, not receive a shape indistinguishable from
+        "there were genuinely zero orphaned orders". Overridden with a
+        real implementation only where the underlying client already
+        has one -- :class:`CcxtBrokerAdapter` (delegating to
+        :meth:`~src.agents.market_data.exchange_client.
+        AsyncExchangeClient.cancel_all_orders`, which already existed
+        before this method did). :class:`OandaBrokerAdapter`'s own
+        ``OandaClient.cancel_all_orders(instrument)`` is a real, separate
+        capability too, not yet wired through this ABC -- a real,
+        disclosed gap, not silently assumed covered.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement cancel_all_open_orders -- no orphaned-order "
+            "cleanup was performed; the caller must decide how to proceed."
+        )
+
     @abstractmethod
     async def place_limit_order(
         self, symbol: str, side: OrderSide, quantity: float, price: float, *, client_order_id: str | None = None
@@ -275,6 +302,10 @@ class CcxtBrokerAdapter(BaseBroker):
         if symbol is None:
             raise ValueError("CcxtBrokerAdapter.cancel_order requires `symbol` -- most exchanges require it to cancel.")
         return await self._client.cancel_order(order_id, symbol)
+
+    async def cancel_all_open_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
+        """Real override -- delegates to AsyncExchangeClient.cancel_all_orders, which already existed for this exact purpose."""
+        return await self._client.cancel_all_orders(symbol)
 
     async def get_orderbook_snapshot(self, symbol: str, limit: int = 5) -> OrderBookSnapshot:
         raw_book = await self._client.get_orderbook_snapshot(symbol, limit)

@@ -82,6 +82,16 @@ def _parse_args() -> argparse.Namespace:
             "you. Set this explicitly before running with real capital."
         ),
     )
+    parser.add_argument(
+        "--order-rate-limit-per-second", type=float, default=3.0,
+        help=(
+            "Real, proactive rate-limit-ban protection (network.resilience_mesh.RateLimitMesh) -- "
+            "paces real order calls to stay under the exchange's published order-rate limit instead "
+            "of discovering it via an HTTP 429/418 (default: 3.0, a real safety margin under "
+            "Binance spot's own ~5/s published limit; confirm and tune for your real venue). See "
+            "module docstring point 13."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -96,6 +106,7 @@ async def main() -> None:
         max_order_rate_window_seconds=args.max_order_rate_window_seconds,
         max_single_order_units=args.max_single_order_units,
         max_daily_loss_usd=args.max_daily_loss_usd,
+        order_rate_limit_per_second=args.order_rate_limit_per_second,
     )
     _log.info(
         "alpha_engine_launcher_starting", symbol=args.symbol, exchange=args.exchange,

@@ -713,6 +713,19 @@ ALPHA_ENGINE_TELEMETRY_REDIS_KEY_PREFIX: Final[str] = "alpha_engine_telemetry:"
 # not treat OFF as implying it.
 ALPHA_ENGINE_EMERGENCY_LIQUIDATE_CHANNEL_PREFIX: Final[str] = "alpha_engine_emergency_liquidate:"
 
+# Redis key prefix (+ agent_id) src.agents.alpha_engine.agent.AlphaMarketMakerAgent persists its
+# own inventory baseline under -- no TTL (same reasoning as
+# AGENT_CONTROL_STATE_REDIS_KEY_PREFIX: a real operator decision, here "how much of the account's
+# real balance existed before this engine ever started", must survive a Redis restart or the
+# engine being offline, not expire). Real bug this fixes, found while building the cold-start
+# sanitizer: recomputing the baseline fresh from the broker's current balance on every on_start()
+# (the original implementation) silently "forgot" whatever inventory the engine itself had
+# legitimately accumulated across a crash/restart -- treating its own prior real exposure as
+# pre-existing, cap-exempt balance instead of counting it. Persisting the baseline once, on this
+# engine's real first-ever start, and reusing it across every subsequent restart, is what makes the
+# inventory cap keep meaning what it says after a crash.
+ALPHA_ENGINE_BASELINE_QTY_REDIS_KEY_PREFIX: Final[str] = "alpha_engine_baseline_qty:"
+
 
 class FeatureVector(BaseModel):
     """One instrument's latest normalized technical-indicator snapshot.
