@@ -138,6 +138,13 @@ pages = {
         st.Page(str(_PAGES_DIR / "quantum_entanglement.py"), title="Macro-Entanglement", icon="🌀"),
         st.Page(str(_PAGES_DIR / "quantum_inspired_routing.py"), title="Tensor Train Optimizer", icon="🧮"),
         st.Page(str(_PAGES_DIR / "cyber_defense_core.py"), title="Cyber Defense Core", icon="🛡️"),
+        st.Page(str(_PAGES_DIR / "apex_leviathan.py"), title="Apex Leviathan", icon="🔱"),
+        st.Page(str(_PAGES_DIR / "wolfram_hypergraph.py"), title="Wolfram Hypergraph", icon="🕸️"),
+        st.Page(str(_PAGES_DIR / "casino_information_theory.py"), title="Casino Information Theory", icon="🎰"),
+        st.Page(str(_PAGES_DIR / "electrodynamic_capital.py"), title="Electrodynamic Capital", icon="⚡"),
+        st.Page(str(_PAGES_DIR / "quantitative_supremacy.py"), title="Quantitative Supremacy", icon="∮"),
+        st.Page(str(_PAGES_DIR / "absolute_quant_frontier.py"), title="Absolute Quant Frontier", icon="🧿"),
+        st.Page(str(_PAGES_DIR / "agi_photonic_singularity.py"), title="AGI & Photonic Singularity", icon="✧"),
     ],
     "⚙️ Operations": [
         st.Page(str(_PAGES_DIR / "red_phone.py"), title="SRE & Red Phone", icon="🚒"),
