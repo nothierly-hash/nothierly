@@ -130,7 +130,7 @@ class ShadowRunDiagnostics:
     total_duration_hours: float
     simulated_quote_count: int
     stale_data_count: int
-    daily_loss_limit_configured: bool
+    daily_loss_limit_configured: bool | None
     mixed_mock_mode_seen: set[bool]
     event_counts: Counter[str]
     unexpected_failures: list[tuple[int, str, str]] = field(default_factory=list)
@@ -216,12 +216,24 @@ def compute_diagnostics(lines: Iterable[str]) -> ShadowRunDiagnostics:
     )
     gaps = _find_timestamp_gaps(timestamps)
 
+    daily_loss_limit_status: bool | None = daily_loss_limit_configured
+    if daily_loss_limit_configured and mixed_mock_mode_seen == {True}:
+        # Real bug found and fixed here, running this analyzer against an actual shadow run:
+        # AlphaMarketMakerAgent.on_start only ever logs _NO_DAILY_LOSS_LIMIT_EVENT "if
+        # self._max_daily_loss_usd is None and not self._settings.mock_mode" (see that method's own
+        # source) -- under MOCK_MODE, the warning never fires regardless of whether a real cap was
+        # actually configured, so "the warning never appeared" is not evidence of anything for a
+        # MOCK_MODE-only log. The previous "innocent until proven guilty" default silently reported
+        # a false "configured" for every MOCK_MODE run -- exactly the run this whole script is
+        # normally pointed at. Genuinely indeterminate here, not a guessed "yes".
+        daily_loss_limit_status = None
+
     diagnostics = ShadowRunDiagnostics(
         total_json_lines=sum(event_counts.values()),
         total_duration_hours=total_duration_hours,
         simulated_quote_count=simulated_quote_count,
         stale_data_count=stale_data_count,
-        daily_loss_limit_configured=daily_loss_limit_configured,
+        daily_loss_limit_configured=daily_loss_limit_status,
         mixed_mock_mode_seen=mixed_mock_mode_seen,
         event_counts=event_counts,
         unexpected_failures=unexpected_failures,
@@ -327,7 +339,13 @@ def print_report(d: ShadowRunDiagnostics, *, source_label: str) -> None:
             print(f"   > Vers {gap_start.isoformat()} : silence de {gap_seconds / 60:.1f} minutes")
 
     print("-" * 60)
-    print(f"MAX_DAILY_LOSS_USD configuré au démarrage : {'✅ Oui' if d.daily_loss_limit_configured else '⚠️ NON -- voir alpha_engine_no_daily_loss_limit_configured'}")
+    if d.daily_loss_limit_configured is None:
+        daily_loss_label = "❔ Indéterminé -- run entièrement en MOCK_MODE, l'agent ne journalise cet avertissement qu'en mode réel (voir source)"
+    elif d.daily_loss_limit_configured:
+        daily_loss_label = "✅ Oui"
+    else:
+        daily_loss_label = "⚠️ NON -- voir alpha_engine_no_daily_loss_limit_configured"
+    print(f"MAX_DAILY_LOSS_USD configuré au démarrage : {daily_loss_label}")
     print("=" * 60)
 
     verdict_label = {"GO": "✅ VERDICT (PARTIEL) : GO", "ATTENTION": "⚠️ VERDICT : ATTENTION (JAUNE)", "NO_GO": "🚨 VERDICT : NO-GO (ROUGE)"}[d.verdict]

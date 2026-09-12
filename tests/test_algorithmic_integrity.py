@@ -149,6 +149,14 @@ class _SpyVenue:
             "side": side, "type": "market", "amount": quantity, "filled": quantity, "average": price,
         }
 
+    async def emergency_flatten_market_order(
+        self, symbol: str, side: Literal["buy", "sell"], quantity: float, *, client_order_id: str | None = None
+    ) -> dict[str, Any]:
+        # Same safe default as BaseBroker.emergency_flatten_market_order's own docstring: a venue
+        # that hasn't deliberately opted into bypassing the Kill Switch just calls the normal,
+        # fully-gated place_market_order.
+        return await self.place_market_order(symbol, side, quantity, client_order_id=client_order_id)
+
 
 @pytest.mark.asyncio
 async def test_sor_shadow_mode_never_calls_the_real_broker() -> None:

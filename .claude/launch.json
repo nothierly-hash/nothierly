@@ -12,6 +12,18 @@
       "runtimeExecutable": ".venv/Scripts/streamlit.exe",
       "runtimeArgs": ["run", "src/dashboard/nothierly_ems.py", "--server.headless", "true", "--server.port", "8503"],
       "port": 8503
+    },
+    {
+      "name": "p2p-api",
+      "runtimeExecutable": ".venv/Scripts/uvicorn.exe",
+      "runtimeArgs": ["p2p_api:app", "--host", "127.0.0.1", "--port", "8020"],
+      "port": 8020
+    },
+    {
+      "name": "genesis-static",
+      "runtimeExecutable": ".venv/Scripts/python.exe",
+      "runtimeArgs": ["-m", "http.server", "8090", "--directory", "nothierly_genesis"],
+      "port": 8090
     }
   ]
 }

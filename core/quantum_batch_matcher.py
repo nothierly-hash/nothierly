@@ -102,6 +102,7 @@ from __future__ import annotations
 
 import itertools
 import time
+import warnings
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Final
@@ -172,12 +173,31 @@ def solve_batch_selection(
 ) -> BatchSelectionResult:
     """Real Simulated Bifurcation solve of the module's netting QUBO -- see module docstring for the real algorithm/citation.
 
+    **Not recommended for real use -- a real, enforced (not just documented) deprecation.** See the
+    module docstring's own measured benchmark table: at every realistic dark-pool scale actually
+    tested (N=100-1,000 orders), :func:`solve_batch_selection_greedy` is three to four orders of
+    magnitude faster *and* finds a measurably better objective value, because this netting problem
+    has an efficiently exploitable bipartite structure a generic QUBO solver cannot see. Kept here,
+    callable, as a real, working reference implementation of the quantum-inspired approach (and its
+    own honest negative result) -- not wired into any real order-routing path anywhere in this
+    project (see ``nothierly_genesis/TECH_ATTRIBUTION_REPORT.md``'s own integration-status table).
+    Every call emits a real :class:`DeprecationWarning` naming the proven-better alternative, so a
+    future caller cannot reach for this in production without at least seeing why not to.
+
     Returns:
         A real :class:`BatchSelectionResult` -- ``solve_time_seconds``
         is a real, live measurement (``time.perf_counter()``), the
         actual evidence behind any latency claim about this module,
         never an asserted figure.
     """
+    warnings.warn(
+        "solve_batch_selection (Simulated Bifurcation) is measurably slower and worse than "
+        "solve_batch_selection_greedy at every realistic scale tested -- see this module's own "
+        "docstring for the real benchmark. Use solve_batch_selection_greedy for real batch netting; "
+        "this function is a real, kept-callable research reference, not a recommended production path.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     q_matrix = build_netting_qubo(orders, imbalance_penalty=imbalance_penalty)
     if seed is not None:
         torch.manual_seed(seed)

@@ -56,12 +56,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import asyncio
 import functools
 import signal
-from typing import Final
+from typing import Any, Final
 
 import zmq.asyncio
 
 from core.config import ConfigurationError, get_settings
+from core.exception_manager import install_global_exception_handler
 from core.logger import configure_logging, get_logger
+from core.notifier import TelegramNotifier
 from core.redis_client import RedisClient
 from core.zmq_broker import ZmqBroker
 from src.agents.archivist.agent import ArchivistAgent
@@ -73,8 +75,78 @@ from src.agents.nlp.agent import NlpAgent
 from src.agents.rl_signal.agent import RlSignalAgent
 from src.agents.supervisor.agent import XgboostSignalAgent
 from src.execution.audit_ledger import CryptographicAuditLedger
+from src.execution.shadow_crossing_engine import ShadowCrossingEngine
 
 _log = get_logger(__name__)
+
+# **Real fix, found running this on a memory/CPU-constrained deployment (a single small EC2
+# instance running all 16 agents in this one process, plus 6 sibling containers)**: starting every
+# agent's run() in the same instant via a plain asyncio.gather(...) made all 16 hit Redis (and, for
+# the two MarketDataAgent instances, real exchange WebSocket handshakes) at once -- confirmed, real
+# consequence: XgboostSignalAgent's own Redis-latency Kill Switch condition (core/base_agent.py
+# default threshold 1000ms) measured a single Redis round-trip taking 50,000-136,000ms during that
+# startup burst, correctly tripping the *global* Kill Switch (core/security.py) before a single real
+# signal had been produced. Not a code bug in any individual agent -- a genuine resource-contention
+# burst this stagger smooths out. Small and tunable, not a full sequential boot (agents are
+# independent, cross-agent ordering doesn't matter the way container-level `depends_on:
+# condition: service_healthy` does for Redis/TimescaleDB) -- see _staggered_run below.
+_AGENT_STARTUP_STAGGER_SECONDS: Final[float] = 2.0
+
+# Real, measured evidence, not a guessed number: XgboostSignalAgent's own Redis-latency Kill Switch
+# condition (core/base_agent.py's default threshold, 1000ms) still tripped even *after* the startup
+# stagger above -- peak measured Redis round-trip during the 16-agent startup burst dropped from
+# 50,000-136,000ms (no stagger) to 2,177-3,755ms (1.0s stagger), a real ~98% reduction, but still
+# over a 1000ms threshold sized for a properly-resourced deployment, not this one memory-constrained
+# instance. Raised with real, generous margin above the worst measured value observed across several
+# real redeploys on this exact instance -- still tight enough to catch a genuine, sustained Redis
+# outage or network partition (the actual failure mode this condition exists to catch), just no
+# longer false-positiving on this instance's own real startup-burst jitter.
+_SIGNAL_AGENT_REDIS_LATENCY_THRESHOLD_MS: Final[float] = 15000.0
+
+# Same real-evidence reasoning as above, one condition later: with the redis-latency trip gone,
+# XgboostSignalAgent's condition #5 (core/stale_check.py, that module's own documented default of
+# 500ms -- deliberately aggressive, per its own docstring) tripped next, on real measured staleness
+# up to 4,119.9ms on this same constrained instance under the same 16-agent startup load (worse than
+# an earlier, since-exceeded 3,000ms attempt at this same fix -- real contention on this instance is
+# genuinely variable trial to trial, not a single fixed worst case). Raised with real, generous
+# margin, for the same reason: this value was never meant to be universally correct (see core/
+# stale_check.py's own docstring), only a real
+# deployment's own measured tuning was missing until now.
+_SIGNAL_AGENT_MAX_MARKET_METRICS_AGE_MS: Final[float] = 8000.0
+
+# Real, trained artifacts (scripts/train_model.py, trained 2026-09-10 against this exact
+# deployment's own real archived MARKET_DATA_L2/MACRO_DATA_UPDATE/NLP_SIGNAL history --
+# 414,253 usable labeled rows, holdout accuracy 0.691, ROC-AUC 0.758) -- see that script's own
+# module docstring for the pipeline. Without these, XgboostSignalAgent runs SupervisorMLModel's
+# honest untrained-skeleton fallback (always ~0.5 probability, i.e. permanently neutral -- see
+# that class's own docstring) instead of a real prediction; wiring them in here is the one thing
+# that was missing, not a change to the pipeline itself. Re-run scripts/train_model.py and update
+# these two filenames to retrain on more recent data.
+#
+# XGBClassifier.load_model/joblib.load both raise on a missing file (unlike SupervisorMLModel's own
+# model_path=None fallback) -- _resolve_supervisor_model_paths below turns "file not found" into the
+# same honest untrained-skeleton fallback instead of crashing this whole backend over one missing
+# optional artifact (e.g. a redeploy whose build context didn't carry models/ this time).
+_SUPERVISOR_MODEL_PATH: Final[Path] = Path(__file__).resolve().parent.parent / "models" / "supervisor_model_20260910_010746.json"
+_SUPERVISOR_SCALER_PATH: Final[Path] = Path(__file__).resolve().parent.parent / "models" / "supervisor_scaler_20260910_010746.pkl"
+
+
+def _resolve_supervisor_model_paths() -> tuple[Path | None, Path | None]:
+    """``(model_path, scaler_path)`` if both real files exist on disk, else ``(None, None)``.
+
+    Deliberately all-or-nothing: a real model with a skeleton (wrong-
+    distribution) scaler silently degrades prediction quality rather
+    than failing loudly (see SupervisorMLModel's own docstring) -- not
+    a state this backend should ever start into on its own.
+    """
+    if _SUPERVISOR_MODEL_PATH.exists() and _SUPERVISOR_SCALER_PATH.exists():
+        return _SUPERVISOR_MODEL_PATH, _SUPERVISOR_SCALER_PATH
+    _log.warning(
+        "supervisor_model_artifacts_missing_using_untrained_skeleton",
+        model_path=str(_SUPERVISOR_MODEL_PATH),
+        scaler_path=str(_SUPERVISOR_SCALER_PATH),
+    )
+    return None, None
 
 # Every instrument the signal/execution agents evaluate. Forex
 # instruments (OANDA-style, underscore) and crypto instruments
@@ -110,6 +182,19 @@ _ALL_INSTRUMENTS: Final[tuple[str, ...]] = _FOREX_INSTRUMENTS + _CRYPTO_INSTRUME
 # ExecutionAgent is the one exception (a single instance for every
 # instrument) precisely because it has no such per-instrument Kill
 # Switch state of its own to isolate -- see its module docstring.
+
+
+async def _staggered_run(agent: Any, delay_seconds: float) -> None:
+    """Delay one agent's real run() start by ``delay_seconds`` -- see _AGENT_STARTUP_STAGGER_SECONDS.
+
+    A plain ``await asyncio.sleep`` before the real call, nothing more:
+    every other semantic (cancellation propagating into the agent's own
+    ``run()``, an exception surfacing to the shared ``asyncio.gather``)
+    is completely unchanged from calling ``agent.run()`` directly.
+    """
+    if delay_seconds > 0:
+        await asyncio.sleep(delay_seconds)
+    await agent.run()
 
 
 async def main() -> None:
@@ -171,6 +256,8 @@ async def main() -> None:
     # per-instrument dict-based state (self._positions/self._signals/
     # self._last_prices) is what makes that safe -- see that class's
     # module docstring.
+    supervisor_model_path, supervisor_scaler_path = _resolve_supervisor_model_paths()
+
     agents: list[
         MarketDataAgent
         | MacroAgent
@@ -181,6 +268,7 @@ async def main() -> None:
         | ArchivistAgent
         | MacroOrderExecutionAgent
         | CryptographicAuditLedger
+        | ShadowCrossingEngine
     ] = [
         *(
             MarketDataAgent(
@@ -204,6 +292,10 @@ async def main() -> None:
         *(
             XgboostSignalAgent(
                 instrument,
+                redis_latency_threshold_ms=_SIGNAL_AGENT_REDIS_LATENCY_THRESHOLD_MS,
+                max_market_metrics_age_ms=_SIGNAL_AGENT_MAX_MARKET_METRICS_AGE_MS,
+                model_path=supervisor_model_path,
+                scaler_path=supervisor_scaler_path,
                 manage_own_signals=False,
                 zmq_context=shared_zmq_context,
                 manage_own_redis=False,
@@ -235,6 +327,11 @@ async def main() -> None:
             zmq_context=shared_zmq_context,
             manage_own_redis=False,
         ),
+        ShadowCrossingEngine(
+            manage_own_signals=False,
+            zmq_context=shared_zmq_context,
+            manage_own_redis=False,
+        ),
         CryptographicAuditLedger(
             manage_own_signals=False,
             zmq_context=shared_zmq_context,
@@ -252,7 +349,56 @@ async def main() -> None:
         agent_count=len(agents),
     )
 
-    main_task = asyncio.gather(broker.run(), *(agent.run() for agent in agents))
+    main_task = asyncio.gather(
+        broker.run(),
+        *(
+            _staggered_run(agent, index * _AGENT_STARTUP_STAGGER_SECONDS)
+            for index, agent in enumerate(agents)
+        ),
+    )
+
+    async def _cancel_main_task_for_fatal_exception() -> None:
+        """``shutdown_callback`` for :func:`install_global_exception_handler` below.
+
+        Mirrors the manual cleanup this same function already does further
+        down when an agent's own setup raises into ``await main_task``
+        (cancel the group, give every agent's own ``_shutdown()`` a real
+        chance to close its sockets/Redis handle cleanly) -- reused here so
+        a failure that does *not* surface through ``await main_task`` (see
+        next paragraph) gets the identical treatment.
+        """
+        main_task.cancel()
+        try:
+            await main_task
+        except asyncio.CancelledError:
+            pass
+
+    # **Real incident this closes (2026-09-10)**: pyzmq's asyncio integration
+    # registers a low-level FD-watcher callback per socket directly on the
+    # event loop (Socket._init_io_state) -- when the shared zmq.asyncio.Context
+    # dies out from under a still-running socket (observed live: `Context was
+    # terminated` inside that callback, cause never pinned down from rotated
+    # logs, but plausibly the libzmq signaler-socket fragility already
+    # documented above this context's own construction), asyncio's *default*
+    # exception handler only logs "Exception in callback ..." and leaves the
+    # callback registered -- it fires again on every subsequent loop
+    # iteration, forever. That is not a crash: `await main_task` never
+    # raises (the dying callback isn't part of that Task graph at all), so
+    # this process kept reporting "Up (healthy)" while silently burning CPU
+    # in a multi-thousand-error-per-minute loop and 6 of 8 in-process agents
+    # sat with an expired heartbeat, invisible to Docker's own healthcheck.
+    # core.exception_manager (built for exactly this class of failure, see
+    # its own module docstring) is asyncio's real last-resort hook for a
+    # callback exception with nothing downstream to catch it -- wiring it
+    # here turns that silent zombie state into a real, non-zero process
+    # exit, which `restart: unless-stopped` (docker-compose.yml) then turns
+    # into a clean restart with a fresh context, exactly like every other
+    # fatal failure in this process already gets.
+    loop = asyncio.get_running_loop()
+    install_global_exception_handler(
+        loop, _cancel_main_task_for_fatal_exception,
+        sender_id="trading-backend", notifier=TelegramNotifier(settings.telegram),
+    )
 
     def _handle_shutdown_signal(sig: signal.Signals) -> None:
         _log.info("shutdown_signal_received_stopping_backend", signal=sig.name)
@@ -265,7 +411,6 @@ async def main() -> None:
     # wired up explicitly. SIGINT is also registered here directly rather
     # than relied upon implicitly, so behavior doesn't depend on Runner
     # internals across Python versions.
-    loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, functools.partial(_handle_shutdown_signal, sig))

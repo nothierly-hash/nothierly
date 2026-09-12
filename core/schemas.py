@@ -561,6 +561,82 @@ TOPOLOGY_FRAGILITY_ALERT_TOPIC: Final[str] = "TOPOLOGY_FRAGILITY_ALERT"
 
 FEATURES_TOPIC: Final[str] = "FEATURES"
 
+# =============================================================================
+# Swarm AI -- Scout / Analyst / Risk Gate reactive pipeline (scout_agent.py /
+# analyst_agent.py / risk_gate_agent.py). ZeroMQ carries the real instant
+# event; Redis carries the real state each event refers to -- neither topic
+# below ever embeds the full anomaly/analysis payload itself, only the
+# `anomaly_id` a subscriber uses to read the real record from Redis. Same
+# "small event, real state lives in Redis" discipline every other real
+# ZMQ topic in this project already follows (see e.g. TRADING_SIGNALS_TOPIC's
+# own MessagePayload.data shape).
+# =============================================================================
+
+# Real, statistical (z-score) anomaly on p2p_api.py's own accumulated P2P
+# premium history -- published by scout_agent.py the moment a real deviation
+# crosses threshold for one of the five tracked currencies.
+SWARM_ANOMALY_DETECTED_TOPIC: Final[str] = "SWARM_ANOMALY_DETECTED"
+# Real Redis HASH key prefix (+ anomaly_id) scout_agent.py writes the real
+# detection details to (currency, latest/baseline premium, z-score,
+# detected_at) -- read by analyst_agent.py on receiving the event above.
+SWARM_ANOMALY_REDIS_KEY_PREFIX: Final[str] = "swarm:anomalies:"
+
+# Real outcome of analyst_agent.py's own reactive check (political_agent.py's
+# real RSS fetch + real LLM crisis scoring, reused as a library call -- see
+# that module's own docstring for why it is not itself a ZMQ participant).
+SWARM_ANALYSIS_DONE_TOPIC: Final[str] = "SWARM_ANALYSIS_DONE"
+# Real Redis HASH key prefix (+ anomaly_id) analyst_agent.py writes its real
+# outcome to -- status is one of "CRISIS_CONFIRMED"/"NO_CRISIS"/
+# "NO_MATCHING_HEADLINES"/"LLM_UNCONFIGURED", never a fabricated verdict when
+# no real LLM provider is configured (see political_agent.py's own module
+# docstring on this exact discipline).
+SWARM_ANALYSIS_REDIS_KEY_PREFIX: Final[str] = "swarm:analysis:"
+
+# Real final green light from risk_gate_agent.py -- only published when
+# analyst_agent.py's own status is "CRISIS_CONFIRMED" *and* the currency's
+# real, current P2P liquidity (p2p_api.py's own already-computed
+# avg_liquidity_usdt field) clears the configured floor. A human operator
+# (dashboard), not an autonomous trader, is the real subscriber -- this
+# project holds no real execution capability for P2P/fiat-rail arbitrage
+# (see p2p_api.py's own module docstring on what this data can and cannot
+# back), so the swarm's real output is a real, actionable alert, not a
+# fabricated auto-trade.
+SWARM_ARBITRAGE_APPROVED_TOPIC: Final[str] = "SWARM_ARBITRAGE_APPROVED"
+# Real, bounded Redis LIST (LPUSH + LTRIM, newest first) of every real
+# approval risk_gate_agent.py has ever published -- read by the dashboard's
+# Swarm Console section. Same bounded-growth discipline as every other real
+# event log in this project (see e.g. ALPHA_ENGINE_PNL_HISTORY_REDIS_KEY_PREFIX).
+SWARM_APPROVED_OPPORTUNITIES_REDIS_KEY: Final[str] = "swarm:approved_opportunities"
+SWARM_APPROVED_OPPORTUNITIES_MAX_ENTRIES: Final[int] = 500
+
+# Real, separate channel/list for nothierly_genesis/saga_proposal_generator.py's own output --
+# deliberately NOT the same topic/key as SWARM_ARBITRAGE_APPROVED_TOPIC above: that one's entries
+# are scout/analyst/risk-gate's real single-fiat crisis alerts (fiat, crisis_score, sentiment...);
+# a TDA-derived multi-leg saga proposal has a structurally different shape (a cycle, per-leg
+# liquidity, a saga_steps breakdown) and reusing the same list would mix two incompatible record
+# shapes the dashboard renders differently. Same disclosed scope as that topic's own comment: a
+# real, actionable proposal for a human operator to review -- this project has no real execution
+# capability wired to it, and nothing here auto-executes.
+SWARM_TDA_SAGA_PROPOSED_TOPIC: Final[str] = "SWARM_TDA_SAGA_PROPOSED"
+SWARM_TDA_SAGA_REDIS_KEY: Final[str] = "swarm:tda_saga_proposals"
+SWARM_TDA_SAGA_MAX_ENTRIES: Final[int] = 200
+
+# --- Generic, currency-agnostic Redis key patterns (market_discovery.py's own consumers) -------
+# Real, disclosed scope: this is the go-forward pattern for NEW dynamic-market code
+# (market_discovery.py, the generalized nothierly_genesis/tda_engine.py) -- it does not retrofit
+# every existing hardcoded key above (P2P_HISTORY_ZSET_KEY_PREFIX, SWARM_APPROVED_OPPORTUNITIES_
+# REDIS_KEY, ...), which real, already-tested production code paths still read/write today.
+# Migrating those is real, separate, larger follow-up work, not silently implied by adding these.
+def p2p_premium_redis_key(fiat_code: str, asset_symbol: str = "USDT") -> str:
+    """``market:p2p:{fiat}:{asset}:premium`` -- one real key per (fiat, asset) pair, built at call
+    time from whatever :mod:`market_discovery` actually discovered, never a hardcoded currency."""
+    return f"market:p2p:{fiat_code.upper()}:{asset_symbol.upper()}:premium"
+
+
+def spot_price_redis_key(base_symbol: str, quote_symbol: str) -> str:
+    """``market:spot:{base}_{quote}:price`` -- one real key per real ccxt spot pair discovered."""
+    return f"market:spot:{base_symbol.upper()}_{quote_symbol.upper()}:price"
+
 # Redis key prefix (+ instrument) FeatureStore additionally persists each
 # vector under, for the two signal agents' poll-based reads -- see
 # src.agents.supervisor.feature_confirmation and FeatureStore's own
@@ -714,6 +790,19 @@ AUDIT_LEDGER_DEAD_LETTER_REDIS_KEY: Final[str] = "AUDIT_LEDGER_DEAD_LETTER_QUEUE
 # left behind after the engine crashed.
 ALPHA_ENGINE_TELEMETRY_REDIS_KEY_PREFIX: Final[str] = "alpha_engine_telemetry:"
 
+# Redis LIST key prefix (+ agent_id) (LPUSH + LTRIM, newest first) AlphaMarketMakerAgent._record_fill
+# pushes one real entry to on every real fill it detects (see that method's own docstring point 7 on
+# how a fill is detected/priced) -- timestamp, fill_qty/price, and the resulting realized_pnl_delta_usd/
+# session_realized_pnl_usd. ALPHA_ENGINE_TELEMETRY_REDIS_KEY_PREFIX above is a short-TTL *snapshot*
+# (today's/session's running totals only, gone the moment the engine stops publishing); this is the
+# real history a P&L equity curve needs and the snapshot alone cannot provide. Read by
+# src/dashboard/ems_pages/bilan.py. Honestly empty until this engine's real (non-SHADOW/mock) path
+# detects its first fill -- see that page's own docstring for why no other component in this codebase
+# can stand in for it (src/execution/reporting_engine.py's own docstring: this system takes no
+# directional position on a B2B client's behalf, so client fills have no PnL/win-rate to report either).
+ALPHA_ENGINE_PNL_HISTORY_REDIS_KEY_PREFIX: Final[str] = "alpha_engine_pnl_history:"
+ALPHA_ENGINE_PNL_HISTORY_MAX_ENTRIES: Final[int] = 5000
+
 # Redis Pub/Sub channel prefix (+ agent_id) the dashboard's "Emergency
 # Liquidate" button PUBLISHes a one-shot command to -- deliberately a
 # *separate* channel from AGENT_CONTROL_CHANNEL_PREFIX above, not an
@@ -753,6 +842,76 @@ ALPHA_ENGINE_ASSET_STATUS_REDIS_KEY_PREFIX: Final[str] = "alpha_engine_asset_sta
 # dynamic risk override under -- meant to shadow (not replace) core.asset_universe.ASSET_UNIVERSE's
 # static config without a restart. Same "not yet consumed" honesty note as the key above.
 ALPHA_ENGINE_ASSET_RISK_OVERRIDE_REDIS_KEY_PREFIX: Final[str] = "alpha_engine_asset_risk_override:"
+
+# Redis STRING key ("true"/"false"), no TTL -- same reasoning as AGENT_CONTROL_STATE_REDIS_KEY_PREFIX:
+# a real operator decision must survive a Redis restart, not silently revert. This is the live master
+# switch for src.mlops.vast_client.VastAIClient -- src/dashboard/ems_pages/finops.py's toggle writes
+# here so the running nothierly-agents/nothierly-dashboard containers see the change on their very
+# next call, with no restart. core.config.VastAiSettings.enabled (env var VASTAI_ENABLED) is only the
+# cold-start fallback used the first time this key has never been written -- see
+# src.mlops.vast_client.is_vast_ai_enabled for the real precedence and its fail-closed behavior on a
+# Redis error (this is a cost-control switch: any doubt about its state must block, not allow).
+VAST_AI_ENABLED_REDIS_KEY: Final[str] = "vast_ai_enabled"
+
+# Real, dynamic lookup for political_agent.py's proprietary LLM circuit breaker: a rented Vast.ai
+# instance gets a new public IP:port every rental, so this can never be a static .env value the way
+# GUARDIAN_API_KEY is. scripts/deploy_custom_llm.py writes this (a full "http://host:port" base URL,
+# no trailing slash) only once its vLLM server is confirmed answering /health -- never on a bare
+# `rent_instance` success alone, so this key can never point at a container still loading its model.
+# Absent/empty is a real, valid, common state ("no proprietary LLM deployed right now"), not an
+# error -- political_agent.py's own fallback path already handles it as exactly that.
+PROPRIETARY_LLM_ENDPOINT_REDIS_KEY: Final[str] = "llm:proprietary_endpoint"
+
+# Must match, verbatim, the `--model` this project's own vLLM onstart_script loads (see
+# scripts/deploy_custom_llm.py) -- vLLM's OpenAI-compatible server validates the request body's
+# `model` field against what it actually loaded and rejects a mismatch. Shared here, once, so the
+# deploy script and political_agent.py's own proprietary call can never drift apart.
+PROPRIETARY_LLM_MODEL_NAME: Final[str] = "TheBloke/Mistral-7B-Instruct-v0.2-AWQ"
+
+# Real, observed outcome of political_agent.py's most recent LLM call (one of "proprietary",
+# "fallback", "unconfigured") + its timestamp, as a JSON string -- written by _assess_headline
+# itself (best-effort, same "never fatal" discipline as its own heartbeat write) so the dashboard's
+# "Statut de l'IA" indicator reflects what actually just happened, never a guess derived from
+# PROPRIETARY_LLM_ENDPOINT_REDIS_KEY's mere presence (an endpoint can be configured yet still be
+# unreachable -- only a real recent call outcome can honestly distinguish the two). No TTL: a stale
+# value (older than roughly one poll cycle) is itself a real signal the agent has stopped scoring
+# anything, surfaced via this key's own timestamp field, not by the key silently disappearing.
+LLM_STATUS_REDIS_KEY: Final[str] = "llm:status"
+
+# p2p_api.py's real time-travel history for sandbox.py's 30-day-delayed lookup -- one ZSET per
+# fiat (real Redis "{prefix}{fiat}" key, e.g. "p2p:history_zset:ARS"), member = that scan's own
+# JSON-serialized P2PCandidate, score = the scan's real unix timestamp. Never TTL'd (a sorted set
+# has no per-member expiry) -- bounded instead via ZREMRANGEBYSCORE in the same write, see
+# p2p_api.py's own _store_history_snapshot for why (same "don't let something grow unbounded
+# forever" discipline the 2026-09-10 disk-space incident made non-negotiable in this project).
+P2P_HISTORY_ZSET_KEY_PREFIX: Final[str] = "p2p:history_zset:"
+# Real retention window: covers the 30-day sandbox lookback plus a real margin so a slightly late
+# write (a missed cache refresh cycle, a brief outage) can never leave a fiat with zero history
+# right when the sandbox needs it.
+P2P_HISTORY_RETENTION_SECONDS: Final[int] = 40 * 24 * 60 * 60
+
+# Real Redis Pub/Sub channel p2p_api.py's own _run_full_scan publishes its complete, real
+# P2PPremiumsResponse JSON to, the instant a fresh scan completes -- p2p_websocket.py's own
+# WebSocket endpoint subscribes to this and forwards each message to every connected client, real
+# push instead of a client having to poll GET /api/v1/p2p-premiums on its own schedule. Same real
+# payload shape either way -- a WebSocket client and a REST poller see byte-identical data, only
+# the delivery mechanism differs. Best-effort, fire-and-forget (see _run_full_scan's own docstring
+# on why a Redis hiccup here must never affect the real, synchronous REST response path).
+P2P_PREMIUMS_PUBSUB_CHANNEL: Final[str] = "p2p:premiums:updates"
+
+# Real, O(1)-readable snapshot of the *complete* latest P2PPremiumsResponse (one JSON blob),
+# written by p2p_api.py's own _publish_scan_update alongside its existing Pub/Sub push -- neither
+# the Pub/Sub channel above (a transient push, nothing to read once no one was listening) nor the
+# per-fiat P2P_HISTORY_ZSET_KEY_PREFIX (a ranged ZSET query, not a single-key lookup) can answer
+# "what is the current state right now" in one GET. src/graphql_api/schema.py's get_premium
+# resolver is this key's real reader -- see that module's own docstring for why a GraphQL resolver
+# specifically needs a real O(1) read here rather than triggering (or waiting on) a fresh scan.
+P2P_LATEST_SNAPSHOT_REDIS_KEY: Final[str] = "p2p:premiums:latest_snapshot"
+
+# Real port for src/grpc_service/grpc_server.py's TradeExecutor service -- the internal,
+# binary-protocol EaaS layer (see that module's own docstring for its real, disclosed scope:
+# a latency demonstration of the transport, not a second real execution engine).
+GRPC_TRADE_EXECUTOR_PORT: Final[int] = 50051
 
 
 class FeatureVector(BaseModel):

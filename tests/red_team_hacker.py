@@ -49,15 +49,26 @@ if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import asyncio
+from decimal import Decimal
 
 import fakeredis.aioredis
 import pytest
 
 from core.config import RedisSettings
 from core.logger import _redact_secrets
+from core.message_integrity import SignatureVerificationError, publish_signed_market_metrics, read_verified_market_metrics, sign
 from core.redis_client import RedisClient
-from core.schemas import MARKET_METRICS_REDIS_KEY_PREFIX, MarketMetrics
-from core.security import STATUS_SAFE, SYSTEM_STATUS_KEY, is_system_safe, trip_kill_switch
+from core.schemas import ALPHA_ENGINE_EMERGENCY_LIQUIDATE_CHANNEL_PREFIX, MARKET_METRICS_REDIS_KEY_PREFIX, MarketMetrics
+import core.security as security_module
+from core.security import (
+    STATUS_SAFE,
+    SYSTEM_STATUS_EPOCH_KEY,
+    SYSTEM_STATUS_KEY,
+    SYSTEM_STATUS_SIG_KEY,
+    is_system_safe,
+    reset_kill_switch,
+    trip_kill_switch,
+)
 from src.execution.audit_ledger import GENESIS_HASH, AuditTrailRow, compute_event_hash, verify_chain
 
 _REPORT: list[tuple[str, str, str]] = []  # (scenario, verdict, detail)
@@ -74,41 +85,65 @@ def _record(scenario: str, verdict: str, detail: str) -> None:
 
 
 async def _attack_redis_market_metrics_poisoning() -> None:
+    """**Re-run after the real fix** (core/message_integrity.py): the legit reading is now published via
+    the real, signed writer (publish_signed_market_metrics, what MarketDataAgent now actually calls) --
+    the attacker still only has raw Redis access, not VAULT_MASTER_KEY, so it can forge the primary key's
+    plaintext but not a matching companion signature. Reports BOTH real outcomes: unmigrated legacy
+    readers (a bare MarketMetrics.model_validate_json(raw), still real in ~8 call sites -- see
+    read_verified_market_metrics's own docstring for the full list) remain genuinely vulnerable; a
+    migrated reader (read_verified_market_metrics, what XgboostSignalAgent now actually calls) is not."""
     client = RedisClient(RedisSettings())
-    client._redis = fakeredis.aioredis.FakeRedis(server=fakeredis.FakeServer(), decode_responses=True)
+    # _DecodingFakeRedis (defined below, near Attack 2), not a plain FakeRedis: this test's own
+    # read_verified_market_metrics call now depends on `get` returning `str` (decode_responses=True's real
+    # contract), and fakeredis 2.37.1's async client returns raw bytes from GET regardless -- see that
+    # class's own docstring for why this is a real, reproducible fakeredis-library quirk, not a production
+    # behavior (real redis.asyncio.Redis decodes correctly and reliably).
+    client._redis = _DecodingFakeRedis(server=fakeredis.FakeServer(), decode_responses=True)
 
     symbol = "BTC/USDT"
     real_key = f"{MARKET_METRICS_REDIS_KEY_PREFIX}{symbol}"  # the exact real key MarketDataAgent writes
 
     legit = MarketMetrics(symbol=symbol, spread=12.5, order_book_imbalance=0.05, mid_price=65000.0)
-    await client.execute("set", real_key, legit.model_dump_json())
+    await publish_signed_market_metrics(client, symbol, legit, ttl_seconds=10)
 
     # The real attack: nothing distinguishes an attacker's SET on this exact key from the real
-    # MarketDataAgent's own write -- no signature, no source-agent authentication, and (per
-    # core/config.py's RedisSettings.password default of None) no Redis auth by default either.
+    # MarketDataAgent's own write -- no source-agent authentication, and (per core/config.py's
+    # RedisSettings.password default of None) no Redis auth by default either. The attacker does NOT also
+    # know VAULT_MASTER_KEY, so it cannot forge a matching companion signature at f"{real_key}:sig" --
+    # that key still holds the legit reading's real signature, now stale relative to the poisoned payload.
     poisoned = MarketMetrics(symbol=symbol, spread=0.0001, order_book_imbalance=1.0, mid_price=1.00)
     await client.execute("set", real_key, poisoned.model_dump_json())
 
     raw = await client.execute("get", real_key)
     assert raw is not None
-    read_back = MarketMetrics.model_validate_json(raw)
+    legacy_read_back = MarketMetrics.model_validate_json(raw)  # what every unmigrated reader still does
 
-    if read_back.mid_price == poisoned.mid_price:
+    legacy_vulnerable = legacy_read_back.mid_price == poisoned.mid_price
+    try:
+        await read_verified_market_metrics(client, symbol)
+        migrated_reader_rejected = False
+    except SignatureVerificationError:
+        migrated_reader_rejected = True
+
+    if legacy_vulnerable and migrated_reader_rejected:
         _record(
             "Redis MarketMetrics Cache Poisoning",
-            "VULNERABLE",
+            "PARTIALLY FIXED",
             f"A fabricated MarketMetrics(mid_price=$1.00 for BTC/USDT, vs. a real $65,000.00) was written "
-            f"under the real key '{real_key}' and read back validated with zero complaint -- Pydantic only "
-            f"checks shape (mid_price > 0), never plausibility. Any real live consumer of this key "
-            f"(XgboostSignalAgent, RlSignalAgent, QuantCopilot, Command Center) would treat this as genuine. "
-            f"Real root cause: core/config.py's RedisSettings.password defaults to None and use_tls to "
-            f"False -- confirmed by .env.example shipping REDIS_PASSWORD= blank -- so any direct/local run "
-            f"of this codebase (outside the Docker Compose stack, which does force a password) exposes an "
-            f"unauthenticated Redis. No ACL exists anywhere in this codebase to narrow this even if auth "
-            f"were on."
+            f"under the real key '{real_key}'. read_verified_market_metrics (now used by XgboostSignalAgent) "
+            f"correctly raised SignatureVerificationError and rejected it. But a bare "
+            f"MarketMetrics.model_validate_json(raw) -- what RlSignalAgent, QuantCopilot, alert_agent, "
+            f"alpha_engine, shadow_crossing_engine, the gateway, and two dashboard pages still do -- read "
+            f"the poisoned value back with zero complaint, exactly as before. Real, disclosed scope: signing "
+            f"is opt-in per reader, not yet migrated project-wide."
         )
+    elif not legacy_vulnerable and not migrated_reader_rejected:
+        _record("Redis MarketMetrics Cache Poisoning", "SAFE", "Poisoned value was not accepted by either path.")
     else:
-        _record("Redis MarketMetrics Cache Poisoning", "SAFE", "Poisoned value was not accepted as written.")
+        _record(
+            "Redis MarketMetrics Cache Poisoning", "UNEXPECTED RESULT",
+            f"legacy_vulnerable={legacy_vulnerable}, migrated_reader_rejected={migrated_reader_rejected} -- re-verify.",
+        )
 
 
 # =============================================================================
@@ -130,9 +165,14 @@ class _DecodingFakeRedis(fakeredis.aioredis.FakeRedis):
 
 
 async def _attack_kill_switch_spoofing() -> None:
+    """**Re-run after the real fix** (core/security.py's is_system_safe/trip_kill_switch/reset_kill_switch
+    now sign/verify SYSTEM_STATUS via SYSTEM_STATUS_SIG_KEY, core/message_integrity.py) -- this attack's
+    own logic is unchanged (it deliberately bypasses reset_kill_switch() with a raw Redis SET, real
+    attacker capability); only the real functions it calls now behave differently."""
     client = RedisClient(RedisSettings())
     client._redis = _DecodingFakeRedis(server=fakeredis.FakeServer(), decode_responses=True)
     RedisClient._instance = client
+    security_module._min_accepted_epoch = 0  # test isolation -- see core/security.py's own docstring on this variable
     try:
         # A real operator legitimately trips the switch after detecting real danger.
         await trip_kill_switch("red-team scenario: operator detected anomalous fills")
@@ -155,7 +195,99 @@ async def _attack_kill_switch_spoofing() -> None:
                 "safe_financial_call's automatic trip-on-repeated-failure). Same real root cause as Attack 1."
             )
         else:
-            _record("Kill Switch Spoofing", "SAFE", "The spoofed SAFE write did not take effect.")
+            _record(
+                "Kill Switch Spoofing (unauthenticated Redis)",
+                "SAFE (real fix)",
+                "The spoofed raw SET on 'SYSTEM_STATUS' did NOT take effect: is_system_safe() now also "
+                "requires a matching HMAC-SHA256 at the companion SYSTEM_STATUS_SIG_KEY (core/"
+                "message_integrity.py), which the attacker -- lacking VAULT_MASTER_KEY -- could not forge. "
+                "The switch correctly stayed tripped (fail closed) instead of being spoofed back to SAFE."
+            )
+    finally:
+        RedisClient._instance = None
+
+
+# =============================================================================
+# ATTACK 2b -- Kill Switch signature REPLAY (stress-testing the Bloc 1 fix itself)
+# =============================================================================
+
+
+async def _attack_kill_switch_signature_replay() -> None:
+    """Pushed further than Attack 2: does the real HMAC fix (core/message_integrity.py) hold up against a
+    REPLAY, not just a forgery? First run of this test found it did NOT -- sign("SAFE") was one fixed hex
+    string for the lifetime of VAULT_MASTER_KEY, so an attacker who merely OBSERVED one real (SYSTEM_STATUS,
+    SYSTEM_STATUS_SIG_KEY) pair once could replay it forever, including to silently un-trip a LATER, real,
+    unrelated panic.
+
+    **Re-run after the real fix**: every signature is now bound to SYSTEM_STATUS_EPOCH_KEY (a monotonic
+    Redis INCR, bumped on every real trip/reset), so a captured pair only verifies for the one transition
+    it was actually issued for. This test now runs TWO variants of the attack:
+
+    (a) Replay the old (value, signature) pair alone, epoch untouched -- defeated by epoch binding alone,
+        since the current epoch has moved on and the old signature no longer matches it.
+    (b) The harder version: replay the epoch key TOO, rolling the whole authenticated triple back to a
+        consistent old state. core.security's own module docstring on SYSTEM_STATUS_EPOCH_KEY predicts
+        this defeats the Redis-side epoch alone -- but is caught by the *second*, independent layer: a
+        per-process, in-memory high-water mark that only Redis being rolled back cannot roll back too.
+    """
+    client = RedisClient(RedisSettings())
+    client._redis = _DecodingFakeRedis(server=fakeredis.FakeServer(), decode_responses=True)
+    RedisClient._instance = client
+    security_module._min_accepted_epoch = 0  # test isolation -- see core/security.py's own docstring on this variable
+    try:
+        # Step 1: at some point in the past, a real, legitimate reset happens. The attacker only ever
+        # reads -- never writes, never learns VAULT_MASTER_KEY -- capturing the real (value, signature, epoch).
+        await reset_kill_switch()
+        captured_value = await client.execute("get", SYSTEM_STATUS_KEY)
+        captured_sig = await client.execute("get", SYSTEM_STATUS_SIG_KEY)
+        captured_epoch = await client.execute("get", SYSTEM_STATUS_EPOCH_KEY)
+        await is_system_safe()  # this process legitimately observes the real epoch, establishing its high-water mark
+
+        # Step 2: time passes. A real operator legitimately trips the switch for a real, CURRENT,
+        # unrelated danger.
+        await trip_kill_switch("red-team scenario: a real, current, unrelated danger")
+        assert await is_system_safe() is False
+
+        # Variant (a): replay value+signature only, epoch left at its real, current value.
+        await client.execute("set", SYSTEM_STATUS_KEY, captured_value)
+        await client.execute("set", SYSTEM_STATUS_SIG_KEY, captured_sig)
+        variant_a_safe = await is_system_safe()
+
+        # Re-trip for a clean variant (b) (variant (a), whether it worked or not, must not contaminate this).
+        await trip_kill_switch("red-team scenario: a second, real, current, unrelated danger")
+        assert await is_system_safe() is False
+
+        # Variant (b): the harder attack -- also roll back the epoch key itself, reconstructing a fully
+        # internally-consistent OLD state. Real attacker capability: the same unrestricted Redis WRITE
+        # access this whole class of attack already assumes (Attack 1/2's own threat model) covers
+        # SYSTEM_STATUS_EPOCH_KEY exactly as much as SYSTEM_STATUS_KEY -- nothing in this codebase's Redis
+        # ACLs (there are none) distinguishes "may INCR this key" from "may SET it to anything".
+        await client.execute("set", SYSTEM_STATUS_KEY, captured_value)
+        await client.execute("set", SYSTEM_STATUS_SIG_KEY, captured_sig)
+        await client.execute("set", SYSTEM_STATUS_EPOCH_KEY, captured_epoch)
+        variant_b_safe = await is_system_safe()
+
+        if variant_a_safe or variant_b_safe:
+            _record(
+                "Kill Switch Signature REPLAY (stress-test of this session's own fix)",
+                "VULNERABLE",
+                f"variant_a_safe(value+sig only)={variant_a_safe}, variant_b_safe(value+sig+epoch)="
+                f"{variant_b_safe} -- a real, CURRENT panic was silently un-tripped by replaying captured "
+                f"state. core.security.SYSTEM_STATUS_EPOCH_KEY's own docstring already discloses this exact "
+                f"residual for a fresh process; this run shows it's reachable here too."
+            )
+        else:
+            _record(
+                "Kill Switch Signature REPLAY (stress-test of this session's own fix)",
+                "SAFE (real fix)",
+                "Neither variant un-tripped the real, current panic: (a) value+signature replay alone is "
+                "defeated by SYSTEM_STATUS_EPOCH_KEY binding (the old signature no longer matches the "
+                "current epoch); (b) replaying the epoch too is separately caught by this process's own "
+                "in-memory high-water mark (_min_accepted_epoch), which Redis being rolled back cannot roll "
+                "back. Honest residual, disclosed in core/security.py: a BRAND-NEW process, with no "
+                "high-water mark yet, would trust whatever Redis reports on its very first call -- not "
+                "closed by this fix, and not closeable without a non-Redis source of truth."
+            )
     finally:
         RedisClient._instance = None
 
@@ -238,6 +370,86 @@ def _attack_api_secret_log_leak() -> None:
 
 
 # =============================================================================
+# ATTACK 5 -- Emergency Liquidate channel injection (unauthenticated Redis Pub/Sub)
+# =============================================================================
+
+
+async def _attack_emergency_liquidate_channel_injection() -> None:
+    """New attack surface, found by reading src/agents/alpha_engine/agent.py while stress-testing the
+    Bloc 3 (SOR unwind) fix from this same session: AlphaMarketMakerAgent._listen_for_emergency_liquidate
+    subscribed to ALPHA_ENGINE_EMERGENCY_LIQUIDATE_CHANNEL_PREFIX + agent_id, and its handler acted on ANY
+    message that arrived, regardless of origin or content -- confirmed VULNERABLE on the first run of this
+    test (a raw, unauthenticated PUBLISH forced a real 0.25 BTC market sell via the Kill-Switch-bypassing
+    emergency_flatten_market_order path). **Re-run after the real fix**: the listener now verifies the
+    message against sign(f"LIQUIDATE:{{agent_id}}") (core/message_integrity.py) before acting; the real
+    publisher (src/dashboard/ems_pages/autonomous_command_center.py's Confirmer button) now signs it.
+    Tests BOTH real outcomes: an attacker's raw/unsigned publish (no VAULT_MASTER_KEY) is rejected; the
+    real dashboard's own signed publish still works.
+    """
+    from tests.test_alpha_engine import _FakeBroker, _make_agent
+
+    client = RedisClient(RedisSettings())
+    client._redis = fakeredis.aioredis.FakeRedis(server=fakeredis.FakeServer(), decode_responses=True)
+    RedisClient._instance = client
+    try:
+        agent = _make_agent(client, exchange_id="fake")
+        broker = agent._broker
+        assert isinstance(broker, _FakeBroker)
+        broker.position_qty = Decimal("0.25")  # a real, nonzero position an attacker could force-close
+
+        listener_task = asyncio.create_task(agent._listen_for_emergency_liquidate())
+        await asyncio.sleep(0.05)  # let the subscribe() actually register before publishing
+        channel = f"{ALPHA_ENGINE_EMERGENCY_LIQUIDATE_CHANNEL_PREFIX}{agent.agent_id}"
+
+        # Step 1 -- the attack: a raw, unsigned PUBLISH from an unauthenticated client -- not the
+        # dashboard, no VAULT_MASTER_KEY. Real attacker capability already established by Attack 1/2's
+        # own Redis access model.
+        await client.execute("publish", channel, "anything -- an attacker guessing the old literal 'LIQUIDATE' too")
+        await asyncio.sleep(0.2)
+        attack_blocked = broker.market_orders == []
+
+        # Step 2 -- the real, legitimate path: the dashboard's own Confirmer button, which now signs.
+        await client.execute("publish", channel, sign(f"LIQUIDATE:{agent.agent_id}"))
+        await asyncio.sleep(0.2)
+        legit_still_works = len(broker.market_orders) == 1
+
+        listener_task.cancel()
+        try:
+            await listener_task
+        except asyncio.CancelledError:
+            pass
+
+        if attack_blocked and legit_still_works:
+            _record(
+                "Emergency Liquidate Channel Injection (unauthenticated Redis Pub/Sub)",
+                "SAFE (real fix)",
+                f"An unsigned PUBLISH on {channel!r} was correctly rejected (no market order placed); a "
+                f"signed one (sign(f'LIQUIDATE:{{agent_id}}'), what the real dashboard button now sends) "
+                f"still triggered the real liquidation: {broker.market_orders[0]!r}. The break-glass path "
+                f"itself (emergency_flatten_market_order) stays deliberately unguarded by the Kill Switch "
+                f"-- the fix is authenticating who may reach it, not gating the action itself."
+            )
+        elif not attack_blocked:
+            _record(
+                "Emergency Liquidate Channel Injection (unauthenticated Redis Pub/Sub)",
+                "VULNERABLE",
+                f"An unauthenticated PUBLISH on {channel!r} (no signature, no dashboard session, no "
+                f"content validation) forced a real market order: {broker.market_orders[0]!r}. This calls "
+                f"BaseBroker.emergency_flatten_market_order -- deliberately NOT Kill-Switch-gated (see "
+                f"core/security.py's module docstring) -- so this is not merely an unwanted trade, it is "
+                f"one that fires even during a real, legitimate panic."
+            )
+        else:
+            _record(
+                "Emergency Liquidate Channel Injection", "REGRESSION",
+                "The attack was correctly blocked, but the real dashboard's own signed publish no longer "
+                "works either -- the fix over-corrected and broke the legitimate path.",
+            )
+    finally:
+        RedisClient._instance = None
+
+
+# =============================================================================
 # pytest entrypoints
 # =============================================================================
 
@@ -252,6 +464,11 @@ async def test_kill_switch_spoofing() -> None:
     await _attack_kill_switch_spoofing()
 
 
+@pytest.mark.asyncio
+async def test_kill_switch_signature_replay() -> None:
+    await _attack_kill_switch_signature_replay()
+
+
 def test_worm_ledger_tampering_is_detected() -> None:
     _attack_worm_ledger_tampering()
     assert _REPORT[-1][1] == "DETECTED"  # the one attack that MUST fail for real money to be safe
@@ -259,6 +476,11 @@ def test_worm_ledger_tampering_is_detected() -> None:
 
 def test_api_secret_log_leak() -> None:
     _attack_api_secret_log_leak()
+
+
+@pytest.mark.asyncio
+async def test_emergency_liquidate_channel_injection() -> None:
+    await _attack_emergency_liquidate_channel_injection()
 
 
 # =============================================================================
@@ -273,15 +495,19 @@ def _print_summary() -> None:
     for scenario, verdict, _detail in _REPORT:
         print(f"  [{verdict:20s}] {scenario}")
     print("=" * 78)
-    vulnerable = sum(1 for _s, v, _d in _REPORT if v not in ("DETECTED", "SAFE"))
-    print(f"Real, confirmed vulnerabilities: {vulnerable} / {len(_REPORT)} scenarios")
+    _RESOLVED_VERDICTS = ("DETECTED", "SAFE", "SAFE (real fix)")
+    vulnerable = sum(1 for _s, v, _d in _REPORT if v not in _RESOLVED_VERDICTS and v != "PARTIALLY FIXED")
+    partial = sum(1 for _s, v, _d in _REPORT if v == "PARTIALLY FIXED")
+    print(f"Real, confirmed vulnerabilities: {vulnerable} / {len(_REPORT)} scenarios ({partial} partially fixed)")
 
 
 async def _main() -> None:
     await _attack_redis_market_metrics_poisoning()
     await _attack_kill_switch_spoofing()
+    await _attack_kill_switch_signature_replay()
     _attack_worm_ledger_tampering()
     _attack_api_secret_log_leak()
+    await _attack_emergency_liquidate_channel_injection()
     _print_summary()
 
 

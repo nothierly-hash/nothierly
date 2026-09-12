@@ -34,10 +34,25 @@ from core.security import requires_system_active
 # RequestTimeout is technically a subclass of NetworkError already, but it
 # is listed explicitly (as required) for clarity at the call site about
 # exactly which failure modes this client treats as recoverable.
+#
+# **Real bug found live, via an actual multi-hour shadow run, not a test**: ccxt.pro's own
+# websocket transport runs a background `ping_loop` task (aiohttp-based keepalive) independently of
+# the main watch_trades/watch_order_book call this wraps -- when that background task's own
+# `connection.ping()` hits a reset connection, it raises a raw `ConnectionResetError` (a Python
+# builtin, via aiohttp's `ClientConnectionResetError`) that ccxt.pro does NOT translate into its own
+# `ccxt.NetworkError` before it propagates into the awaited call, defeating this module's own
+# "every network-facing call retries forever" guarantee and crashing the whole agent process after
+# ~1h of otherwise-healthy reconnect attempts (see MarketDataAgent's own real crash log). `OSError`
+# (the real base class for every one of ConnectionResetError/ConnectionRefusedError/
+# ConnectionAbortedError/BrokenPipeError -- genuine OS/socket-level failures, never a programming
+# error like TypeError/AttributeError/KeyError) is the correct, library-agnostic net to catch this
+# under, without importing aiohttp's own exception types into a module that otherwise only speaks
+# ccxt's vocabulary.
 _RECOVERABLE_CCXT_ERRORS: Final[tuple[type[Exception], ...]] = (
     NetworkError,
     ExchangeError,
     RequestTimeout,
+    OSError,
 )
 # AuthenticationError is a subclass of ExchangeError above, but a real bug
 # found via live testing (Chapter 13, Étape 5.6): retrying it "forever with
@@ -53,11 +68,16 @@ class AsyncExchangeClient:
 
     Every network-facing call (``load_markets``, ``watch_order_book``,
     ``watch_trades``) goes through the same resilient retry loop: on a
-    recoverable ``ccxt`` error the failure is logged via structlog and
-    retried after a capped exponential backoff (with jitter), forever,
-    rather than propagating the error to the caller. Non-``ccxt``
-    exceptions (programming errors, cancellation, ...) are never caught
-    here and propagate normally.
+    recoverable ``ccxt`` error -- or a real OS/socket-level failure
+    (``OSError``, e.g. a raw ``ConnectionResetError`` leaking out of
+    ccxt.pro's own internal websocket keepalive task without being
+    translated into ``ccxt.NetworkError`` first, found via a real
+    multi-hour shadow run -- see :data:`_RECOVERABLE_CCXT_ERRORS`'s own
+    comment) -- the failure is logged via structlog and retried after a
+    capped exponential backoff (with jitter), forever, rather than
+    propagating the error to the caller. Genuine programming errors
+    (``TypeError``, ``AttributeError``, ``KeyError``, ...) and
+    cancellation are never caught here and propagate normally.
     """
 
     def __init__(

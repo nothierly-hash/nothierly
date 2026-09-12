@@ -24,6 +24,7 @@ import fakeredis.aioredis
 import pytest
 
 from core.base_agent import AgentControlState
+from core.message_integrity import publish_signed_market_metrics
 from core.redis_client import RedisClient
 from core.schemas import MarketMetrics
 from src.agents.rl_signal.agent import RlSignalAgent
@@ -53,8 +54,11 @@ def redis_client() -> Generator[RedisClient, None, None]:
 
 
 async def _seed_market_metrics(redis_client: RedisClient) -> None:
+    # Signed write (core/message_integrity.py): XgboostSignalAgent._read_market_metrics now verifies a
+    # signature before accepting a reading -- a plain unsigned SET (the old body of this helper) would be
+    # rejected exactly like tests/red_team_hacker.py's own poisoning attack is.
     metrics = MarketMetrics(symbol=_INSTRUMENT, spread=0.0001, order_book_imbalance=0.1, mid_price=1.10000)
-    await redis_client.execute("set", f"market_metrics:{_INSTRUMENT}", metrics.model_dump_json())
+    await publish_signed_market_metrics(redis_client, _INSTRUMENT, metrics, ttl_seconds=10)
 
 
 @pytest.fixture

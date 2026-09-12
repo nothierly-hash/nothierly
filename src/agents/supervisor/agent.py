@@ -49,7 +49,9 @@ import zmq.asyncio
 from pydantic import ValidationError
 
 from core.base_agent import AgentControlState, BaseAgent
+from core.circuit_breaker import MarketAnomalyDetector
 from core.config import AppSettings
+from core.message_integrity import SignatureVerificationError, read_verified_market_metrics
 from core.redis_client import RedisUnavailableError
 from core.schemas import (
     FEATURE_VECTOR_REDIS_KEY_PREFIX,
@@ -61,6 +63,7 @@ from core.schemas import (
     TradingSignal,
 )
 from core.security import trip_kill_switch
+from core.stale_check import staleness_reason
 from src.agents.supervisor.feature_confirmation import apply_feature_confirmation
 from src.agents.supervisor.ml_engine import SupervisorMLModel
 
@@ -150,7 +153,11 @@ class XgboostSignalAgent(BaseAgent):
         spread_anomaly_multiplier: float = 3.0,
         spread_history_window: int = 20,
         max_consecutive_errors: int = 3,
+        flash_crash_window_seconds: float = 60.0,
+        flash_crash_max_move_fraction: float = 0.05,
+        max_market_metrics_age_ms: float = 500.0,
         model_path: str | Path | None = None,
+        scaler_path: str | Path | None = None,
         settings: AppSettings | None = None,
         manage_own_signals: bool = True,
         zmq_context: zmq.asyncio.Context | None = None,
@@ -180,8 +187,29 @@ class XgboostSignalAgent(BaseAgent):
                 this many *prior* readings exist.
             max_consecutive_errors: Kill Switch condition #3: trip once
                 consecutive read/inference errors exceed this count.
+            flash_crash_window_seconds: Kill Switch condition #4: lookback
+                window :class:`~core.circuit_breaker.MarketAnomalyDetector`
+                measures a price move over -- independent of spread (see
+                that class's own docstring for why this exists alongside
+                condition #2, not instead of it).
+            flash_crash_max_move_fraction: Kill Switch condition #4:
+                absolute fractional price move within
+                ``flash_crash_window_seconds`` that trips it.
+            max_market_metrics_age_ms: Kill Switch condition #5: trip if
+                the latest :class:`~core.schemas.MarketMetrics` reading is
+                older than this many milliseconds (see
+                :mod:`core.stale_check`'s own docstring on why 500ms is
+                deliberately aggressive).
             model_path: Passed through to :class:`SupervisorMLModel`; see
                 its docstring for the untrained-skeleton fallback.
+            scaler_path: Passed through to :class:`SupervisorMLModel`
+                alongside ``model_path`` -- without this, a real
+                ``model_path`` still loads and runs, but against a
+                skeleton (synthetic-data-fitted) scaler, silently
+                degrading prediction quality (see that class's own
+                docstring). Real bug fixed here: this parameter never
+                existed on this constructor at all, so no caller could
+                ever supply a real fitted scaler alongside a real model.
             settings: Application settings. Defaults to ``get_settings()``
                 (see :class:`~core.base_agent.BaseAgent`).
             manage_own_signals: See :class:`~core.base_agent.BaseAgent`.
@@ -214,12 +242,17 @@ class XgboostSignalAgent(BaseAgent):
         self._spread_anomaly_multiplier = spread_anomaly_multiplier
         self._max_consecutive_errors = max_consecutive_errors
 
-        self._ml_model = SupervisorMLModel(model_path=model_path)
+        self._ml_model = SupervisorMLModel(model_path=model_path, scaler_path=scaler_path)
 
         self._consecutive_error_count = 0
         self._spread_history_window = spread_history_window
         self._spread_history: deque[float] = deque(maxlen=spread_history_window)
         self._emergency_mode = False
+
+        self._anomaly_detector = MarketAnomalyDetector(
+            window_seconds=flash_crash_window_seconds, max_move_fraction=flash_crash_max_move_fraction
+        )
+        self._max_market_metrics_age_ms = max_market_metrics_age_ms
 
     # -- BaseAgent overrides -----------------------------------------
 
@@ -320,7 +353,7 @@ class XgboostSignalAgent(BaseAgent):
         """
         try:
             state = await self._fetch_latest_state()
-        except (RedisUnavailableError, ValidationError) as exc:
+        except (RedisUnavailableError, ValidationError, SignatureVerificationError) as exc:
             self._consecutive_error_count += 1
             self._log.warning(
                 "xgboost_signal_state_fetch_failed",
@@ -408,10 +441,17 @@ class XgboostSignalAgent(BaseAgent):
         )
 
     async def _read_market_metrics(self) -> MarketMetrics | None:
-        """Read the traded symbol's latest :class:`~core.schemas.MarketMetrics`."""
+        """Read + signature-verify the traded symbol's latest :class:`~core.schemas.MarketMetrics`.
+
+        Real fix for ``tests/red_team_hacker.py``'s Attack 1 (Redis
+        MarketMetrics cache poisoning): a plain ``GET`` accepted anything
+        shaped like a valid reading, including a fabricated one written
+        directly to this key by anyone with Redis access. See
+        :func:`~core.message_integrity.read_verified_market_metrics`'s own
+        docstring for the real, disclosed scope of this fix.
+        """
         assert self._redis_client is not None
-        raw = await self._redis_client.execute("get", f"market_metrics:{self._symbol}")
-        return MarketMetrics.model_validate_json(raw) if raw is not None else None
+        return await read_verified_market_metrics(self._redis_client, self._symbol)
 
     async def _read_feature_vector(self) -> FeatureVector | None:
         """Read the traded symbol's latest :class:`~core.schemas.FeatureVector`, if any.
@@ -492,6 +532,18 @@ class XgboostSignalAgent(BaseAgent):
             # Recorded *after* the check so the current reading never
             # contaminates its own anomaly baseline.
             self._spread_history.append(spread)
+
+            # Condition #4 -- flash crash, independent of spread. Real gap closed: see
+            # core/circuit_breaker.py's module docstring (tests/chaos_monkey.py Chaos 1a).
+            price_move_reason = self._anomaly_detector.check(state.market_metrics.mid_price)
+            if price_move_reason is not None:
+                reasons.append(price_move_reason)
+
+            # Condition #5 -- stale-but-present reading. Real gap closed: see
+            # core/stale_check.py's module docstring (tests/chaos_monkey.py Chaos 3).
+            stale_reason = staleness_reason(state.market_metrics.timestamp, max_age_ms=self._max_market_metrics_age_ms)
+            if stale_reason is not None:
+                reasons.append(stale_reason)
 
         if self._consecutive_error_count > self._max_consecutive_errors:
             reasons.append(

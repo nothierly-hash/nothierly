@@ -38,6 +38,7 @@ from typing import Literal
 import streamlit as st
 
 from core.base_agent import AgentControlState
+from core.message_integrity import sign
 from core.schemas import (
     AGENT_CONTROL_CHANNEL_PREFIX,
     AGENT_CONTROL_STATE_REDIS_KEY_PREFIX,
@@ -228,7 +229,11 @@ else:
     col_confirm, col_cancel = st.columns(2)
     with col_confirm:
         if st.button("✅ CONFIRMER -- fermer maintenant", type="primary", width="stretch", key=f"confirm_{agent_id}"):
-            r.publish(f"{ALPHA_ENGINE_EMERGENCY_LIQUIDATE_CHANNEL_PREFIX}{agent_id}", "LIQUIDATE")
+            # Signed (core/message_integrity.py) -- real fix for tests/red_team_hacker.py's Attack 5: the
+            # engine's listener now verifies this against f"LIQUIDATE:{agent_id}" before acting, so only a
+            # holder of VAULT_MASTER_KEY (this dashboard backend) can trigger a real liquidation, not any
+            # client able to reach this project's by-default-unauthenticated Redis.
+            r.publish(f"{ALPHA_ENGINE_EMERGENCY_LIQUIDATE_CHANNEL_PREFIX}{agent_id}", sign(f"LIQUIDATE:{agent_id}"))
             st.session_state[_confirm_key] = False
             st.toast("Commande Emergency Liquidate envoyée -- effective au prochain cycle réel du moteur.", icon="🆘")
             st.rerun()

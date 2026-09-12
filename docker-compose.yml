@@ -25,11 +25,27 @@
 # separate infrastructure this project has no established story for --
 # not fabricated here.
 
+# Log rotation, applied to every service below via `<<: *default-logging`.
+#
+# Real incident (2026-09-10): the `json-file` driver Docker uses by
+# default has NO size limit or rotation. `nothierly-agents` (17 async
+# agents, continuous structured JSON stdout -- heartbeats every few
+# seconds, per-agent signal/ZMQ event logs) grew its own container log
+# file to 40GB with zero rotation configured anywhere in this file,
+# repeatedly filling the host disk to 100% and blocking rebuilds/redeploys
+# of unrelated services. Capping every service here prevents recurrence.
+x-default-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "20m"
+    max-file: "5"
+
 services:
   timescaledb:
     image: timescale/timescaledb:latest-pg15
     container_name: nothierly-${CLIENT_ID:?Set CLIENT_ID in this client's .env -- see file header}-timescaledb
     restart: unless-stopped
+    logging: *default-logging
     environment:
       - POSTGRES_USER=${DB_USER:?Set DB_USER}
       - POSTGRES_PASSWORD=${DB_PASSWORD:?Set DB_PASSWORD}
@@ -68,6 +84,7 @@ services:
       timeout: 3s
       retries: 5
     restart: unless-stopped
+    logging: *default-logging
 
   nothierly-gateway:
     build: .
@@ -84,10 +101,22 @@ services:
       REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD}
       TIMESCALE_HOST: timescaledb
       TIMESCALE_PORT: "5432"
+      # Same real bug, same fix, as the alpha-engine service block's identical two lines (see that
+      # block's own comment for the full verified reasoning): without these, api_middleware/
+      # gateway.py's _build_zmq_publisher falls back to binding its OWN isolated ZMQ PUB port
+      # instead of connecting to nothierly-agents' shared broker -- CLIENT_ORDERS_TOPIC (every real
+      # order submit_order publishes) then reaches no subscriber at all. Found live: src/execution/
+      # shadow_crossing_engine.py's ShadowCrossingEngine subscribes to exactly that topic and would
+      # stay permanently empty even once actually run (see run_backend.py), because this gateway was
+      # never actually connected to the bus that engine listens on.
+      ZMQ_BROKER_FRONTEND_ADDRESS: tcp://nothierly-agents:5559
+      ZMQ_BROKER_BACKEND_ADDRESS: tcp://nothierly-agents:5560
     depends_on:
       redis-broker:
         condition: service_healthy
       timescaledb:
+        condition: service_healthy
+      nothierly-agents:
         condition: service_healthy
     healthcheck:
       # The gateway's own real liveness endpoint (api_middleware/gateway.py,
@@ -99,6 +128,7 @@ services:
       retries: 5
       start_period: 15s
     restart: unless-stopped
+    logging: *default-logging
 
   nothierly-agents:
     build: .
@@ -160,6 +190,7 @@ services:
       retries: 5
       start_period: 30s
     restart: unless-stopped
+    logging: *default-logging
 
   alpha-engine:
     build: .
@@ -245,6 +276,7 @@ services:
     # fully deadlocked event loop never runs core.watchdog's own task either, so it never exits on its
     # own at all -- only the external healthcheck-driven restart below can recover that case.
     restart: on-failure:5
+    logging: *default-logging
 
   # The real, disclosed gap this closes: a `healthcheck:` block alone (see alpha-engine's above)
   # only makes `docker ps` report "unhealthy" -- plain Docker Compose does NOT itself restart a
@@ -271,6 +303,7 @@ services:
     depends_on:
       - alpha-engine
     restart: unless-stopped
+    logging: *default-logging
 
   nothierly-dashboard:
     build: .
@@ -290,6 +323,12 @@ services:
       REDIS_HOST: redis-broker
       REDIS_PORT: "6379"
       REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD}
+      # This container's own copy of p2p_api.py's real internal client key (the P2P Premium
+      # Scanner page sends it as X-API-Key against the now-authenticated production endpoint --
+      # see src/dashboard/ems_pages/p2p_premium_scanner.py). Only this raw value lives here; only
+      # its SHA-256 hash is ever configured on the p2p-api service below (zero-knowledge, even for
+      # this project's own internal traffic).
+      P2P_API_INTERNAL_KEY: ${P2P_API_INTERNAL_KEY:-}
     depends_on:
       redis-broker:
         condition: service_healthy
@@ -303,6 +342,97 @@ services:
       retries: 5
       start_period: 15s
     restart: unless-stopped
+    logging: *default-logging
+
+  # Real, standalone B2B SaaS pivot -- p2p_api.py's own module docstring for the full design.
+  # No TimescaleDB dependency -- every market-data source this service reads (Binance P2P,
+  # open.er-api.com, CoinGecko) is a real *external* public API. Redis IS a real dependency below
+  # (added for sandbox.py's 30-day history ZSET, and for the SOC 2 rate limiter/audit trail) --
+  # this comment previously said "no redis-broker dependency at all", true when this service was
+  # first built, no longer true; corrected here rather than left stale next to code that
+  # contradicts it.
+  #
+  # **Host port note, corrected from the original brief**: the brief asked for host port 8000,
+  # but that is already claimed by nothierly-gateway above (see its own `ports:` -- a second
+  # service publishing the same host port would fail this whole `docker compose up` outright,
+  # not just conflict silently). The *container's own* internal port is still 8000, exactly as
+  # asked (`--port 8000` below) -- only the host-side mapping moves, the same
+  # `${..._HOST_PORT:-default}` pattern nothierly-gateway/-dashboard already use.
+  nothierly-p2p-api:
+    build: .
+    container_name: nothierly-${CLIENT_ID:?Set CLIENT_ID}-p2p-api
+    command: ["uvicorn", "p2p_api:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "${P2P_API_HOST_PORT:-8001}:8000"
+    # Added for sandbox.py's real 30-day-delayed replay endpoint (p2p_api.py's own
+    # _store_history_snapshot writes each scan's candidates into a per-fiat Redis ZSET) -- this
+    # service's own real-time endpoint (GET /api/v1/p2p-premiums) still needs no Redis/TimescaleDB
+    # at all and degrades gracefully (best-effort history write, see that function's own docstring)
+    # if Redis is ever unreachable; this dependency only gates startup ordering, not correctness.
+    env_file:
+      - ${CLIENT_ENV_FILE:-.env}
+    environment:
+      CLIENT_ID: ${CLIENT_ID:?Set CLIENT_ID}
+      REDIS_HOST: redis-broker
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD}
+      # Zero-knowledge: SHA-256 hex digests only, never a raw key -- see
+      # core/config.py's own P2PApiSettings docstring and p2p_api.py's require_production_api_key.
+      # Unset means the production endpoint fails closed (every request rejected), matching this
+      # project's own established convention for every other API-key setting.
+      P2P_API_KEY_SHA256_HASHES: ${P2P_API_KEY_SHA256_HASHES:-}
+    depends_on:
+      redis-broker:
+        condition: service_healthy
+    healthcheck:
+      # This service's own real liveness endpoint (p2p_api.py's /health) -- not a fabricated check.
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status == 200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+    logging: *default-logging
+
+  # Real, standalone background worker -- political_agent.py's own module docstring for the
+  # full design (RSS in, real LLM crisis scoring, Redis out). Named nothierly-political-agent
+  # deliberately, not "macro_agent" as the brief itself suggested -- this project already has a
+  # real, distinct src.agents.macro.agent.MacroAgent (numeric macro indicators, runs inside
+  # nothierly-agents) with that exact name; reusing it here would collide with an existing,
+  # unrelated real process, not create a new one. No ZMQ broker or TimescaleDB dependency --
+  # this service's entire real contract is RSS in, Redis out (see that module's own docstring
+  # on why it is not a core.base_agent.BaseAgent subclass).
+  nothierly-political-agent:
+    build: .
+    container_name: nothierly-${CLIENT_ID:?Set CLIENT_ID}-political-agent
+    command: ["python", "political_agent.py"]
+    env_file:
+      - ${CLIENT_ENV_FILE:-.env}
+    environment:
+      CLIENT_ID: ${CLIENT_ID:?Set CLIENT_ID}
+      REDIS_HOST: redis-broker
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD}
+    depends_on:
+      redis-broker:
+        condition: service_healthy
+    healthcheck:
+      # Same real "heartbeat:{agent_id} key exists" liveness proxy as nothierly-agents' own
+      # healthcheck above, scoped to this one specific agent_id (a single standalone process,
+      # not a fleet, so a precise check is the honest one here). A generous start_period: one
+      # real cycle (RSS fetch across 5 feeds + any real LLM calls) must complete once before
+      # this first writes its own heartbeat.
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - "import redis,sys; r=redis.Redis(host='redis-broker',port=6379,password='${REDIS_PASSWORD}'); sys.exit(0 if r.exists('heartbeat:political-macro-sentiment-agent') else 1)"
+      interval: 60s
+      timeout: 5s
+      retries: 5
+      start_period: 120s
+    restart: unless-stopped
+    logging: *default-logging
 
 volumes:
   redis_data:

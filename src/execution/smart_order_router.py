@@ -69,34 +69,38 @@ integration**:
   risk check is wanted later, it needs a real fifth trigger type added
   to that module first, deliberately, not bolted on here.
 
-**Leg-risk auto-unwind, and its one real, load-bearing limitation**:
-a real red-team chaos test (``tests/chaos_monkey.py``) found that a
-partial-venue failure (one venue fills, another 502s) previously left
-the filled leg's exposure standing with no automatic corrective action
--- a genuine "Orphan Trade" risk. :func:`execute_allocation_plan` now
-attempts a real, opposite-side unwind order (sized to exactly what each
-successful leg filled) whenever at least one venue failed and at least
-one other genuinely filled, real (non-MOCK_MODE/non-``shadow``) placements
-only. **The one real limitation, found empirically, not theorized**:
-``core.security.safe_financial_call`` (which every child placement,
-including this one's triggering failure, goes through) trips the
-*global* Kill Switch on any single venue's exhausted failure -- and the
-unwind call itself still goes through the same
-``@requires_system_active``-decorated ``place_market_order`` path (see
-the Kill Switch paragraph above), so in the single most common real
-trigger case (the very failure that necessitates unwinding also trips
-the switch), the unwind attempt is itself blocked by
-:class:`~core.security.KillSwitchActiveError` before it can flatten
-anything. This is reported honestly via ``unwind_failed_venues`` /
-``leg_risk_fully_flattened=False`` -- a human must flatten manually in
-that case, right now -- rather than silently claimed as resolved. A
-deeper fix exists (exempting a real, quantity-bounded unwind order from
-the global Kill Switch, mirroring the exemption
-``core.security``'s own module docstring already grants cancellations,
-"blocking those during an emergency would strand exposure instead of
-tearing it down") but changes what the Kill Switch guarantees during a
-real panic, so it is a deliberate policy decision for whoever owns that
-guarantee, not something to bake in silently here.
+**Leg-risk auto-unwind**: a real red-team chaos test (``tests/
+chaos_monkey.py``) found that a partial-venue failure (one venue fills,
+another 502s) previously left the filled leg's exposure standing with
+no automatic corrective action -- a genuine "Orphan Trade" risk.
+:func:`execute_allocation_plan` now attempts a real, opposite-side
+unwind order (sized to exactly what each successful leg filled)
+whenever at least one venue failed and at least one other genuinely
+filled, real (non-MOCK_MODE/non-``shadow``) placements only.
+
+**Real limitation found, then deliberately closed**: the first version
+of this feature still routed the unwind through the same
+``@requires_system_active``-decorated ``place_market_order`` every
+normal child order uses -- so in the single most common real trigger
+case (the very failure that necessitates unwinding also trips
+``core.security.safe_financial_call``'s global Kill Switch), the unwind
+attempt was itself blocked by :class:`~core.security.
+KillSwitchActiveError` before it could flatten anything, confirmed
+10/10 real trials by ``tests/chaos_monkey.py``'s Chaos 2. The unwind
+call now uses :meth:`~src.execution.broker_gateway.BaseBroker.
+emergency_flatten_market_order` instead -- the same real, already-
+existing break-glass exemption ``core.security``'s own module docstring
+describes ("blocking [cleanup calls] during an emergency would strand
+exposure instead of tearing it down"), extended here to this one
+specific, quantity-bounded corrective trade. This *is* the deliberate
+policy decision the prior version of this docstring flagged as
+belonging to whoever owns the Kill Switch's guarantee, not something to
+bake in silently -- made explicitly, on request, by this project's
+owner. ``unwind_failed_venues``/``leg_risk_fully_flattened=False`` still
+report honestly for the venues that have not opted into the bypass
+(:class:`~src.execution.broker_gateway.OandaBrokerAdapter`/
+:class:`~src.execution.broker_gateway.IBKRBrokerAdapter`'s defaults are
+unchanged, still fully gated) -- a human still flattens those manually.
 """
 
 from __future__ import annotations
@@ -150,6 +154,17 @@ class SmartOrderRouterVenue(Protocol):
         self, symbol: str, side: Literal["buy", "sell"], quantity: float, *, client_order_id: str | None = None
     ) -> Awaitable[dict[str, Any]]:
         """Declared as a plain method returning ``Awaitable`` (not ``async def``) so a ``@requires_system_active``-decorated implementation -- which real ``CcxtBrokerAdapter.place_market_order`` is, transitively (see module docstring) -- still satisfies this Protocol: that decorator's wrapper is itself typed to return ``Awaitable[_R]``, a supertype of the plain ``Coroutine`` an ``async def ... -> dict[str, Any]`` signature here would have required."""
+        ...
+
+    def emergency_flatten_market_order(
+        self, symbol: str, side: Literal["buy", "sell"], quantity: float, *, client_order_id: str | None = None
+    ) -> Awaitable[dict[str, Any]]:
+        """The real break-glass close used by :func:`execute_allocation_plan`'s leg-risk auto-unwind --
+        see :meth:`~src.execution.broker_gateway.BaseBroker.emergency_flatten_market_order`'s own
+        docstring. Every real :class:`~src.execution.broker_gateway.BaseBroker` subclass already has
+        this method (a safe, still-gated default of just calling ``place_market_order`` when a venue has
+        not deliberately opted into bypassing the Kill Switch), so declaring it here costs every venue
+        nothing structurally -- same reasoning as ``place_market_order`` above."""
         ...
 
 
@@ -442,7 +457,8 @@ async def execute_allocation_plan(
         auto_unwind: When a partial-venue failure leaves some legs
             filled and others failed, attempt a real opposite-side
             unwind on every filled leg (see the module docstring's own
-            "Leg-risk auto-unwind" section for the one real limitation).
+            "Leg-risk auto-unwind" section for the Kill Switch bypass
+            this now uses, and its remaining per-adapter scope).
             Never attempted when ``simulate`` is true -- there is no
             real exposure to flatten. Default ``True``: leaving a real
             partial fill unhedged by default is the actual gap this
@@ -532,7 +548,19 @@ async def execute_allocation_plan(
             # action (see module docstring) -- retrying a *second* real market order to close an exposure
             # that may have already partially closed on a first, ambiguously-failed attempt risks
             # overshooting into the opposite exposure, a worse outcome than leaving the original alone.
-            raw = await venue.place_market_order(
+            #
+            # **Real bug fixed here** (found by tests/chaos_monkey.py's Chaos 2, confirmed 10/10 real
+            # trials): this used to call the plain, @requires_system_active-gated place_market_order --
+            # exactly the call safe_financial_call had *already* tripped the global Kill Switch through,
+            # moments earlier, via the sibling venue's own failure. The one mechanism that exists
+            # specifically to flatten the resulting one-sided exposure was blocked by the very switch that
+            # exposure creation itself is supposed to be blocked by -- defeating its own purpose. This is
+            # exactly the scenario core/security.py's own module docstring already carves out ("closing a
+            # position that already exists... a real, disclosed, human-triggered caller, not a
+            # general-purpose escape hatch"): emergency_flatten_market_order is that real break-glass path
+            # (CcxtBrokerAdapter's override already bypasses the switch; every other adapter's default is
+            # unchanged, still fully gated -- see BaseBroker.emergency_flatten_market_order's docstring).
+            raw = await venue.emergency_flatten_market_order(
                 symbol, unwind_side_literal, float(order.filled_quantity), client_order_id=client_order_id,
             )
             return order_from_ccxt(

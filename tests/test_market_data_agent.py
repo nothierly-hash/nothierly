@@ -20,9 +20,11 @@ from typing import Any, Generator
 import fakeredis.aioredis
 import pytest
 
+import asyncio
+
 from core.config import RedisSettings
 from core.redis_client import RedisClient
-from core.schemas import TRADE_TAPE_MAX_ENTRIES, TRADE_TAPE_REDIS_KEY_PREFIX
+from core.schemas import HEARTBEAT_REDIS_KEY_PREFIX, TRADE_TAPE_MAX_ENTRIES, TRADE_TAPE_REDIS_KEY_PREFIX
 from src.agents.market_data.agent import MarketDataAgent
 
 _SYMBOL = "BTC/USDT"
@@ -95,3 +97,26 @@ async def test_tape_is_capped_at_the_real_max_entries(agent: MarketDataAgent, re
 async def test_no_redis_client_does_not_crash(agent: MarketDataAgent) -> None:
     agent._redis_client = None
     await agent._handle_trades_update([{"timestamp": 1, "side": "buy", "amount": 1.0, "price": 1.0}])
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_loop_writes_a_real_heartbeat_independent_of_the_stream_loops(
+    agent: MarketDataAgent, redis_client: RedisClient
+) -> None:
+    """Real regression test for a real bug found live in this project's own 13.5h shadow run:
+    MarketDataAgent.run() overrides BaseAgent.run() entirely with two WebSocket stream consumers
+    and never called BaseAgent._write_heartbeat() -- a perfectly healthy agent (real, fresh
+    trade-tape/market-metrics writes the whole time) looked permanently OFFLINE to every real
+    heartbeat-based liveness check in this project (docker-compose.yml's own healthcheck,
+    swarm_console.py's agent status). This asserts the real fix: a real, independent heartbeat
+    loop, run concurrently with (not instead of) the two stream consumers.
+    """
+    heartbeat_task = asyncio.create_task(agent._heartbeat_loop())
+    try:
+        await asyncio.sleep(0.05)
+        raw = await redis_client.execute("get", f"{HEARTBEAT_REDIS_KEY_PREFIX}{agent.agent_id}")
+        assert raw is not None
+    finally:
+        heartbeat_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await heartbeat_task

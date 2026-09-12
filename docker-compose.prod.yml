@@ -1,0 +1,275 @@
+# Nothierly -- production hardening overlay: network isolation, new gRPC/Swarm services,
+# and resource/log-rotation ceilings.
+#
+# Launched ON TOP OF docker-compose.yml, never alone:
+#
+#   docker compose -p nothierly-${CLIENT_ID} --env-file .env.${CLIENT_ID} \
+#       -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# **Real, disclosed deviation from this chapter's literal brief, and why**: the brief asked for a
+# single, self-contained "docker-compose.prod.yml" defining its own redis/api_gateway/terminal
+# services from scratch. docker-compose.yml already *is* this project's real production manifest
+# (its own header: "single-tenant deployment manifest", one real Compose project per client) --
+# it already has a real redis-broker (AOF persistence, password-protected, healthchecked), a real
+# hybrid REST+GraphQL API (nothierly-p2p-api, this session's own earlier gRPC/GraphQL chapter --
+# see p2p_api.py's bottom-of-file router mounts), and a real Streamlit terminal (nothierly-
+# dashboard). Duplicating all of that into a second, parallel file under different service names
+# would produce two independent Redis instances holding half the system's state each (every
+# SWARM_*/P2P_* key this project's agents/dashboard read and write assumes ONE shared Redis --
+# see core/redis_client.py's own singleton docstring), not a hardened version of the real system.
+# Compose's own file-overlay mechanism (`-f base -f override`) is the idiomatic, real answer for
+# exactly this "same services, add production-only concerns" case -- used here instead.
+#
+# **Service-name mapping** (this chapter's brief names vs. this project's real, already-existing
+# service names -- see the "why" above):
+#   api_gateway -> nothierly-p2p-api   (the real Hybrid REST+GraphQL API, port 8000 internally,
+#                                        exactly as asked -- already true, unchanged here)
+#   terminal    -> nothierly-dashboard (Streamlit; kept on its real, already-deployed port 8503,
+#                                        not switched to Streamlit's bare default 8501 -- the
+#                                        brief gave no reason to break existing client configs/
+#                                        firewall rules built around the real port)
+#   redis       -> redis-broker        (kept -- see "why" above; --loglevel warning added below,
+#                                        matching this chapter's own ask, on top of its real
+#                                        --requirepass/--appendonly yes, not a plain --save-only
+#                                        config that would be a downgrade for a password-protected
+#                                        broker holding Kill Switch state)
+#
+# **Not touched here, and why**: alpha-engine already carries its own real, load-bearing 1G
+# memory limit that core.watchdog.SystemWatchdog reads back via the cgroup file that limit
+# produces (see docker-compose.yml's own comment on that exact service) -- silently overwriting
+# it to match this chapter's own memory figures would break that real mechanism, not harden it.
+# nothierly-agents (the shared 7-agent fleet: MarketDataAgent, MacroAgent, a FinBERT/torch-backed
+# NlpAgent, XgboostSignalAgent, RlSignalAgent, ExecutionAgent, ArchivistAgent, all one process) is
+# also left without a new ceiling here: applying this chapter's own 500MB "agent" figure to a
+# single process holding a loaded torch/transformers model on top of six other agents would very
+# likely trigger the exact OOM this whole chapter exists to prevent, not stop it.
+
+# New anchor, not a redefinition of docker-compose.yml's own `x-default-logging` (10m/3 here vs.
+# that file's real, already-tuned 20m/5 -- see its own comment on the real 40GB-log incident that
+# figure was tuned against). Applied only to the genuinely new services below; the pre-existing
+# services keep the logging config already proven against that real incident, not silently
+# replaced by this chapter's own, unverified-in-production figures.
+x-default-logging-prod: &default-logging-prod
+  driver: "json-file"
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  redis-broker:
+    command: >-
+      redis-server
+      --requirepass ${REDIS_PASSWORD:?Set REDIS_PASSWORD -- redis-broker refuses to start without one}
+      --appendonly yes
+      --save 60 1
+      --loglevel warning
+    networks: [internal_core]
+
+  timescaledb:
+    networks: [internal_core]
+
+  nothierly-agents:
+    networks: [internal_core]
+
+  nothierly-political-agent:
+    networks: [internal_core]
+    deploy:
+      resources:
+        limits:
+          memory: 500M
+
+  autoheal:
+    networks: [internal_core]
+
+  nothierly-gateway:
+    networks: [public_net, internal_core]
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  nothierly-p2p-api:
+    networks: [public_net, internal_core]
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  nothierly-dashboard:
+    networks: [public_net, internal_core]
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  # --- New: the internal gRPC EaaS transport (this session's own src/grpc_service/grpc_server.py)
+  # -- see that module's own docstring for its real, disclosed scope (a latency demonstration, not
+  # a second real execution engine; real trades still only ever go through
+  # src/execution/broker_gateway.py / smart_order_router.py). No `ports:` -- reached only from
+  # inside internal_core, exactly like every other core-only service below.
+  grpc_engine:
+    build: .
+    container_name: nothierly-${CLIENT_ID:?Set CLIENT_ID}-grpc-engine
+    command: ["python", "-m", "src.grpc_service.grpc_server"]
+    networks: [internal_core]
+    env_file:
+      - ${CLIENT_ENV_FILE:-.env}
+    environment:
+      CLIENT_ID: ${CLIENT_ID:?Set CLIENT_ID}
+    depends_on:
+      redis-broker:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 500M
+    healthcheck:
+      # Real TCP-level liveness: grpc_server.py binds core.schemas.GRPC_TRADE_EXECUTOR_PORT
+      # (50051) inside this container -- a successful connect is a real, not fabricated, check
+      # (no HTTP/health RPC exists on this service -- it declares exactly one business RPC).
+      test: ["CMD-SHELL", "python -c \"import socket; s=socket.create_connection(('127.0.0.1', 50051), timeout=3); s.close()\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+    logging: *default-logging-prod
+
+  # --- New: the Swarm AI reactive pipeline (this session's own scout_agent.py/analyst_agent.py/
+  # risk_gate_agent.py). Each subclasses core.base_agent.BaseAgent, the exact same class
+  # nothierly-agents' own 7-agent fleet and alpha-engine already use -- so, like those two real
+  # multi-container services, they CONNECT to the one shared XSUB/XPUB broker nothierly-agents
+  # binds (ZMQ_BROKER_FRONTEND_ADDRESS/BACKEND_ADDRESS below), rather than each other's bespoke
+  # per-agent addresses.
+  #
+  # **Real, disclosed deviation from this chapter's own literal ask** ("tcp://swarm_scout:5555"
+  # per-agent addressing): BaseAgent supports that mode too (binding its own fixed port when no
+  # broker address is configured -- see its own docstring), but it is this project's *single-
+  # process/local-dev* fallback, not its multi-container one. Point-to-point addressing across
+  # three chained agents (scout -> analyst -> risk-gate, each publishing a topic the next
+  # subscribes to, see core/schemas.py's own SWARM_*_TOPIC docstrings) would need three separate
+  # bind ports wired pairwise instead of the one shared broker every other container in this
+  # stack already connects to -- reintroducing exactly the N-way peer-wiring problem
+  # core/zmq_broker.py's XSUB/XPUB forwarder exists to avoid. No `ports:` either way: nothing
+  # outside internal_core ever needs to reach these agents directly.
+  swarm_scout:
+    build: .
+    container_name: nothierly-${CLIENT_ID:?Set CLIENT_ID}-swarm-scout
+    command: ["python", "scout_agent.py"]
+    networks: [internal_core]
+    env_file:
+      - ${CLIENT_ENV_FILE:-.env}
+    environment:
+      CLIENT_ID: ${CLIENT_ID:?Set CLIENT_ID}
+      REDIS_HOST: redis-broker
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD}
+      ZMQ_BROKER_FRONTEND_ADDRESS: tcp://nothierly-agents:5559
+      ZMQ_BROKER_BACKEND_ADDRESS: tcp://nothierly-agents:5560
+    depends_on:
+      redis-broker:
+        condition: service_healthy
+      nothierly-agents:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 500M
+    healthcheck:
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - "import redis,sys; r=redis.Redis(host='redis-broker',port=6379,password='${REDIS_PASSWORD}'); sys.exit(0 if r.exists('heartbeat:swarm-scout') else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    logging: *default-logging-prod
+
+  swarm_analyst:
+    build: .
+    container_name: nothierly-${CLIENT_ID:?Set CLIENT_ID}-swarm-analyst
+    command: ["python", "analyst_agent.py"]
+    networks: [internal_core]
+    env_file:
+      - ${CLIENT_ENV_FILE:-.env}
+    environment:
+      CLIENT_ID: ${CLIENT_ID:?Set CLIENT_ID}
+      REDIS_HOST: redis-broker
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD}
+      ZMQ_BROKER_FRONTEND_ADDRESS: tcp://nothierly-agents:5559
+      ZMQ_BROKER_BACKEND_ADDRESS: tcp://nothierly-agents:5560
+    depends_on:
+      redis-broker:
+        condition: service_healthy
+      nothierly-agents:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 500M
+    healthcheck:
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - "import redis,sys; r=redis.Redis(host='redis-broker',port=6379,password='${REDIS_PASSWORD}'); sys.exit(0 if r.exists('heartbeat:swarm-analyst') else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    logging: *default-logging-prod
+
+  swarm_risk:
+    build: .
+    container_name: nothierly-${CLIENT_ID:?Set CLIENT_ID}-swarm-risk
+    command: ["python", "risk_gate_agent.py"]
+    networks: [internal_core]
+    env_file:
+      - ${CLIENT_ENV_FILE:-.env}
+    environment:
+      CLIENT_ID: ${CLIENT_ID:?Set CLIENT_ID}
+      REDIS_HOST: redis-broker
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD}
+      ZMQ_BROKER_FRONTEND_ADDRESS: tcp://nothierly-agents:5559
+      ZMQ_BROKER_BACKEND_ADDRESS: tcp://nothierly-agents:5560
+    depends_on:
+      redis-broker:
+        condition: service_healthy
+      nothierly-agents:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 500M
+    healthcheck:
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - "import redis,sys; r=redis.Redis(host='redis-broker',port=6379,password='${REDIS_PASSWORD}'); sys.exit(0 if r.exists('heartbeat:swarm-risk-gate') else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    logging: *default-logging-prod
+
+# Two networks, real isolation (not just an unpublished `ports:` -- every service below is also
+# only ever placed on the network(s) it actually needs, see each service block above):
+#   public_net    -- host-reachable services only (nothierly-gateway, nothierly-p2p-api,
+#                    nothierly-dashboard already publish real host ports in docker-compose.yml).
+#   internal_core -- every service, including the public-facing three above (they still need to
+#                    reach redis-broker/nothierly-agents). redis-broker, timescaledb,
+#                    nothierly-agents, alpha-engine, nothierly-political-agent, autoheal,
+#                    grpc_engine, swarm_scout, swarm_analyst, swarm_risk are internal_core ONLY --
+#                    no `ports:` directive anywhere on them, unreachable from outside the Docker
+#                    host's own bridge network regardless of this file even existing.
+networks:
+  public_net: {}
+  internal_core: {}

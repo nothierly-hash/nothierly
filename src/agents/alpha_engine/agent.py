@@ -300,6 +300,7 @@ from core.base_agent import AgentControlState, BaseAgent
 from core.config import AppSettings
 from core.exception_manager import install_global_exception_handler
 from core.logger import get_logger
+from core.message_integrity import verify
 from core.nothierly_ontology import AssetClass, UniversalAsset
 from core.notifier import AlertSeverity, TelegramNotifier
 from core.redis_client import RedisUnavailableError
@@ -308,6 +309,8 @@ from core.schemas import (
     AGENT_CONTROL_STATE_REDIS_KEY_PREFIX,
     ALPHA_ENGINE_BASELINE_QTY_REDIS_KEY_PREFIX,
     ALPHA_ENGINE_EMERGENCY_LIQUIDATE_CHANNEL_PREFIX,
+    ALPHA_ENGINE_PNL_HISTORY_MAX_ENTRIES,
+    ALPHA_ENGINE_PNL_HISTORY_REDIS_KEY_PREFIX,
     ALPHA_ENGINE_TELEMETRY_REDIS_KEY_PREFIX,
     MARKET_METRICS_REDIS_KEY_PREFIX,
     ORDER_AUDIT_EVENTS_TOPIC,
@@ -912,6 +915,9 @@ class AlphaMarketMakerAgent(BaseAgent):
             session_realized_pnl_usd=str(self._session_realized_pnl_usd),
             daily_realized_pnl_usd=str(self._daily_realized_pnl_usd),
         )
+        await self._persist_pnl_history_entry(
+            fill_qty=fill_qty, fill_price=fill_price, realized_pnl_delta_usd=realized_delta,
+        )
         await self._publish_audit_event(
             event_type="EXECUTED", order_id=f"alpha-fill-{uuid.uuid4()}",
             detail=(
@@ -1261,6 +1267,23 @@ class AlphaMarketMakerAgent(BaseAgent):
             async for message in pubsub.listen():
                 if message["type"] != "message":
                     continue
+                # **Real vulnerability fixed here** (found by tests/red_team_hacker.py's Attack 5, a
+                # real, empirically confirmed exploit against this session's own code): this used to act
+                # on ANY message that arrived on this channel, with zero check of origin or content --
+                # this codebase's Redis has no auth by default (see core/config.py's own
+                # _require_redis_auth_in_production docstring), so any client able to reach it could
+                # PUBLISH here and force a real, Kill-Switch-bypassing market order on demand, including
+                # during a real, unrelated panic. emergency_flatten_market_order must stay unguarded to
+                # do its real job (see core/security.py's module docstring) -- so the guard belongs here,
+                # at the one real entry point, not on the break-glass call itself. Only a holder of
+                # VAULT_MASTER_KEY (the real dashboard backend -- see src/dashboard/ems_pages/
+                # autonomous_command_center.py's Confirmer button) can produce a payload that verifies.
+                if not verify(f"LIQUIDATE:{self.agent_id}", message["data"]):
+                    self._log.critical(
+                        "alpha_engine_emergency_liquidate_command_rejected_unsigned",
+                        agent_id=self.agent_id,
+                    )
+                    continue
                 self._log.critical("alpha_engine_emergency_liquidate_command_received", agent_id=self.agent_id)
                 # Serialized against _run_cycle via the same lock -- an emergency liquidate and a
                 # routine requote can never interleave and race each other's order placement.
@@ -1367,6 +1390,35 @@ class AlphaMarketMakerAgent(BaseAgent):
         """
         event = OrderAuditEvent(event_type=event_type, order_id=order_id, asset=self._symbol, detail=detail)
         await self.publish(ORDER_AUDIT_EVENTS_TOPIC, event.model_dump(mode="json"))
+
+    async def _persist_pnl_history_entry(
+        self, *, fill_qty: Decimal, fill_price: Decimal, realized_pnl_delta_usd: Decimal
+    ) -> None:
+        """Append one real fill to this engine's own P&L history -- see ALPHA_ENGINE_PNL_HISTORY_REDIS_KEY_PREFIX's own docstring.
+
+        Same bounded LPUSH + LTRIM pattern as
+        :func:`~src.execution.smart_order_router.log_routing_decision`
+        (newest first, capped, best-effort). Read by
+        :mod:`src.dashboard.ems_pages.bilan` to build a real equity curve
+        -- :meth:`_publish_telemetry`'s own key is a short-TTL snapshot of
+        running totals only, not history a chart can be drawn from.
+        """
+        if self._redis_client is None:
+            return
+        entry = {
+            "timestamp": time.time(),
+            "symbol": self._symbol,
+            "fill_qty": str(fill_qty),
+            "fill_price": str(fill_price),
+            "realized_pnl_delta_usd": str(realized_pnl_delta_usd),
+            "session_realized_pnl_usd": str(self._session_realized_pnl_usd),
+        }
+        key = f"{ALPHA_ENGINE_PNL_HISTORY_REDIS_KEY_PREFIX}{self.agent_id}"
+        try:
+            await self._redis_client.execute("lpush", key, json.dumps(entry))
+            await self._redis_client.execute("ltrim", key, 0, ALPHA_ENGINE_PNL_HISTORY_MAX_ENTRIES - 1)
+        except RedisUnavailableError:
+            self._log.warning("alpha_engine_pnl_history_persist_failed", agent_id=self.agent_id)
 
     async def _publish_telemetry(
         self, *, status: str, market_data_age_seconds: float | None, inventory: Decimal | None

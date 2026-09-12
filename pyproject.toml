@@ -99,6 +99,14 @@ module = "ripser.*"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
+module = "persim.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "geopy.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
 module = "scipy.*"
 ignore_missing_imports = true
 
@@ -128,7 +136,78 @@ ignore_missing_imports = true
 # msgpack ships a real, prebuilt wheel (msgpack-1.2.2-cp314-cp314-win_amd64)
 # but no py.typed marker / stubs of its own.
 
+[[tool.mypy.overrides]]
+module = "streamlit_autorefresh.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "feedparser.*"
+ignore_missing_imports = true
+
+# scripts/finetune_political_llm.py's own real, GPU-only extra deps (see that module's docstring) --
+# never installed in this project's own CPU-only requirements.txt, only on a rented GPU instance.
+[[tool.mypy.overrides]]
+module = "datasets.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "peft.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "trl.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "bitsandbytes.*"
+ignore_missing_imports = true
+
+# p2p_oracle.py's own real time-series forecasting dependency (Amazon's Chronos foundation model).
+[[tool.mypy.overrides]]
+module = "chronos.*"
+ignore_missing_imports = true
+
+# protoc-generated gRPC stubs (src/grpc_service/execution_pb2*.py) -- "DO NOT EDIT" generated
+# code, regenerated wholesale from execution.proto (see that file's own regeneration comment), so
+# holding it to this project's own strict standards (full annotations on every generated method)
+# would just get overwritten on the next `protoc` run. src/grpc_service/grpc_server.py, the real
+# hand-written code that calls into these stubs, is still checked at full strictness.
+[[tool.mypy.overrides]]
+module = ["src.grpc_service.execution_pb2", "src.grpc_service.execution_pb2_grpc"]
+ignore_errors = true
+
+# strawberry-graphql's own @strawberry.field/@strawberry.type decorators are not precisely typed
+# enough for this project's disallow_untyped_decorators=true under mypy strict (verified: the
+# error is on the decorator itself, not on any real missing annotation in src/graphql_api/schema.py's
+# own resolver methods -- every one of them is fully annotated). Scoped to this one module rather
+# than relaxed project-wide.
+[[tool.mypy.overrides]]
+module = "src.graphql_api.schema"
+disallow_untyped_decorators = false
+
+# tests/test_grpc_service.py calls directly into the same protoc-generated, untyped functions
+# (add_TradeExecutorServicer_to_server, TradeExecutorStub) as grpc_server.py's own single,
+# individually-annotated `# type: ignore[no-untyped-call]` call site -- scoped here instead of
+# repeating that comment at four call sites in one test file.
+[[tool.mypy.overrides]]
+module = "tests.test_grpc_service"
+disallow_untyped_calls = false
+
 [tool.pydantic-mypy]
 init_forbid_extra = true
 init_typed = true
 warn_required_dynamic_aliases = true
+
+[tool.pytest.ini_options]
+# Real gap this closes, found stress-testing the red-team fixes in this same session: `pytest tests/`
+# with no timeout at all could hang indefinitely past its last real test result -- reproduced down to a
+# single file (tests/test_shadow_crossing_engine.py, pre-existing, unrelated to those fixes: every one
+# of its own tests passes, but the *process* doesn't exit afterward). The likely real cause is
+# core/zmq_bus.py's own module-level `asyncio.set_event_loop_policy(WindowsSelectorEventLoopPolicy())`
+# -- a process-wide side effect of merely importing it -- interacting with pytest-asyncio's default of a
+# fresh event loop per test on Windows; not fixed here (touching a policy every agent process also
+# depends on, on a hunch, is a worse risk than the hang itself). This bounds the blast radius instead:
+# a full `pytest tests/` can no longer silently block a terminal/CI run forever, regardless of which
+# test or interaction is the real root cause, known or not-yet-found.
+timeout = 120
+timeout_method = "thread"

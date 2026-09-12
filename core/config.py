@@ -273,6 +273,21 @@ class BrokerSettings(BaseSettings):
         default="https://api.broker.example.com",
         description="Base URL of the brokerage/exchange REST API.",
     )
+    sandbox: bool = Field(
+        default=False,
+        description=(
+            "When True, every ccxt.pro exchange this app connects to (src.execution.broker_gateway."
+            "BrokerFactory.create) is switched into its testnet/sandbox mode via ccxt's own "
+            "set_sandbox_mode(True) -- the real mechanism (src.agents.market_data.exchange_client."
+            "AsyncExchangeClient's own sandbox parameter already supported this; nothing wired it to "
+            "settings before this field existed). Mirrors OandaSettings.environment's 'practice'/'live' "
+            "split for the crypto side -- a testnet API key is registered on the exchange's *testnet*, "
+            "a structurally separate system from production; presenting it to the production endpoint "
+            "(this field's False default) fails closed with an authentication error, not a permission "
+            "error, since production has simply never heard of that key at all. Default False (safe: "
+            "production behavior unchanged) -- must be explicitly set to true to use testnet keys."
+        ),
+    )
 
 
 class VaultSettings(BaseSettings):
@@ -389,6 +404,37 @@ class VastAiSettings(BaseSettings):
         default=None,
         description="Local path to the matching SSH private key, used to connect to them.",
     )
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "Master switch, safe-by-default (matching this project's other financial-action "
+            "defaults -- see AppSettings.mock_mode). This is only the boot-time fallback: "
+            "src.mlops.vast_client.is_vast_ai_enabled() prefers a live Redis key "
+            "(core.schemas.VAST_AI_ENABLED_REDIS_KEY) when one is set, so the dashboard's own "
+            "toggle can flip this at runtime without a container restart -- this .env value only "
+            "matters on a cold start, before the dashboard has ever written that key."
+        ),
+    )
+    max_hourly_price_limit_usd: float | None = Field(
+        default=None,
+        description=(
+            "Hard ceiling VastAIClient.rent_instance refuses to exceed, enforced against the "
+            "offer's real, freshly re-queried dph_total at rent time -- not a caller-supplied "
+            "number, so a bug or bad argument upstream cannot silently bypass it. None (the "
+            "default) enforces no ceiling; set explicitly to actually protect against a surprise "
+            "bill from a mis-filtered search."
+        ),
+    )
+
+    @field_validator("max_hourly_price_limit_usd", mode="before")
+    @classmethod
+    def _blank_price_limit_means_unset(cls, value: str | None) -> str | None:
+        # Same real, already-established fix as ZmqSettings._blank_broker_address_means_unset above:
+        # pydantic-settings maps `VASTAI_MAX_HOURLY_PRICE_LIMIT_USD=` (present but blank -- a real
+        # deployment mistake this project's own .env has already made once) to `""`, not `None`, for
+        # a plain `float | None` field. Without this, `""` fails float parsing at startup instead of
+        # being treated as "no ceiling configured".
+        return None if value == "" else value
 
 
 class MacroApiSettings(BaseSettings):
@@ -715,6 +761,64 @@ class ApiMiddlewareSettings(BaseSettings):
     )
 
 
+class P2PApiSettings(BaseSettings):
+    """Credentials and limits for ``p2p_api.py``'s production endpoint (``GET /api/v1/p2p-premiums``).
+
+    Populated from environment variables prefixed with ``P2P_API_``.
+    **Zero-knowledge, deliberately different from :class:`ApiMiddlewareSettings.api_keys`
+    (that one still stores raw keys)**: ``key_sha256_hashes`` stores
+    only SHA-256 hex digests -- the raw key itself is never persisted
+    anywhere on this server, only ever hashed on arrival and compared
+    against this list (see ``p2p_api.py``'s own ``require_production_api_key``).
+    Unset means every request to the production endpoint is rejected, not
+    accepted -- same fail-closed default this project already uses for
+    :class:`ApiMiddlewareSettings.api_keys`. ``GET /api/v1/sandbox/...``
+    stays deliberately keyless regardless of this setting -- see
+    ``sandbox.py``'s own module docstring for that real, separate design.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="P2P_API_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    key_sha256_hashes: SecretStr | None = Field(
+        default=None,
+        description=(
+            "Comma-separated SHA-256 hex digests of valid client API keys. Compared "
+            "timing-safely against the SHA-256 of the caller's raw X-API-Key header -- "
+            "never the raw key itself."
+        ),
+    )
+    production_rate_limit_per_second: int = Field(
+        default=10, gt=0, description="Max requests/second per authenticated client on the production endpoint.",
+    )
+    sandbox_rate_limit_per_second: int = Field(
+        default=2, gt=0, description="Max requests/second per client IP on the public sandbox endpoint.",
+    )
+    nemdi_rate_limit_per_second: int = Field(
+        default=5, gt=0,
+        description=(
+            "Max requests/second per client IP on the public NEMDI index endpoint (nemdi.py) -- "
+            "higher than the sandbox tier's own limit since this is meant to be embedded/polled "
+            "by real media outlets, not just trial API exploration."
+        ),
+    )
+    internal_key: SecretStr | None = Field(
+        default=None,
+        description=(
+            "This project's own internal callers' real raw key (currently: the dashboard's "
+            "P2P Premium Scanner page) -- its SHA-256 hash must also appear in "
+            "key_sha256_hashes for those internal calls to validate. Kept as its own "
+            "field, not just 'one more entry in key_sha256_hashes', so an operator "
+            "rotating external client keys can see at a glance which hash is this "
+            "project's own internal traffic."
+        ),
+    )
+
+
 class ReconciliationSettings(BaseSettings):
     """Configuration for ``src/execution/eod_reconciliator.py``'s daily broker-balance reconciliation.
 
@@ -888,6 +992,7 @@ class AppSettings(BaseSettings):
     dashboard: DashboardSettings = Field(default_factory=DashboardSettings)
     r2: R2Settings = Field(default_factory=R2Settings)
     api_middleware: ApiMiddlewareSettings = Field(default_factory=ApiMiddlewareSettings)
+    p2p_api: P2PApiSettings = Field(default_factory=P2PApiSettings)
     reconciliation: ReconciliationSettings = Field(default_factory=ReconciliationSettings)
     fix_gateway: FixGatewaySettings = Field(default_factory=FixGatewaySettings)
     twilio: TwilioSettings = Field(default_factory=TwilioSettings)

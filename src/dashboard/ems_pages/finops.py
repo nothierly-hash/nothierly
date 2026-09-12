@@ -10,6 +10,20 @@ returns every instance on the account) -- real burn rate (sum of
 cost (``dph_total`` x hours elapsed since each instance's own real
 ``start_date``), never a projected or estimated figure.
 
+**Master switch**: the toggle below writes
+:data:`~core.schemas.VAST_AI_ENABLED_REDIS_KEY` directly via this
+process's own Redis connection -- read live, on every call, by
+:func:`~src.mlops.vast_client.is_vast_ai_enabled`, so both
+``nothierly-agents`` (:mod:`scripts.run_remote_training`) and this
+dashboard process see a flip immediately, with no container restart.
+Gates :meth:`~src.mlops.vast_client.VastAIClient.search_gpu`/
+``search_offers``/``rent_instance``/``start_instance`` (exposure-
+creating calls) -- deliberately **not** the "Mettre en pause"/"Détruire"
+buttons further down, or the cost-aggregation section above: a cost-
+control switch that also blocked you from seeing or stopping what is
+already running would defeat its own purpose the moment you needed it
+most.
+
 **R2 "cluster health", precisely what it is and isn't**:
 :func:`~src.data_pipeline.data_lake_sync.check_bucket_health` is a real
 ``HEAD`` connectivity ping plus a real, capped object-count/size walk
@@ -35,6 +49,8 @@ import asyncio
 import streamlit as st
 
 from core.config import get_settings
+from core.schemas import VAST_AI_ENABLED_REDIS_KEY
+from src.dashboard.ems_pages._shared import get_redis_client, safe_get
 from src.dashboard.theme import status_badge
 from src.mlops.host_metrics import get_host_memory_snapshot
 from src.mlops.vast_client import summarize_instance_costs
@@ -43,10 +59,132 @@ st.title("☁️ Cloud Infrastructure & FinOps")
 st.caption("Suivi réel de l'infrastructure Vast.ai, R2, et de cet hôte -- pas de chiffre inventé.")
 
 settings = get_settings()
+r = get_redis_client()
 
 st.subheader("Vast.ai -- recherche d'instance réelle")
 vast_configured = settings.vastai.api_key is not None
 st.markdown(status_badge("SAFE" if vast_configured else "PENDING", "CLÉ CONFIGURÉE" if vast_configured else "NON CONFIGURÉ"), unsafe_allow_html=True)
+
+st.markdown("---")
+st.subheader("🔌 Master Switch -- module Vast.ai")
+_vast_enabled_raw = safe_get(r, VAST_AI_ENABLED_REDIS_KEY)
+_vast_enabled_live = (
+    _vast_enabled_raw.strip().lower() == "true" if _vast_enabled_raw is not None else settings.vastai.enabled
+)
+_vast_toggle = st.toggle(
+    "Activer le module Vast.ai (recherche/location/redémarrage d'instances)",
+    value=_vast_enabled_live,
+    key="vast_ai_master_switch",
+    help=(
+        "OFF (par défaut) bloque la recherche, la location, et le redémarrage d'instance -- "
+        "'Mettre en pause' et 'Détruire' restent toujours disponibles ci-dessous, y compris OFF, "
+        "pour ne jamais empêcher de couper une facturation déjà en cours."
+    ),
+)
+if _vast_toggle != _vast_enabled_live:
+    r.set(VAST_AI_ENABLED_REDIS_KEY, "true" if _vast_toggle else "false")
+    st.toast(
+        f"Module Vast.ai {'activé' if _vast_toggle else 'désactivé'} -- effectif immédiatement, "
+        "aucun redémarrage de conteneur nécessaire.",
+        icon="🔌",
+    )
+    st.rerun()
+st.markdown(
+    status_badge("SAFE" if _vast_toggle else "PANIC", "MODULE ACTIVÉ" if _vast_toggle else "MODULE DÉSACTIVÉ"),
+    unsafe_allow_html=True,
+)
+
+if vast_configured:
+    st.markdown("---")
+    st.subheader("🆘 Actions d'urgence -- toutes les instances réelles")
+    st.caption(
+        "Ces deux boutons ne sont jamais bloqués par le Master Switch ci-dessus -- couper une "
+        "facturation déjà en cours doit toujours rester possible."
+    )
+    emergency_col1, emergency_col2 = st.columns(2)
+
+    with emergency_col1:
+        if st.button("⏸️ Mettre toutes les instances en pause", width="stretch"):
+            from src.mlops.vast_client import VastAIClient
+
+            async def _pause_all() -> tuple[list[tuple[int, str | None]], str | None]:
+                results: list[tuple[int, str | None]] = []
+                try:
+                    async with VastAIClient(api_key=settings.vastai.api_key.get_secret_value()) as client:  # type: ignore[union-attr]
+                        instances = await client.list_instances()
+                        for instance in instances:
+                            instance_id = int(instance["id"])
+                            try:
+                                await client.stop_instance(instance_id)
+                                results.append((instance_id, None))
+                            except Exception as exc:  # noqa: BLE001
+                                results.append((instance_id, str(exc)))
+                    return results, None
+                except Exception as exc:  # noqa: BLE001
+                    return results, str(exc)
+
+            with st.spinner("Pause réelle de chaque instance en cours..."):
+                pause_results, fatal_error = asyncio.run(_pause_all())
+            if fatal_error is not None:
+                st.error(f"Échec réel : {fatal_error}")
+            elif not pause_results:
+                st.info("Aucune instance réelle à mettre en pause.")
+            else:
+                for instance_id, error in pause_results:
+                    if error is None:
+                        st.success(f"Instance {instance_id} : pause réelle envoyée.")
+                    else:
+                        st.error(f"Instance {instance_id} : échec réel -- {error}")
+
+    with emergency_col2:
+        _confirm_destroy_key = "confirm_destroy_all_vast_instances"
+        if _confirm_destroy_key not in st.session_state:
+            st.session_state[_confirm_destroy_key] = False
+
+        if not st.session_state[_confirm_destroy_key]:
+            if st.button("🗑️ Détruire toutes les instances", type="primary", width="stretch"):
+                st.session_state[_confirm_destroy_key] = True
+                st.rerun()
+        else:
+            st.warning("Confirmez : ceci détruit réellement CHAQUE instance Vast.ai sur ce compte, irréversible.")
+            col_confirm, col_cancel = st.columns(2)
+            with col_confirm:
+                if st.button("✅ CONFIRMER -- tout détruire", type="primary", width="stretch"):
+                    from src.mlops.vast_client import VastAIClient
+
+                    async def _destroy_all() -> tuple[list[tuple[int, str | None]], str | None]:
+                        results: list[tuple[int, str | None]] = []
+                        try:
+                            async with VastAIClient(api_key=settings.vastai.api_key.get_secret_value()) as client:  # type: ignore[union-attr]
+                                instances = await client.list_instances()
+                                for instance in instances:
+                                    instance_id = int(instance["id"])
+                                    try:
+                                        await client.destroy_instance(instance_id)
+                                        results.append((instance_id, None))
+                                    except Exception as exc:  # noqa: BLE001
+                                        results.append((instance_id, str(exc)))
+                            return results, None
+                        except Exception as exc:  # noqa: BLE001
+                            return results, str(exc)
+
+                    with st.spinner("Destruction réelle de chaque instance en cours..."):
+                        destroy_results, fatal_error = asyncio.run(_destroy_all())
+                    st.session_state[_confirm_destroy_key] = False
+                    if fatal_error is not None:
+                        st.error(f"Échec réel : {fatal_error}")
+                    elif not destroy_results:
+                        st.info("Aucune instance réelle à détruire.")
+                    else:
+                        for instance_id, error in destroy_results:
+                            if error is None:
+                                st.success(f"Instance {instance_id} : détruite réellement.")
+                            else:
+                                st.error(f"Instance {instance_id} : échec réel -- {error}. VÉRIFIEZ MANUELLEMENT sur console.vast.ai.")
+            with col_cancel:
+                if st.button("Annuler", width="stretch", key="cancel_destroy_all"):
+                    st.session_state[_confirm_destroy_key] = False
+                    st.rerun()
 
 if vast_configured:
     instance_id = st.number_input("ID d'instance Vast.ai à interroger", min_value=0, step=1, value=0)

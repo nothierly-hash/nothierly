@@ -34,13 +34,55 @@ from functools import wraps
 from typing import Any, Final, ParamSpec, TypeVar
 
 from core.logger import get_logger
+from core.message_integrity import sign, verify
 from core.redis_client import RedisClient, RedisUnavailableError
 
 _log = get_logger(__name__)
 
 SYSTEM_STATUS_KEY: Final[str] = "SYSTEM_STATUS"
+# Companion key holding an HMAC-SHA256 of f"{SYSTEM_STATUS_KEY value}:{SYSTEM_STATUS_EPOCH_KEY value}"
+# (see core/message_integrity.py). Real gap this closes, found by tests/red_team_hacker.py's Attack 2:
+# SYSTEM_STATUS is a plain Redis key with no source authentication -- by default (no REDIS_PASSWORD
+# locally) or even with a shared password, nothing distinguishes a dashboard operator's real
+# reset_kill_switch() call from anyone else's raw `redis-cli SET SYSTEM_STATUS SAFE`. is_system_safe()
+# now fails closed (blocks trading) whenever the value present does not carry a matching signature,
+# rather than trusting the value alone.
+SYSTEM_STATUS_SIG_KEY: Final[str] = "SYSTEM_STATUS:sig"
+# Monotonic counter (Redis INCR), bumped on every real trip_kill_switch/reset_kill_switch call, bound
+# into the signed payload above. Real gap this closes, found by tests/red_team_hacker.py's Attack 2b
+# (a real, confirmed limitation of the signature scheme above, discovered by red-teaming this session's
+# own fix): sign()/verify() alone authenticate WHO could have written a value, never WHEN -- an attacker
+# who merely OBSERVES one real (SYSTEM_STATUS, SYSTEM_STATUS_SIG_KEY) pair once (e.g. read-only Redis
+# access at any point a genuine reset happened) could replay it verbatim, indefinitely, including to
+# silently un-trip a LATER, unrelated, real panic. Binding the epoch means that pair only verifies for
+# the ONE state transition it was actually signed for -- any subsequent real trip_kill_switch/
+# reset_kill_switch call (which always bumps the epoch) makes every earlier signed pair permanently
+# stale, closed or not.
+#
+# **Honest residual limit, disclosed, not hidden**: this alone does not make replay
+# cryptographically impossible -- an attacker with the same unrestricted Redis WRITE access this
+# whole class of attack already assumes (see Attack 1/2's own threat model) could roll this counter
+# back down with a raw SET alongside the old signature, since Redis has no ACL in this codebase
+# distinguishing "may INCR" from "may SET". _MIN_ACCEPTED_EPOCH below (a per-process, in-memory,
+# monotonically-increasing high-water mark) closes that specific residual: it independently refuses
+# any epoch this process has already seen a HIGHER value for, regardless of what Redis currently
+# reports -- Redis can be rolled back, this process's own memory cannot be, from the outside, without
+# also compromising the process itself (a strictly bigger compromise than "can write to Redis"). The
+# one remaining honest gap: a brand-new process (freshly started, never having observed the real
+# epoch yet) has no high-water mark to check against on its very first call, and trusts whatever
+# Redis reports at that moment -- the same fundamental limit every replay defense built on a single,
+# fully-attacker-writable store eventually reaches. Closing that too needs an external, non-Redis
+# source of truth (e.g. the WORM audit ledger, already tamper-evident) -- a real, larger architecture
+# change, not a signature detail, and out of scope for this patch.
+SYSTEM_STATUS_EPOCH_KEY: Final[str] = "SYSTEM_STATUS:epoch"
 STATUS_SAFE: Final[str] = "SAFE"
 STATUS_PANIC: Final[str] = "PANIC"
+
+# Per-process high-water mark -- see SYSTEM_STATUS_EPOCH_KEY's own docstring above. Module-level by
+# design: every caller within one process shares the same defense, the same way RedisClient._instance
+# is one process-wide singleton. Resets only on process restart, never manually -- an intentional
+# reset would itself reopen exactly the replay window this exists to close.
+_min_accepted_epoch: int = 0
 
 # Upper bound on how long a Kill Switch *check* itself may take, regardless
 # of whichever agent happened to initialize the shared RedisClient
@@ -73,14 +115,25 @@ async def is_system_safe() -> bool:
     """Check Redis's ``SYSTEM_STATUS`` flag. Fails closed on any doubt.
 
     Returns:
-        ``False`` (block) if Redis is unreachable, the check times out, or
-        ``SYSTEM_STATUS`` is ``"PANIC"``. ``True`` (safe) only if the key
-        is absent or equals ``"SAFE"``.
+        ``False`` (block) if Redis is unreachable, the check times out,
+        ``SYSTEM_STATUS`` is ``"PANIC"``, a value is present but its
+        companion :data:`SYSTEM_STATUS_SIG_KEY` is missing/does not match
+        the value+epoch it claims to authenticate, or the epoch itself is
+        older than one this process has already observed (a replay -- see
+        :data:`SYSTEM_STATUS_EPOCH_KEY`'s own docstring for what this does
+        and does not defend against). ``True`` (safe) only if the key is
+        absent, or present, signed, fresh, and equal to ``"SAFE"``.
     """
+    global _min_accepted_epoch
     try:
         client = await asyncio.wait_for(RedisClient.get_instance(), timeout=_CHECK_TIMEOUT_SECONDS)
-        status = await asyncio.wait_for(
-            client.execute("get", SYSTEM_STATUS_KEY), timeout=_CHECK_TIMEOUT_SECONDS
+        status, signature, raw_epoch = await asyncio.wait_for(
+            asyncio.gather(
+                client.execute("get", SYSTEM_STATUS_KEY),
+                client.execute("get", SYSTEM_STATUS_SIG_KEY),
+                client.execute("get", SYSTEM_STATUS_EPOCH_KEY),
+            ),
+            timeout=_CHECK_TIMEOUT_SECONDS,
         )
     except (RedisUnavailableError, asyncio.TimeoutError) as exc:
         _log.error(
@@ -89,11 +142,47 @@ async def is_system_safe() -> bool:
             error=str(exc),
         )
         return False
-    return status in (None, STATUS_SAFE)
+
+    if status is None:
+        return True
+
+    epoch = int(raw_epoch) if raw_epoch is not None else 0
+    if epoch < _min_accepted_epoch:
+        _log.critical(
+            "kill_switch_epoch_rollback_detected_failing_closed",
+            status=status, observed_epoch=epoch, min_accepted_epoch=_min_accepted_epoch,
+        )
+        return False
+
+    if not verify(f"{status}:{epoch}", signature):
+        _log.critical(
+            "kill_switch_signature_invalid_failing_closed",
+            status=status, epoch=epoch,
+        )
+        return False
+
+    _min_accepted_epoch = max(_min_accepted_epoch, epoch)
+    return bool(status == STATUS_SAFE)
+
+
+async def _set_system_status(status: str) -> None:
+    """Shared real write path for :func:`trip_kill_switch`/:func:`reset_kill_switch`.
+
+    Every real state transition bumps :data:`SYSTEM_STATUS_EPOCH_KEY` via
+    an atomic Redis ``INCR`` *first*, then signs ``f"{status}:{new_epoch}"``
+    -- binding every signature to the one specific transition it was
+    issued for, never reusable for another.
+    """
+    client = await RedisClient.get_instance()
+    new_epoch = await client.execute("incr", SYSTEM_STATUS_EPOCH_KEY)
+    await asyncio.gather(
+        client.execute("set", SYSTEM_STATUS_KEY, status),
+        client.execute("set", SYSTEM_STATUS_SIG_KEY, sign(f"{status}:{new_epoch}")),
+    )
 
 
 async def trip_kill_switch(reason: str) -> None:
-    """Set ``SYSTEM_STATUS=PANIC`` in Redis. Any agent may call this at any time.
+    """Set ``SYSTEM_STATUS=PANIC`` (signed, epoch-bound) in Redis. Any agent may call this at any time.
 
     Best-effort: if Redis itself is unreachable, the flag can't be
     persisted -- but :func:`is_system_safe` already fails closed in that
@@ -105,10 +194,7 @@ async def trip_kill_switch(reason: str) -> None:
     """
     _log.critical("GLOBAL_KILL_SWITCH_TRIPPED", reason=reason)
     try:
-        client = await asyncio.wait_for(RedisClient.get_instance(), timeout=_TRIP_TIMEOUT_SECONDS)
-        await asyncio.wait_for(
-            client.execute("set", SYSTEM_STATUS_KEY, STATUS_PANIC), timeout=_TRIP_TIMEOUT_SECONDS
-        )
+        await asyncio.wait_for(_set_system_status(STATUS_PANIC), timeout=_TRIP_TIMEOUT_SECONDS)
     except (RedisUnavailableError, asyncio.TimeoutError) as exc:
         _log.error(
             "kill_switch_trip_could_not_persist_to_redis",
@@ -118,15 +204,14 @@ async def trip_kill_switch(reason: str) -> None:
 
 
 async def reset_kill_switch() -> None:
-    """Set ``SYSTEM_STATUS=SAFE`` in Redis. An explicit, deliberate operator action.
+    """Set ``SYSTEM_STATUS=SAFE`` (signed, epoch-bound) in Redis. An explicit, deliberate operator action.
 
     No code path in this system calls this automatically -- recovering
     from a global panic is a decision for a human to make on purpose,
     never something an agent decides for itself.
     """
     _log.warning("GLOBAL_KILL_SWITCH_RESET")
-    client = await RedisClient.get_instance()
-    await client.execute("set", SYSTEM_STATUS_KEY, STATUS_SAFE)
+    await _set_system_status(STATUS_SAFE)
 
 
 def requires_system_active(func: Callable[_P, Awaitable[_R]]) -> Callable[_P, Awaitable[_R]]:

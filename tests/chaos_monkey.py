@@ -60,7 +60,7 @@ from core.redis_client import RedisClient
 from core.schemas import MarketMetrics, OrderBookLevel, OrderBookSnapshot
 from core.security import requires_system_active
 from src.agents.supervisor.agent import EmergencyStopError, SignalState, XgboostSignalAgent
-from src.execution.smart_order_router import build_allocation_plan, execute_allocation_plan
+from src.execution.smart_order_router import SmartOrderRouterResult, build_allocation_plan, execute_allocation_plan
 
 _REPORT: list[tuple[str, str, str]] = []
 
@@ -104,9 +104,16 @@ async def _isolated_kill_switch_redis() -> AsyncIterator[None]:
 
 
 async def _chaos_flash_crash_price_move_alone() -> None:
+    """**Re-run after the real fix**: XgboostSignalAgent._check_kill_switch now also runs
+    core.circuit_breaker.MarketAnomalyDetector (condition #4) -- see that module's docstring for why this
+    gap existed and src/agents/supervisor/agent.py's updated __init__/_check_kill_switch for the wiring."""
     agent = XgboostSignalAgent("BTC/USDT", manage_own_signals=False, manage_own_redis=False)
     for _ in range(agent._spread_history_window):
         agent._spread_history.append(10.0)  # a normal, calm $10 spread on BTC/USDT, established baseline
+    # Establish a real prior price baseline for the flash-crash detector -- mirrors what a real
+    # continuous run already has after its first cycle; a single isolated _check_kill_switch call (as
+    # this test makes) otherwise has no history yet to measure a move against.
+    agent._anomaly_detector.check(65000.0)
 
     state = SignalState(
         market_metrics=MarketMetrics(symbol="BTC/USDT", spread=10.0, order_book_imbalance=0.0, mid_price=52000.0),
@@ -119,17 +126,19 @@ async def _chaos_flash_crash_price_move_alone() -> None:
     except EmergencyStopError:
         tripped = True
 
-    if not tripped:
+    if tripped:
         _record(
             "Flash Crash: -20% price move alone (65000 -> 52000, spread/latency/errors all normal)",
-            "GAP CONFIRMED",
-            "XgboostSignalAgent._check_kill_switch (src/agents/supervisor/agent.py) did NOT trip. Confirmed "
-            "by codebase-wide review: no code path anywhere in this system computes a price-percentage move "
-            "and halts on it. This local breaker only watches Redis latency, spread-vs-rolling-baseline, "
-            "and consecutive errors -- a clean, tight-spread crash slips through entirely."
+            "BLOCKED (real fix)",
+            "core.circuit_breaker.MarketAnomalyDetector, now wired into XgboostSignalAgent._check_kill_"
+            "switch as condition #4, trips independently of spread -- confirmed: a -20% price move with a "
+            "calm, unchanged spread now halts trading, closing the gap this scenario originally found."
         )
     else:
-        _record("Flash Crash: price move alone", "BLOCKED", "Unexpectedly tripped -- re-verify assumptions.")
+        _record(
+            "Flash Crash: -20% price move alone", "GAP STILL PRESENT",
+            "Unexpectedly did NOT trip -- re-verify MarketAnomalyDetector wiring in _check_kill_switch.",
+        )
 
 
 # =============================================================================
@@ -208,8 +217,21 @@ class _ChaosVenue:
             "side": side, "type": "market", "amount": quantity, "filled": quantity, "average": price,
         }
 
+    async def emergency_flatten_market_order(
+        self, symbol: str, side: Literal["buy", "sell"], quantity: float, *, client_order_id: str | None = None
+    ) -> dict[str, Any]:
+        """Mirrors the real, unguarded CcxtBrokerAdapter.emergency_flatten_market_order override (no
+        @requires_system_active) -- exercised here specifically to prove the leg-risk unwind (Chaos 2)
+        now actually flattens exposure once src/execution/smart_order_router.py's _unwind_one calls this
+        instead of the gated place_market_order for its unwind leg."""
+        price = self._book.asks[0].price if side == "buy" else self._book.bids[0].price
+        return {
+            "id": client_order_id, "clientOrderId": client_order_id, "status": "closed",
+            "side": side, "type": "market", "amount": quantity, "filled": quantity, "average": price,
+        }
 
-async def _run_one_broker_outage_trial() -> tuple[frozenset[str], frozenset[str]]:
+
+async def _run_one_broker_outage_trial() -> SmartOrderRouterResult:
     healthy_venue = _ChaosVenue("binance", bids=[(64990.0, 2.0)], asks=[(65010.0, 2.0)], fee_rate=0.0004)
     outage_venue = _ChaosVenue(
         "bybit", bids=[(64985.0, 2.0)], asks=[(65020.0, 2.0)], fee_rate=0.0006,
@@ -224,11 +246,10 @@ async def _run_one_broker_outage_trial() -> tuple[frozenset[str], frozenset[str]
         # `simulate = settings.mock_mode or shadow` branch never calls place_market_order at all, silently
         # fabricating a fill for BOTH venues and hiding the real outage entirely (first run of this test
         # showed exactly that: "failed venues=[]" with the 502 never triggered).
-        result = await execute_allocation_plan(
+        return await execute_allocation_plan(
             plan, venues, "BTC/USDT", asset=_ASSET, algo_id="chaos-monkey-test", regulatory_client_shortcode="CHAOS",
             settings=AppSettings(mock_mode=False),
         )
-    return frozenset(o.broker_id for o in result.orders), frozenset(b for b, _r in result.failed_venues)
 
 
 async def _chaos_broker_outage_mid_routing(*, trials: int = 10) -> None:
@@ -237,23 +258,29 @@ async def _chaos_broker_outage_mid_routing(*, trials: int = 10) -> None:
     concurrent healthy venue "could itself get blocked depending on scheduling -- a real, intentional
     cross-cutting safety behavior"). Run several real trials and report the empirical distribution instead
     of asserting one specific outcome, which that same existing test explicitly avoids doing for exactly
-    this reason."""
-    outcomes: list[tuple[frozenset[str], frozenset[str]]] = [await _run_one_broker_outage_trial() for _ in range(trials)]
-    leg_risk_count = sum(1 for filled, failed in outcomes if "binance" in filled and "bybit" in failed)
-    no_exposure_count = sum(1 for filled, _failed in outcomes if not filled)
+    this reason.
+
+    **Re-run after the real fix** (src/execution/smart_order_router.py's _unwind_one now calls
+    emergency_flatten_market_order instead of the Kill-Switch-gated place_market_order for its unwind
+    leg -- see that function's own updated comment): this now additionally reports whether a filled leg
+    was actually, successfully unwound, not just whether leg risk occurred in the first place.
+    """
+    outcomes: list[SmartOrderRouterResult] = [await _run_one_broker_outage_trial() for _ in range(trials)]
+    leg_risk_occurred_count = sum(1 for r in outcomes if r.orders and r.failed_venues)
+    auto_unwound_count = sum(1 for r in outcomes if r.orders and r.failed_venues and r.leg_risk_fully_flattened and r.unwind_orders)
+    unresolved_count = sum(1 for r in outcomes if r.unwind_failed_venues)
+    no_exposure_count = sum(1 for r in outcomes if not r.orders)
 
     detail = (
-        f"{trials} real trials -- binance filled while bybit failed (real leg risk): {leg_risk_count}/{trials}; "
-        f"neither filled (Kill Switch raced ahead of binance's own placement too): {no_exposure_count}/{trials}. "
-        f"execute_allocation_plan() (src/execution/smart_order_router.py:300-415) has NO compensating-trade / "
-        f"auto-unwind logic anywhere in its body, in either case -- confirmed by direct code reading. When "
-        f"leg risk occurs, binance's real fill stands exactly as placed, with zero automatic flattening of "
-        f"the resulting one-sided BTC exposure; separately, core.security.safe_financial_call "
-        f"(retry_on_failure=False, as the SOR always passes) trips the GLOBAL Kill Switch on bybit's single "
-        f"failure regardless of which outcome occurred, halting all FUTURE order placement system-wide."
+        f"{trials} real trials -- leg risk occurred (one venue filled, one failed): {leg_risk_occurred_count}/{trials}; "
+        f"of those, auto-unwound back to flat by emergency_flatten_market_order: {auto_unwound_count}/{trials}; "
+        f"still unresolved (real exposure remains, manual intervention required): {unresolved_count}/{trials}; "
+        f"neither leg filled (Kill Switch raced ahead of both): {no_exposure_count}/{trials}."
     )
-    if leg_risk_count > 0:
+    if unresolved_count > 0:
         _record("Broker API Outage mid-SOR-routing (real 502, one of two venues, 10 real trials)", "LEG RISK CONFIRMED", detail)
+    elif auto_unwound_count > 0:
+        _record("Broker API Outage mid-SOR-routing (real 502, one of two venues, 10 real trials)", "LEG RISK AUTO-UNWOUND", detail)
     else:
         _record("Broker API Outage mid-SOR-routing (10 real trials)", "NO LEG RISK OBSERVED THIS RUN (race-dependent, not a designed guarantee)", detail)
 
@@ -263,29 +290,47 @@ async def _chaos_broker_outage_mid_routing(*, trials: int = 10) -> None:
 # =============================================================================
 
 
-def _chaos_latency_spike_staleness() -> None:
+async def _chaos_latency_spike_staleness() -> None:
+    """**Re-run after the real fix**: XgboostSignalAgent._check_kill_switch now also runs
+    core.stale_check.staleness_reason (condition #5, max_market_metrics_age_ms=500.0 default) -- see that
+    module's docstring for why this gap existed. Exercises the real agent path (not just the schema in
+    isolation, as the original version of this scenario did) so this is real evidence the fix closes the
+    gap, not just that the schema itself carries a timestamp."""
+    agent = XgboostSignalAgent("BTC/USDT", manage_own_signals=False, manage_own_redis=False)
+    for _ in range(agent._spread_history_window):
+        agent._spread_history.append(10.0)
+    agent._anomaly_detector.check(65000.0)  # same price as the stale reading below -- isolates staleness as the sole trigger
+
     stale_timestamp = datetime.now(timezone.utc) - timedelta(seconds=2)
-    stale_metrics = MarketMetrics(
-        symbol="BTC/USDT", timestamp=stale_timestamp, spread=10.0, order_book_imbalance=0.0, mid_price=65000.0,
-    )
     # Simulates: MarketDataAgent hiccups for a real 2-second network/exchange latency spike, then finally
     # writes -- the Redis key's own TTL (10s) starts fresh from THIS write, so nothing about the key's
     # presence in Redis reveals that the reading it carries describes a moment 2s in the past.
-    raw = stale_metrics.model_dump_json()
-    read_back = MarketMetrics.model_validate_json(raw)
-    age_seconds = (datetime.now(timezone.utc) - read_back.timestamp).total_seconds()
-    assert age_seconds >= 2.0  # confirm the staleness is real, not a rounding artifact
-
-    _record(
-        "Latency Spike: 2s-old MarketMetrics, well within the real 10s Redis TTL",
-        "GAP CONFIRMED",
-        f"age_seconds={age_seconds:.3f} -- nothing rejected, warned, or flagged this reading. Confirmed by "
-        f"codebase-wide review: no function anywhere computes 'now - MarketMetrics.timestamp' and compares "
-        f"it to a threshold (staleness for this schema is handled only by Redis TTL expiry -- key present "
-        f"== treated as fresh). Contrast with the real check that DOES exist for a different schema: "
-        f"ExecutionAgent._evaluate_consensus's TradingSignal freshness check (age_seconds <= "
-        f"signal_validity_seconds, src/agents/execution/agent.py:899-924)."
+    state = SignalState(
+        market_metrics=MarketMetrics(
+            symbol="BTC/USDT", timestamp=stale_timestamp, spread=10.0, order_book_imbalance=0.0, mid_price=65000.0,
+        ),
+        macro_snapshots={}, sentiment_signals=[], redis_latency_ms=5.0,
     )
+    tripped = False
+    try:
+        async with _isolated_kill_switch_redis():
+            await agent._check_kill_switch(state)
+    except EmergencyStopError:
+        tripped = True
+
+    if tripped:
+        _record(
+            "Latency Spike: 2s-old MarketMetrics, well within the real 10s Redis TTL",
+            "BLOCKED (real fix)",
+            "core.stale_check.staleness_reason, now wired into XgboostSignalAgent._check_kill_switch as "
+            "condition #5, rejects a merely-present-but-stale reading -- confirmed: a 2s-old reading, well "
+            "within the 10s Redis TTL, now halts trading instead of being silently treated as fresh."
+        )
+    else:
+        _record(
+            "Latency Spike: 2s-old MarketMetrics", "GAP STILL PRESENT",
+            "Unexpectedly did NOT trip -- re-verify staleness_reason wiring in _check_kill_switch.",
+        )
 
 
 # =============================================================================
@@ -294,9 +339,9 @@ def _chaos_latency_spike_staleness() -> None:
 
 
 @pytest.mark.asyncio
-async def test_flash_crash_price_move_alone_is_not_detected() -> None:
+async def test_flash_crash_price_move_alone_is_now_detected() -> None:
     await _chaos_flash_crash_price_move_alone()
-    assert _REPORT[-1][1] == "GAP CONFIRMED"
+    assert _REPORT[-1][1] == "BLOCKED (real fix)"
 
 
 @pytest.mark.asyncio
@@ -309,9 +354,10 @@ async def test_broker_outage_mid_sor_routing() -> None:
     await _chaos_broker_outage_mid_routing()
 
 
-def test_latency_spike_staleness_gap() -> None:
-    _chaos_latency_spike_staleness()
-    assert _REPORT[-1][1] == "GAP CONFIRMED"
+@pytest.mark.asyncio
+async def test_latency_spike_staleness_is_now_detected() -> None:
+    await _chaos_latency_spike_staleness()
+    assert _REPORT[-1][1] == "BLOCKED (real fix)"
 
 
 # =============================================================================
@@ -332,7 +378,7 @@ async def _main() -> None:
     await _chaos_flash_crash_price_move_alone()
     await _chaos_flash_crash_with_spread_blowout()
     await _chaos_broker_outage_mid_routing()
-    _chaos_latency_spike_staleness()
+    await _chaos_latency_spike_staleness()
     _print_summary()
 
 

@@ -50,6 +50,30 @@ specific exchange/market doesn't report its own real fee schedule --
 applied to both sides of the real cross (each side avoids one real
 taker fee it would have paid on a public venue). A real, standard
 approximation, not a fabricated number.
+
+**Real technology-attribution gap closed here**: :mod:`crypto.
+zk_matching_engine` (real Pedersen commitments + a real Chaum-Pedersen
+proof over BN128, see that module's own docstring) had, before this,
+only ever been exercised against synthetic cases in ``tests/
+test_zk_matching_engine.py`` -- zero real order flow had ever passed
+through it (see ``nothierly_genesis/TECH_ATTRIBUTION_REPORT.md``'s own
+integration-status table). Every real match this engine finds is now
+*also* replayed through :class:`~crypto.zk_matching_engine.ZkDarkPool`
+(:meth:`_demonstrate_zk_confidential_cross`), independently verified via
+:func:`~crypto.zk_matching_engine.verify_cross_publicly`, and persisted
+alongside the plaintext match. **Stated precisely, not oversold**: this
+does not make *this engine's own* observation confidential -- it already
+reads the real, plaintext quantity/side straight off
+``CLIENT_ORDERS_TOPIC``, same as the plaintext match above. What it
+proves, for the first time against real (not synthetic) order flow, is
+that :mod:`crypto.zk_matching_engine`'s real commit/open/prove/verify
+pipeline produces a correct, independently-verifiable settlement that
+reveals neither party's size nor side to a third party holding only the
+two public commitments -- the actual, real value that module's own
+docstring claims, now demonstrated rather than only unit-tested. Never
+gates or affects the plaintext observation above: a ZK-side failure is
+logged and the plaintext match/audit trail stands regardless (see
+:meth:`_demonstrate_zk_confidential_cross`'s own docstring).
 """
 
 from __future__ import annotations
@@ -59,6 +83,8 @@ import json
 import time
 from decimal import Decimal
 from typing import Any, Final
+
+import zmq.asyncio
 
 from core.base_agent import BaseAgent
 from core.config import AppSettings
@@ -73,6 +99,7 @@ from core.schemas import (
     MarketMetrics,
     MessagePayload,
 )
+from crypto.zk_matching_engine import ConfidentialCrossSettlement, ZkDarkPool, pedersen_commit, verify_cross_publicly
 
 _AGENT_ID: Final[str] = "shadow-crossing-engine"
 _HEARTBEAT_INTERVAL_SECONDS: Final[float] = 2.0
@@ -80,6 +107,14 @@ _HEARTBEAT_INTERVAL_SECONDS: Final[float] = 2.0
 # See module docstring.
 _DEFAULT_TAKER_FEE_RATE: Final[float] = 0.001
 _SHADOW_MATCHING_WINDOW_MS: Final[float] = 30_000.0
+
+# Real fixed-point scale converting a Decimal order quantity into the signed integer
+# crypto.zk_matching_engine.pedersen_commit requires (elliptic-curve arithmetic works over integers
+# mod curve_order, not floats/Decimals) -- 1e8 matches this project's own crypto-precision
+# convention (satoshi-scale) elsewhere. Both sides of one real fill always use the same scale, so a
+# real, exact quantity match (guaranteed by CrossingNetwork before a fill is ever created) sums to
+# exactly zero after scaling too -- no rounding-induced false negative.
+_ZK_VALUE_SCALE: Final[int] = 10**8
 
 # The real "new macro order" message shape api_middleware/gateway.py's
 # submit_order publishes onto CLIENT_ORDERS_TOPIC -- required keys this
@@ -98,6 +133,7 @@ class ShadowCrossingEngine(BaseAgent):
         *,
         settings: AppSettings | None = None,
         manage_own_signals: bool = True,
+        zmq_context: zmq.asyncio.Context | None = None,
         manage_own_redis: bool = True,
         taker_fee_rate: float = _DEFAULT_TAKER_FEE_RATE,
         matching_window_ms: float = _SHADOW_MATCHING_WINDOW_MS,
@@ -107,10 +143,13 @@ class ShadowCrossingEngine(BaseAgent):
             subscribed_topics=(CLIENT_ORDERS_TOPIC,),
             settings=settings,
             manage_own_signals=manage_own_signals,
+            zmq_context=zmq_context,
             manage_own_redis=manage_own_redis,
         )
         self._taker_fee_rate = taker_fee_rate
         self._crossing_network = CrossingNetwork(get_mid_price=self._get_live_mid_price, matching_window_ms=matching_window_ms)
+        # See module docstring's own "Real technology-attribution gap closed here" section.
+        self._zk_dark_pool = ZkDarkPool()
 
     async def on_tick(self) -> None:
         """Unused: this agent is stream-driven; see :meth:`run`."""
@@ -216,7 +255,66 @@ class ShadowCrossingEngine(BaseAgent):
         )
         for fill in result.fills:
             if fill.buy_order_id == order_id:
-                await self._log_shadow_match(fill)
+                zk_settlement = self._demonstrate_zk_confidential_cross(fill)
+                await self._log_shadow_match(fill, zk_settlement=zk_settlement)
+
+    def _demonstrate_zk_confidential_cross(self, fill: InternalCrossFill) -> ConfidentialCrossSettlement | None:
+        """Replay this exact real match through crypto/zk_matching_engine.py's real ZK crossing core.
+
+        See this module's own docstring, "Real technology-attribution gap closed here" section, for
+        the precise, honest scope of what this does and does not demonstrate. Never raises and never
+        affects the plaintext match this was already derived from -- a real cryptographic or
+        arithmetic failure here (should be unreachable: ``fill.quantity`` is, by construction, the
+        exact same value on both sides of one real ``CrossingNetwork`` fill, so the signed scaled
+        values always sum to exactly zero) is logged and returns ``None``, never raised into the
+        caller that only cares about the real plaintext observation.
+        """
+        try:
+            scaled_quantity = int(fill.quantity * _ZK_VALUE_SCALE)
+            buy_commitment, buy_blinding = pedersen_commit(scaled_quantity)
+            sell_commitment, sell_blinding = pedersen_commit(-scaled_quantity)
+
+            buy_record = self._zk_dark_pool.submit_intention(
+                order_id=fill.buy_order_id, client_id=fill.buy_client_id, instrument=fill.instrument, commitment=buy_commitment,
+            )
+            sell_record = self._zk_dark_pool.submit_intention(
+                order_id=fill.sell_order_id, client_id=fill.sell_client_id, instrument=fill.instrument, commitment=sell_commitment,
+            )
+            settlement = self._zk_dark_pool.attempt_confidential_cross(
+                order_id_a=fill.buy_order_id, opening_a=(scaled_quantity, buy_blinding),
+                order_id_b=fill.sell_order_id, opening_b=(-scaled_quantity, sell_blinding),
+            )
+            if settlement is None:
+                self._log.error(
+                    "zk_confidential_cross_demo_unexpectedly_failed",
+                    agent_id=self.agent_id, cross_id=fill.cross_id,
+                    detail="Real quantities from one already-matched CrossingNetwork fill should always sum to zero after scaling -- investigate.",
+                )
+                return None
+
+            publicly_verified = verify_cross_publicly(
+                commitment_a_hex=buy_record.commitment_hex, commitment_b_hex=sell_record.commitment_hex, proof=settlement.proof,
+            )
+            self._log.info(
+                "zk_confidential_cross_demonstrated",
+                agent_id=self.agent_id, cross_id=fill.cross_id, zk_cross_id=settlement.cross_id,
+                publicly_verified=publicly_verified,
+            )
+            if not publicly_verified:
+                # Real defensive check, should be unreachable given attempt_confidential_cross's own
+                # internal verification already passed -- never silently claim a demonstrated proof
+                # that a second, independent verification pass does not also confirm.
+                self._log.error(
+                    "zk_confidential_cross_public_verification_failed",
+                    agent_id=self.agent_id, cross_id=fill.cross_id, zk_cross_id=settlement.cross_id,
+                )
+                return None
+            return settlement
+        except Exception:
+            self._log.warning(
+                "zk_confidential_cross_demo_raised", agent_id=self.agent_id, cross_id=fill.cross_id, exc_info=True,
+            )
+            return None
 
     async def _get_live_mid_price(self, symbol: str) -> Decimal | None:
         """Real, live mid-price for ``symbol``, or ``None`` -- never a fabricated price. See ``CrossingNetwork``'s own docstring on why ``None`` refuses a match rather than inventing one."""
@@ -234,7 +332,7 @@ class ShadowCrossingEngine(BaseAgent):
             return None
         return Decimal(str(metrics.mid_price))
 
-    async def _log_shadow_match(self, fill: InternalCrossFill) -> None:
+    async def _log_shadow_match(self, fill: InternalCrossFill, *, zk_settlement: ConfidentialCrossSettlement | None) -> None:
         """Persist one real shadow-match event -- for the Internal Dark Pool dashboard page. Best-effort: a Redis hiccup here must never affect the real order flow this engine only ever observes."""
         fee_saved_usd = float(fill.quantity) * float(fill.price) * self._taker_fee_rate * 2
         self._log.info(
@@ -244,6 +342,7 @@ class ShadowCrossingEngine(BaseAgent):
             quantity=str(fill.quantity),
             price=str(fill.price),
             fee_saved_usd=round(fee_saved_usd, 2),
+            zk_demonstrated=zk_settlement is not None,
         )
         if self._redis_client is None:
             return
@@ -258,6 +357,10 @@ class ShadowCrossingEngine(BaseAgent):
             "sell_order_id": fill.sell_order_id,
             "sell_client_id": fill.sell_client_id,
             "fee_saved_usd": fee_saved_usd,
+            # See module docstring's own "Real technology-attribution gap closed here" section --
+            # None (never demonstrated, or a real, logged failure) vs. a real zk_cross_id, never a
+            # fabricated placeholder either way.
+            "zk_cross_id": zk_settlement.cross_id if zk_settlement is not None else None,
         }
         try:
             await self._redis_client.execute("lpush", DARK_POOL_SHADOW_MATCHES_REDIS_KEY, json.dumps(entry))

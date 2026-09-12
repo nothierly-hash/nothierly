@@ -731,4 +731,4 @@ class BrokerFactory:
             return IBKRBrokerAdapter(host=settings.ibkr.host, port=settings.ibkr.port, client_id=settings.ibkr.client_id)
 
         api_key, api_secret = await _resolve_ccxt_credentials(normalized, settings=settings, redis_client=redis_client)
-        return CcxtBrokerAdapter(normalized, api_key=api_key, api_secret=api_secret)
+        return CcxtBrokerAdapter(normalized, api_key=api_key, api_secret=api_secret, sandbox=settings.broker.sandbox)

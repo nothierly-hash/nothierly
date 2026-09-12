@@ -33,6 +33,7 @@ from core.session_manager import MarketSessionManager
 from core.schemas import (
     AGENT_CONTROL_STATE_REDIS_KEY_PREFIX,
     ALPHA_ENGINE_BASELINE_QTY_REDIS_KEY_PREFIX,
+    ALPHA_ENGINE_PNL_HISTORY_REDIS_KEY_PREFIX,
     ALPHA_ENGINE_TELEMETRY_REDIS_KEY_PREFIX,
     MARKET_METRICS_REDIS_KEY_PREFIX,
 )
@@ -506,6 +507,27 @@ async def test_max_daily_loss_forces_engine_off(redis_client: RedisClient) -> No
 
     assert agent._daily_realized_pnl_usd == Decimal("-100")  # 0.01 * (60000 - 70000)
     assert agent.control_state == AgentControlState.OFF
+
+
+@pytest.mark.asyncio
+async def test_record_fill_persists_real_pnl_history_entry(redis_client: RedisClient) -> None:
+    """The src/dashboard/ems_pages/bilan.py equity curve's real data source: one LPUSH per real fill."""
+    agent = _make_agent(redis_client)
+    agent._baseline_qty = Decimal(0)
+    agent._last_known_total_qty = Decimal("0.01")
+    agent._own_avg_entry_price = Decimal("70000")
+
+    await agent._record_fill(Decimal("-0.01"), fill_price=Decimal("71000"))  # +$10 realized
+
+    key = f"{ALPHA_ENGINE_PNL_HISTORY_REDIS_KEY_PREFIX}{agent.agent_id}"
+    raw_entries = await _redis(agent).execute("lrange", key, 0, -1)
+    assert len(raw_entries) == 1
+    entry = json.loads(raw_entries[0])
+    assert entry["symbol"] == agent._symbol
+    assert entry["fill_qty"] == "-0.01"
+    assert entry["fill_price"] == "71000"
+    assert Decimal(entry["realized_pnl_delta_usd"]) == Decimal("10")
+    assert Decimal(entry["session_realized_pnl_usd"]) == Decimal("10")
 
 
 @pytest.mark.asyncio

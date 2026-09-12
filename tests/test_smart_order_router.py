@@ -83,6 +83,19 @@ class _FakeVenue:
             "side": side, "type": "market", "amount": quantity, "filled": quantity, "average": price,
         }
 
+    async def emergency_flatten_market_order(
+        self, symbol: str, side: Literal["buy", "sell"], quantity: float, *, client_order_id: str | None = None
+    ) -> dict[str, Any]:
+        """Mirrors the real, unguarded CcxtBrokerAdapter.emergency_flatten_market_order override (no
+        @requires_system_active) -- see execute_allocation_plan's _unwind_one, which now calls this instead
+        of the gated place_market_order for its unwind leg."""
+        self.placed_orders.append((symbol, side, quantity, client_order_id))
+        price = self._book.asks[0].price if side == "buy" else self._book.bids[0].price
+        return {
+            "id": client_order_id, "clientOrderId": client_order_id, "status": "closed",
+            "side": side, "type": "market", "amount": quantity, "filled": quantity, "average": price,
+        }
+
 
 @pytest.fixture
 def killswitch_redis() -> Generator[RedisClient, None, None]:
@@ -386,12 +399,14 @@ async def test_multiple_simulated_venues_each_fill_independently_under_mock_mode
 
 
 @pytest.mark.asyncio
-async def test_auto_unwind_is_attempted_but_blocked_by_the_kill_switch_it_did_not_cause(killswitch_redis: RedisClient) -> None:
-    """The real, current-architecture outcome (see smart_order_router.py's own module docstring): venue_b's
-    exhausted failure goes through safe_financial_call, which UNCONDITIONALLY trips the global Kill Switch
-    on any exhausted failure -- so venue_a's real unwind attempt, which also goes through the same
-    @requires_system_active-decorated place_market_order, is itself blocked by the very switch venue_b's
-    own failure just tripped. This is the honest, reproducible outcome today, not a test bug."""
+async def test_auto_unwind_succeeds_via_the_kill_switch_bypass_it_needs(killswitch_redis: RedisClient) -> None:
+    """**Real bug fixed** (found by tests/chaos_monkey.py's Chaos 2, 10/10 real trials): venue_b's exhausted
+    failure goes through safe_financial_call, which UNCONDITIONALLY trips the global Kill Switch -- venue_a's
+    real unwind attempt used to go through the same @requires_system_active-decorated place_market_order,
+    so it was blocked by the very switch venue_b's own failure just tripped, defeating its own purpose.
+    _unwind_one now calls emergency_flatten_market_order instead -- the real, already-existing break-glass
+    path (see BaseBroker.emergency_flatten_market_order's own docstring) -- so the unwind now actually
+    flattens the exposure instead of leaving it stranded."""
     venue_a = _FakeVenue("venue_a", bids=[(1.0, 1.0)], asks=[(100.0, 5.0)], fee_rate=0.0)
     venue_b = _FakeVenue("venue_b", bids=[(1.0, 1.0)], asks=[(101.0, 5.0)], fee_rate=0.0, place_error=ConnectionError("simulated exchange outage"))
     plan = await build_allocation_plan([venue_a, venue_b], "BTC/USDT", OrderSide.BUY, Decimal("6"))
@@ -401,14 +416,11 @@ async def test_auto_unwind_is_attempted_but_blocked_by_the_kill_switch_it_did_no
         settings=AppSettings(mock_mode=False),
     )
 
-    assert len(result.orders) == 1 and result.orders[0].broker_id == "venue_a"  # the real, unflattened leg
+    assert len(result.orders) == 1 and result.orders[0].broker_id == "venue_a"  # the real, originally-open leg
     assert {b for b, _r in result.failed_venues} == {"venue_b"}
-    assert result.unwind_orders == ()  # the unwind attempt did NOT succeed
-    assert len(result.unwind_failed_venues) == 1
-    broker_id, reason = result.unwind_failed_venues[0]
-    assert broker_id == "venue_a"
-    assert "Kill Switch" in reason
-    assert result.leg_risk_fully_flattened is False  # the honest, correct verdict: a human must act now
+    assert len(result.unwind_orders) == 1 and result.unwind_orders[0].broker_id == "venue_a"  # now really flattened
+    assert result.unwind_failed_venues == ()
+    assert result.leg_risk_fully_flattened is True  # the honest, correct verdict: no human intervention needed
 
 
 @pytest.mark.asyncio

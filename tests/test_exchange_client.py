@@ -1,9 +1,16 @@
 """Real, executable tests for src/agents/market_data/exchange_client.py's retry/backoff behavior.
 
-Focused on the real bug found via live testing (Chapter 13, Étape 5.6):
-AuthenticationError must fail immediately, never retry forever. No real
-exchange is contacted -- ``_call_with_backoff`` is exercised directly
-with a fake ``call`` callable.
+Focused on two real bugs found via live testing, not theorized:
+
+1. Chapter 13, Étape 5.6: AuthenticationError must fail immediately, never retry forever.
+2. A real multi-hour shadow run crash: a raw ``ConnectionResetError`` (``OSError``) leaking out of
+   ccxt.pro's own internal websocket keepalive task, never translated into ``ccxt.NetworkError``,
+   used to crash the whole agent process instead of being retried like every other transient
+   network failure -- see :data:`~src.agents.market_data.exchange_client._RECOVERABLE_CCXT_ERRORS`'s
+   own comment.
+
+No real exchange is contacted -- ``_call_with_backoff`` is exercised directly with a fake ``call``
+callable.
 """
 
 from __future__ import annotations
@@ -48,3 +55,23 @@ async def test_recoverable_network_error_is_retried_until_success() -> None:
     result = await client._call_with_backoff(fails_twice_then_succeeds, operation="test", context={})
     assert result == "ok"
     assert call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_raw_connection_reset_error_is_retried_not_crashed() -> None:
+    """Real bug, found live: ccxt.pro's own internal ping keepalive can raise a raw
+    ConnectionResetError that never passes through ccxt's own NetworkError wrapping -- this must be
+    retried exactly like a real ccxt.NetworkError, never left to crash the caller."""
+    call_count = 0
+
+    async def fails_once_with_raw_os_error_then_succeeds() -> str:
+        nonlocal call_count
+        call_count += 1
+        if call_count < 2:
+            raise ConnectionResetError("Cannot write to closing transport")
+        return "ok"
+
+    client = _client()
+    result = await client._call_with_backoff(fails_once_with_raw_os_error_then_succeeds, operation="test", context={})
+    assert result == "ok"
+    assert call_count == 2

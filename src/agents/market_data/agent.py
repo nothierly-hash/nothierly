@@ -13,21 +13,35 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from typing import Any
+from typing import Any, Final
 
 import zmq.asyncio
 from pydantic import ValidationError
 
 from core.base_agent import BaseAgent
 from core.config import AppSettings
+from core.message_integrity import publish_signed_market_metrics
 from core.redis_client import RedisUnavailableError
 from core.schemas import (
-    MARKET_METRICS_REDIS_KEY_PREFIX,
     ORDER_BOOK_TOP_N,
     TRADE_TAPE_MAX_ENTRIES,
     TRADE_TAPE_REDIS_KEY_PREFIX,
 )
 from src.agents.market_data.exchange_client import AsyncExchangeClient
+
+# Real bug found live in this exact session's own shadow run (13.5h+ uptime, real trade/L2 data
+# flowing the whole time): overriding run() below to drain two WebSocket streams instead of using
+# BaseAgent's own periodic tick loop means BaseAgent._write_heartbeat() -- normally called once per
+# tick, right there in that generic loop -- was never being called at all, ever, for this agent's
+# entire lifetime. A perfectly healthy agent (real, fresh market_metrics/trade_tape writes the
+# whole time) therefore looked permanently OFFLINE to every real heartbeat-based liveness check in
+# this project (docker-compose.yml's own nothierly-agents healthcheck, swarm_console.py's agent
+# status, core.base_agent's own documented "a missing/expired heartbeat means this agent is down"
+# contract). Fixed below with a third concurrent loop that writes a real heartbeat on a real, short
+# period -- well under _HEARTBEAT_MIN_TTL_SECONDS (5s) so the key never has a chance to expire
+# between writes, the same real safety margin BaseAgent's own default tick_interval_seconds=1.0
+# already gives every tick-loop-based agent.
+_HEARTBEAT_WRITE_INTERVAL_SECONDS: Final[float] = 3.0
 from src.agents.market_data.l2_surface_packer import publish_l2_surface
 from src.execution.data_normalizer import normalize_l2_update
 
@@ -158,6 +172,7 @@ class MarketDataAgent(BaseAgent):
             await asyncio.gather(
                 self._watch_order_book_loop(),
                 self._watch_trades_loop(),
+                self._heartbeat_loop(),
             )
         except asyncio.CancelledError:
             self._log.info("agent_run_loop_cancelled_for_shutdown", agent_id=self.agent_id)
@@ -208,6 +223,17 @@ class MarketDataAgent(BaseAgent):
                     symbol=self._symbol,
                 )
 
+    async def _heartbeat_loop(self) -> None:
+        """Real, independent liveness signal -- see this module's own top-level comment on why
+        this agent needs its own heartbeat loop instead of relying on BaseAgent's tick loop (which
+        this agent's own ``run()`` override never calls). Runs forever alongside the two real
+        WebSocket stream consumers via the same ``asyncio.gather`` in ``run()`` -- cancelled
+        together with them on shutdown, same as any other task in that gather.
+        """
+        while True:
+            await self._write_heartbeat()
+            await asyncio.sleep(_HEARTBEAT_WRITE_INTERVAL_SECONDS)
+
     # -- Per-update handling ----------------------------------------------
 
     async def _handle_order_book_update(self, raw_order_book: dict[str, Any]) -> None:
@@ -235,11 +261,14 @@ class MarketDataAgent(BaseAgent):
 
         if self._redis_client is not None:
             try:
-                await self._redis_client.execute(
-                    "set",
-                    f"{MARKET_METRICS_REDIS_KEY_PREFIX}{self._symbol}",
-                    metrics.model_dump_json(),
-                    ex=self._redis_ttl_seconds,
+                # Signed write (core/message_integrity.py) -- real fix for
+                # tests/red_team_hacker.py's Attack 1 (Redis MarketMetrics cache poisoning):
+                # a plain SET let anyone with Redis access forge this key with zero
+                # authentication. Keeps the exact same real key/plaintext JSON every existing
+                # reader already expects; only adds a companion signature readers can opt
+                # into verifying (see read_verified_market_metrics's own docstring).
+                await publish_signed_market_metrics(
+                    self._redis_client, self._symbol, metrics, ttl_seconds=self._redis_ttl_seconds
                 )
             except RedisUnavailableError:
                 self._log.warning(

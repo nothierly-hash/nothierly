@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 import polars as pl
@@ -177,11 +178,13 @@ def part2_real_fill_simulation(btc_book: pl.DataFrame, btc_trades: pl.DataFrame)
     fills = simulate_maker_fill_times(
         btc_book, btc_trades, side="buy", max_wait_seconds=_MAKER_FILL_MAX_WAIT_SECONDS, sample_every=_MAKER_FILL_SAMPLE_EVERY
     )
-    fill_rate = float(fills["filled"].mean())
+    fill_rate = float(cast(float, fills["filled"].mean()) or 0.0)
     print(f"Real fill rate: {fill_rate:.1%} of {fills.height} simulated postings (within {_MAKER_FILL_MAX_WAIT_SECONDS}s)")
     filled_only = fills.filter(pl.col("filled"))
     if filled_only.height > 0:
-        print(f"Real mean fill delay (when filled): {float(filled_only['fill_delay_seconds'].mean()):.2f}s, median: {float(filled_only['fill_delay_seconds'].median()):.2f}s")
+        mean_delay = cast(float, filled_only["fill_delay_seconds"].mean()) or 0.0
+        median_delay = cast(float, filled_only["fill_delay_seconds"].median()) or 0.0
+        print(f"Real mean fill delay (when filled): {float(mean_delay):.2f}s, median: {float(median_delay):.2f}s")
 
     print("\nChecking for adverse selection: real forward price outcome, filled vs. never-filled postings...")
     book_with_vol = compute_rolling_volatility(compute_micro_price(btc_book))

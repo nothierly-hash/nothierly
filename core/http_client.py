@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 from types import TracebackType
-from typing import Any, Final
+from typing import Any, Final, Literal, cast
 from urllib.parse import urlsplit, urlunsplit
 
 import aiohttp
@@ -149,6 +149,22 @@ class ResilientHttpClient:
         """``GET`` ``url`` and return its parsed JSON body. See :meth:`_request_json`."""
         return await self._request_json("GET", url, params=params, headers=headers)
 
+    async def get_text(
+        self,
+        url: str,
+        *,
+        params: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> str:
+        """``GET`` ``url`` and return its raw response body as text -- same retry/concurrency policy as :meth:`get_json`.
+
+        Added for :mod:`political_agent` (RSS/Atom feeds are XML, not
+        JSON -- ``response.json()`` would raise on a perfectly valid
+        feed). Every other real caller in this project so far only
+        needed JSON.
+        """
+        return cast(str, await self._request_json("GET", url, params=params, headers=headers, response_format="text"))
+
     async def post_json(
         self,
         url: str,
@@ -199,12 +215,13 @@ class ResilientHttpClient:
         params: dict[str, Any] | None = None,
         json_body: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
+        response_format: Literal["json", "text"] = "json",
     ) -> Any:
-        """Issue one HTTP request and return its parsed JSON body.
+        """Issue one HTTP request and return its parsed JSON body (or raw text -- see :meth:`get_text`).
 
-        Shared implementation behind :meth:`get_json`/:meth:`put_json`/
-        :meth:`delete_json`: same concurrency limiting, retry policy, and
-        error handling regardless of verb.
+        Shared implementation behind :meth:`get_json`/:meth:`get_text`/
+        :meth:`put_json`/:meth:`delete_json`: same concurrency limiting,
+        retry policy, and error handling regardless of verb.
 
         Retries automatically, with capped exponential backoff + jitter,
         on network/timeout errors and ``429``/``5xx`` responses. Any
@@ -258,6 +275,8 @@ class ResilientHttpClient:
                         raise RetryableHttpError(response.status, sanitized_url)
 
                     response.raise_for_status()
+                    if response_format == "text":
+                        return await response.text()
                     return await response.json()
             except (asyncio.TimeoutError, aiohttp.ServerTimeoutError, aiohttp.ClientConnectionError) as exc:
                 _log.warning(

@@ -38,21 +38,56 @@ computed live.
 
 from __future__ import annotations
 
+import json
 import time
 from typing import Literal
 
 import streamlit as st
 
 from core.base_agent import AgentControlState
-from core.schemas import AGENT_CONTROL_CHANNEL_PREFIX, AGENT_CONTROL_STATE_REDIS_KEY_PREFIX, HEARTBEAT_REDIS_KEY_PREFIX
+from core.schemas import (
+    AGENT_CONTROL_CHANNEL_PREFIX,
+    AGENT_CONTROL_STATE_REDIS_KEY_PREFIX,
+    HEARTBEAT_REDIS_KEY_PREFIX,
+    LLM_STATUS_REDIS_KEY,
+)
 from src.dashboard.ems_pages._shared import get_redis_client, safe_get
 from src.dashboard.theme import status_badge
+
+# A status this stale means political_agent.py has stopped scoring headlines altogether (crashed,
+# or simply hasn't run a cycle yet) -- real signal, not a guessed threshold: _POLL_INTERVAL_SECONDS
+# there is 15 minutes, so anything past ~2 cycles' worth is genuinely stale, not just "between polls".
+_LLM_STATUS_STALE_AFTER_SECONDS = 30 * 60
 
 _HEARTBEAT_AGENTS = (
     "supervisor-agent", "rl-signal-agent", "execution-agent", "alert-agent", "macro-order-execution-agent",
     "audit-ledger-agent",
+    # Real gap closed here, found while wiring the "Statut de l'IA" indicator below: this agent runs
+    # in its own container (docker-compose.yml's nothierly-political-agent), writes a real
+    # heartbeat:{agent_id} key exactly like every agent below (see political_agent.py's own
+    # _write_heartbeat) -- it was simply never added to this page's own list, so it never showed up
+    # here at all despite being real and running, the same silently-invisible pattern this page's own
+    # module docstring already disclosed for macro-agent/nlp-agent/archivist-agent (those three
+    # instead never call _write_heartbeat in the first place -- a different, still-open gap).
+    "political-macro-sentiment-agent",
 )
-_NO_HEARTBEAT_AGENTS = (("market-data-agent", "Boucle événementielle WebSocket -- pas de tick loop, pas de heartbeat."),)
+# Real gap closed here, found auditing scripts/run_backend.py's own real 16-agent count against what
+# this page actually showed: MacroAgent, NlpAgent, and ArchivistAgent are real, running,
+# continuously-ticking agents (confirmed live: macro_snapshot_published, nlp_fetch_cycle_started,
+# archivist_batch_written events fire on schedule) -- but unlike every other agent in this backend,
+# none of their own run() overrides ever call BaseAgent._write_heartbeat(), so they were previously
+# invisible here: not shown as "HORS LIGNE" (which would at least flag a real problem), just absent
+# from the page entirely, indistinguishable from not existing. Real fix belongs in each agent's own
+# run() loop (a genuine missing self._write_heartbeat() call, out of scope for a dashboard-only
+# patch); until that lands, this section honestly labels them PENDING/"pas de heartbeat" rather than
+# fabricating one or silently omitting them -- same "recherche / sur demande" honesty this page's own
+# Tier 2 section already established, not a new convention.
+_NO_HEARTBEAT_AGENTS = (
+    ("market-data-agent", "2 instances réelles (BTC/USDT, ETH/USDT) -- boucle événementielle WebSocket, pas de tick loop, pas de heartbeat."),
+    ("macro-agent", "Tourne réellement (poll_interval=3600s) -- publie macro_snapshot_published -- mais n'appelle jamais _write_heartbeat() (gap réel, pas encore corrigé)."),
+    ("nlp-agent", "Tourne réellement (poll_interval=300s) -- publie nlp_fetch_cycle_started -- mais n'appelle jamais _write_heartbeat() (gap réel, pas encore corrigé)."),
+    ("archivist-agent", "Tourne réellement (flush_interval=5s) -- publie archivist_batch_written -- mais n'appelle jamais _write_heartbeat() (gap réel, pas encore corrigé)."),
+)
 
 # market-data-agent is deliberately absent from the control panel below:
 # it never calls a broker, sends an alert, or publishes a trading
@@ -90,7 +125,10 @@ for agent_id in _HEARTBEAT_AGENTS:
 
         if agent_id not in _CONTROLLABLE_AGENTS:
             col_state.markdown(status_badge("SAFE", "TOUJOURS ACTIF"), unsafe_allow_html=True)
-            st.caption("Pas de contrôle LIVE/SHADOW/OFF -- voir le docstring de src/execution/audit_ledger.py.")
+            if agent_id == "political-macro-sentiment-agent":
+                st.caption("Pas de contrôle LIVE/SHADOW/OFF -- agent en lecture seule (RSS + LLM), jamais d'ordre.")
+            else:
+                st.caption("Pas de contrôle LIVE/SHADOW/OFF -- voir le docstring de src/execution/audit_ledger.py.")
             continue
 
         raw_state = safe_get(r, f"{AGENT_CONTROL_STATE_REDIS_KEY_PREFIX}{agent_id}")
@@ -137,6 +175,47 @@ st.caption(
     "environnement de démonstration sans agent réel en cours d'exécution, tous les agents apparaissent "
     "HORS LIGNE, ce qui est honnête, pas un bug."
 )
+
+st.markdown("---")
+st.subheader("🧠 Statut de l'IA -- Moat Propriétaire (Circuit Breaker)")
+st.caption(
+    "Reflète l'issue réelle du dernier appel LLM de political_agent.py, pas une simple présence de "
+    "configuration -- un endpoint Vast.ai configuré mais injoignable bascule quand même en Secours. "
+    "Voir political_agent.py::_assess_headline / scripts/deploy_custom_llm.py."
+)
+
+raw_llm_status = safe_get(r, LLM_STATUS_REDIS_KEY)
+if raw_llm_status is None:
+    st.markdown(status_badge("PENDING", "AUCUN APPEL LLM ENCORE ENREGISTRÉ"), unsafe_allow_html=True)
+    st.caption("political_agent.py n'a pas encore terminé de cycle avec au moins un titre à scorer.")
+else:
+    mode: str | None
+    status_age_seconds: float | None
+    try:
+        llm_status = json.loads(raw_llm_status)
+        mode = llm_status["mode"]
+        status_age_seconds = time.time() - float(llm_status["timestamp"])
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+        mode, status_age_seconds = None, None
+
+    if mode is None:
+        st.markdown(status_badge("PANIC", "STATUT ILLISIBLE"), unsafe_allow_html=True)
+        st.caption(f"Valeur brute inattendue dans Redis ('{LLM_STATUS_REDIS_KEY}') -- vérifier political_agent.py.")
+    elif status_age_seconds is not None and status_age_seconds > _LLM_STATUS_STALE_AFTER_SECONDS:
+        st.markdown(status_badge("PANIC", f"PÉRIMÉ ({status_age_seconds / 60:.0f} min)"), unsafe_allow_html=True)
+        st.caption("Dernier statut trop ancien -- political_agent.py a probablement arrêté de scorer des titres.")
+    elif mode == "proprietary":
+        st.markdown(status_badge("SAFE", "🟢 PROPRIÉTAIRE (VAST.AI)"), unsafe_allow_html=True)
+        st.caption(f"Dernier appel réel réussi il y a {status_age_seconds:.0f}s sur le modèle self-hosted.")
+    elif mode == "fallback":
+        st.markdown(status_badge("PENDING", "🟠 SECOURS (API PUBLIQUE)"), unsafe_allow_html=True)
+        st.caption(
+            f"Bascule active il y a {status_age_seconds:.0f}s -- le GPU Vast.ai est injoignable, en cours de "
+            "chargement, ou non déployé. Le trading n'est pas affecté (voir Cognitive Guardrail)."
+        )
+    else:  # "unconfigured"
+        st.markdown(status_badge("PANIC", "AUCUN PROVIDER LLM CONFIGURÉ"), unsafe_allow_html=True)
+        st.caption("Ni le GPU propriétaire ni un provider public (GUARDIAN_API_KEY) ne sont configurés.")
 
 st.markdown("---")
 st.subheader("🔬 Tier 2 -- R&D & Shadow Fleet (moteurs de nouvelle génération)")

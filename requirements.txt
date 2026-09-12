@@ -72,6 +72,14 @@ gymnasium>=0.29.0,<1.1.0
 numpy>=1.26.0,<3.0.0
 scikit-learn>=1.4.0,<2.0.0
 xgboost>=2.0.0,<3.0.0
+# Real, missing dependency found deploying this image for real: scripts/audit_matrix.py's
+# audit_xgboost_shap (shap.TreeExplainer, exact -- not approximate -- SHAP values for tree
+# ensembles) is called unconditionally at page-load time by src/dashboard/ems_pages/
+# intelligence.py, which previously crashed the whole "Intelligence" page with
+# ModuleNotFoundError the first time anyone opened it in a built container -- never caught
+# locally since a dev venv installed via a stale lockfile/manual pip install can silently
+# have packages requirements.txt itself never declared.
+shap>=0.44.0,<1.0.0
 # scikit-learn's own model-persistence tool (joblib.dump/joblib.load),
 # used to save/load the fitted feature scaler that pairs with a trained
 # model. Already an installed transitive dependency of scikit-learn, but
@@ -106,6 +114,8 @@ apscheduler>=3.10.0,<4.0.0
 types-redis>=4.6.0
 types-psutil>=5.9.0
 pandas-stubs>=2.2.0
+types-protobuf>=7.0.0
+types-grpcio>=1.60.0
 
 # --- Development / quality tooling ---------------------------------------
 mypy>=1.10.0,<2.0.0
@@ -156,6 +166,11 @@ streamlit>=1.35.0,<2.0.0
 # Ships no py.typed marker -- see pyproject.toml's [[tool.mypy.overrides]]
 # for "plotly.*", same ignore_missing_imports treatment as ccxt/v20 above.
 plotly>=5.20.0,<6.0.0
+# Auto-rerun on a fixed interval (src/dashboard/ems_pages/bilan.py's real-time P&L refresh) without a
+# client-side meta-refresh (loses Streamlit's session state) or a server-side time.sleep() loop (blocks
+# that session's own Streamlit run thread). A small, single-purpose component -- not plotly/streamlit
+# themselves -- for exactly this one gap in Streamlit's own API.
+streamlit-autorefresh>=1.0.1,<2.0.0
 
 # --- B2B Execution Middleware (api_middleware/gateway.py) ------------------
 # HTTP ingestion API for external client orders -- separate from every
@@ -165,6 +180,28 @@ plotly>=5.20.0,<6.0.0
 # docstring) -- fastapi/uvicorn are only for the client-facing HTTP layer.
 fastapi>=0.115.0,<0.116.0
 uvicorn[standard]>=0.30.0,<1.0.0
+
+# --- Political & Macro-Sentiment Agent (political_agent.py) ----------------
+# RSS/Atom parsing (feedparser) and HTML-stripping (beautifulsoup4) for real news feed
+# ingestion -- see that module's own docstring. No new HTTP client: the actual fetching
+# goes through core.http_client.ResilientHttpClient (new get_text() method), not a second
+# HTTP stack.
+feedparser>=6.0.0,<7.0.0
+beautifulsoup4>=4.12.0,<5.0.0
+
+# --- Swarm Command Center (src/dashboard/ems_pages/swarm_command_center.py) ------------------
+# Real network-graph layout (networkx) rendered via plotly (already required above) -- was only
+# ever a transitive dependency before (nothierly_genesis's causal_impact_engine, via dowhy), now
+# imported directly by this project's own code too, so declared explicitly here instead of relying
+# on that transitive install.
+networkx>=3.0,<4.0.0
+
+# --- P2P Premium Oracle (p2p_oracle.py) -------------------------------------
+# Amazon's real, published Chronos time-series foundation model -- real probabilistic forecasting
+# of a currency's P2P premium trajectory (paid tier, see that module's own docstring). Runs on the
+# already-required CPU-only torch build above -- no GPU needed for the "tiny" checkpoint this
+# module uses.
+chronos-forecasting>=2.0.0,<3.0.0
 
 # --- Red Phone SMS circuit breaker (src/agents/alert_agent.py) -------------
 # Official Twilio SDK, per that chapter's explicit request -- it is
@@ -261,12 +298,27 @@ py_ecc>=8.0.0,<9.0.0
 # correctly recovering one dominant H1 (loop) feature, before adoption.
 ripser>=0.6.0,<1.0.0
 
-# --- Genesis Protocol: neuromorphic tick processor (nothierly_genesis/spiking_tick_network.py) --
+# --- Genesis Protocol: TDA arbitrage-cycle engine (nothierly_genesis/tda_engine.py) --------------
+# Same real substitution as ripser above, re-verified directly here (a fresh `pip install
+# giotto-tda` attempt hangs trying to build from source -- no wheel for this platform/Python
+# combination, same underlying gap): giotto-tda not used. persim is the real, standard companion
+# to ripser for persistence-diagram/barcode plotting (scikit-tda's own plotting half); its own
+# dependency on matplotlib was already an installed transitive dependency here (via shap's own
+# plotting functions) before this chapter -- now imported directly too, so declared explicitly.
+persim>=0.3.0,<1.0.0
+matplotlib>=3.8.0,<4.0.0
+
+# --- Genesis Protocol: neuromorphic tick processor (nothierly_genesis/spiking_tick_network.py,
+# and now also snn_encoder.py/snn_brain.py) --
 # snntorch installs cleanly (pure Python atop the torch already required
 # above) -- no substitution needed. See that module's own docstring for a
 # real, load-bearing correction: the brief's claim that this reduces
 # inference latency to microseconds vs. an LSTM is checked with a real,
-# live benchmark on this machine, not assumed.
+# live benchmark on this machine, not assumed -- restated, not re-measured,
+# in snn_brain.py's own docstring for its own, differently-shaped network.
+# `torchvision` was also named in snn_brain.py's own brief -- not added: it
+# is a computer-vision package (image datasets/transforms) with no image
+# anywhere in this project's real neuromorphic-tick pipeline.
 snntorch>=1.0.0,<2.0.0
 
 # --- Genesis Protocol: causal impact engine (nothierly_genesis/causal_impact_engine.py) --
@@ -314,3 +366,36 @@ cma>=4.0.0,<5.0.0
 # project's Redis clients breaks raw binary storage, verified live).
 msgpack>=1.0.0,<2.0.0
 simulated-bifurcation>=2.0.0,<3.0.0
+
+# --- Genesis Protocol: LEO orbital latency engine (nothierly_genesis/orbital_physics.py) --------
+# geopy.distance.geodesic: real WGS84 ellipsoid ground distance between two lat/lon pairs (used
+# for the real fiber-route baseline) -- installs cleanly, pure Python + a small C extension
+# (geographiclib) with a prebuilt wheel. No type stubs published; ignored the same way as
+# ripser/persim above.
+geopy>=2.4.0,<3.0.0
+
+# --- Cognitive Router hypervisor (hypervisor/) -------------------------------------------------
+# litellm: real, universal LLM API abstraction (one call shape across OpenAI/Anthropic/a
+# vLLM-served Vast.ai endpoint/a local Ollama model) -- the brief's own explicit ask, and the
+# real reason hypervisor/task_planner.py and its workers can target four different real backends
+# through one interface instead of four bespoke SDKs. fastapi/pyzmq/redis (async) were already
+# required above; networkx was already required above too (nothierly_genesis's own use), now also
+# used directly for the real task DAG. tiktoken (litellm's own transitive dependency) is imported
+# directly for real token counting on whatever text a worker actually produces -- see
+# hypervisor/cognitive_pricing.py's own cost arithmetic.
+litellm>=1.50.0,<2.0.0
+tiktoken>=0.7.0,<1.0.0
+
+# --- Ultra-Low-Latency dual architecture (src/grpc_service, src/graphql_api) -----------------
+# grpcio was already an installed *transitive* dependency here (pulled in by another package)
+# before this chapter -- now imported directly by src/grpc_service/grpc_server.py too, so
+# declared explicitly rather than relied on implicitly, same discipline as networkx/msgpack
+# above. grpcio-tools is the offline codegen tool (`python -m grpc_tools.protoc`) that compiles
+# execution.proto into execution_pb2.py/execution_pb2_grpc.py -- a dev-time tool, not imported
+# by any running server, but declared here so a fresh clone can regenerate the stubs.
+grpcio>=1.60.0,<2.0.0
+grpcio-tools>=1.60.0,<2.0.0
+# strawberry-graphql[fastapi]: the GraphQL layer for the external Data Oracle endpoint
+# (src/graphql_api/schema.py), mounted onto the existing p2p_api.py FastAPI app at /graphql --
+# the [fastapi] extra pulls in strawberry.fastapi.GraphQLRouter, no separate ASGI server needed.
+strawberry-graphql[fastapi]>=0.230.0,<1.0.0

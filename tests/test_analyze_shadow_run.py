@@ -189,7 +189,12 @@ def test_compute_diagnostics_returns_structured_real_fields() -> None:
     assert diagnostics.total_json_lines == 4
     assert diagnostics.unexpected_failures == []
     assert diagnostics.guardrail_trips == []
-    assert diagnostics.daily_loss_limit_configured is True  # no alpha_engine_no_daily_loss_limit_configured seen
+    # Real bug found and fixed running this analyzer against an actual live shadow run: this file's
+    # own alpha_engine_started carries mock_mode=True, and AlphaMarketMakerAgent.on_start only ever
+    # logs alpha_engine_no_daily_loss_limit_configured "if ... not self._settings.mock_mode" (see
+    # that method's own source) -- so its absence here proves nothing about whether a real cap was
+    # configured. Indeterminate (None), not a guessed True.
+    assert diagnostics.daily_loss_limit_configured is None
 
 
 def test_compute_diagnostics_accepts_any_string_iterable_not_just_a_file() -> None:

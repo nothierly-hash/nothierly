@@ -31,6 +31,7 @@ import numpy.typing as npt
 import plotly.graph_objects as go
 
 from src.agents.market_data.l2_surface_packer import UnpackedL2Surface
+from src.dashboard.theme import get_theme_mode
 
 
 def build_l2_surface_figure(history: list[UnpackedL2Surface]) -> go.Figure:
@@ -67,17 +68,33 @@ def build_l2_surface_figure(history: list[UnpackedL2Surface]) -> go.Figure:
                 z_asks[row, col] = frame.ask_volumes[col]
         timestamps.append(datetime.fromtimestamp(frame.timestamp, tz=timezone.utc).isoformat())
 
+    # Real bug fixed here, found live: this figure never set paper_bgcolor/scene axis colors, so it
+    # rendered on Plotly's own default WHITE canvas -- a jarring, near-invisible white rectangle
+    # against this dashboard's dark "Vantablack" theme (the surface itself was there, just unreadable
+    # against its own axis chrome). Every other chart in this dashboard already solves this the same
+    # way (see microstructure.py/pre_trade_oracle.py): a transparent paper_bgcolor so the page's own
+    # themed background shows through, plus theme-aware font/grid colors -- 3D scenes need those set
+    # per-axis (scene.xaxis/yaxis/zaxis), unlike a 2D chart's single figure-level `font`.
+    dark = get_theme_mode() == "dark"
+    font_color = "#E8EAED" if dark else "#161A20"
+    grid_color = "rgba(255, 255, 255, 0.10)" if dark else "rgba(30, 58, 95, 0.15)"
+
+    axis_style = dict(color=font_color, gridcolor=grid_color, backgroundcolor="rgba(0,0,0,0)", zerolinecolor=grid_color)
+
     fig = go.Figure()
     fig.add_trace(go.Surface(x=x_bids, y=timestamps, z=z_bids, colorscale="Greens", showscale=False, name="Bids"))
     fig.add_trace(go.Surface(x=x_asks, y=timestamps, z=z_asks, colorscale="Reds", showscale=False, name="Asks"))
     fig.update_layout(
         scene=dict(
-            xaxis_title="Prix réel",
-            yaxis_title="Temps",
-            zaxis_title="Volume",
+            xaxis=dict(title="Prix réel", **axis_style),
+            yaxis=dict(title="Temps", **axis_style),
+            zaxis=dict(title="Volume", **axis_style),
+            bgcolor="rgba(0,0,0,0)",
         ),
         height=520,
         margin=dict(l=0, r=0, t=30, b=0),
         showlegend=False,
+        paper_bgcolor="rgba(0,0,0,0)",
+        font=dict(color=font_color),
     )
     return fig

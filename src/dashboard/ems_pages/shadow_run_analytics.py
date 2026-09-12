@@ -108,10 +108,19 @@ else:
     col5, col6, col7 = st.columns(3)
     col5.metric("Guardrails déclenchés", len(diagnostics.guardrail_trips))
     col6.metric("Interruptions suspectes", len(diagnostics.gaps))
-    col7.metric(
-        "Perte max/jour configurée",
-        "✅ Oui" if diagnostics.daily_loss_limit_configured else "⚠️ Non",
-    )
+    if diagnostics.daily_loss_limit_configured is None:
+        daily_loss_value = "❔ Indéterminé"
+    elif diagnostics.daily_loss_limit_configured:
+        daily_loss_value = "✅ Oui"
+    else:
+        daily_loss_value = "⚠️ Non"
+    col7.metric("Perte max/jour configurée", daily_loss_value)
+    if diagnostics.daily_loss_limit_configured is None:
+        st.caption(
+            "Indéterminé : ce run est entièrement en MOCK_MODE -- AlphaMarketMakerAgent.on_start ne "
+            "journalise l'avertissement « pas de plafond configuré » qu'en mode réel (voir "
+            "src/agents/alpha_engine/agent.py::on_start), donc son absence ici ne prouve rien."
+        )
     st.caption(
         "Pas de « slippage moyen simulé » ici -- le mode SHADOW ne place aucun ordre réel et ne "
         "remplit rien ; il n'existe aucun prix d'exécution, simulé ou non, dont dériver un slippage. "
