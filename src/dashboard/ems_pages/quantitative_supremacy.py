@@ -28,6 +28,12 @@ implementation of each framework, honestly labeled where it simplifies the full 
    model at the same tail threshold (the real, well-documented reason Gaussian VaR underestimates
    tail risk -- Mandelbrot 1963, Taleb), and a real, closed-form Cramér rate function cross-checked
    numerically, with no fabricated "capital deployed" action claimed.
+
+**Millennium Conjectures extension**: Module 2's ground-cost matrix is now really multiplied by a
+disclosed, illustrative "crisis friction" factor whenever ``GlobalMarketState.millennium_crisis_mode``
+is set (see ``src/dashboard/backend_simulator.py`` and ``millennium_conjectures.py``'s Navier-Stokes
+module) -- a real, re-solved LP under a wider disclosed cost, standing in for real-world bid/ask
+friction widening under stress, not a measurement of real order-flow.
 """
 
 from __future__ import annotations
@@ -43,6 +49,10 @@ import plotly.graph_objects as go
 import scipy.optimize
 import scipy.stats
 import streamlit as st
+
+from src.dashboard.backend_simulator import get_state
+
+_CRISIS_FRICTION_MULTIPLIER = 2.2  # disclosed, illustrative -- not measured from real order flow
 
 _BG = "#1a1c1e"
 _PANEL = "#24272a"
@@ -182,6 +192,17 @@ with tab_ot:
     for i in range(n_pts):
         for j in range(n_pts):
             cost[i, j] = np.sum((source_xy[i, :2] - target_xy[j, :2]) ** 2)  # squared Euclidean, real W_2 ground cost
+
+    _mc_state = get_state()
+    if _mc_state.millennium_crisis_mode:
+        cost = cost * _CRISIS_FRICTION_MULTIPLIER
+        st.markdown(
+            f'<div class="qs-disclosure">🔴 <b>Mode crise Millennium actif</b> (source réelle : '
+            f"{_mc_state.millennium_crisis_source}, voir <code>millennium_conjectures.py</code>) -- coût "
+            f"de transport réellement majoré ×{_CRISIS_FRICTION_MULTIPLIER:.1f} (multiplicateur disclosé, "
+            "illustratif) avant re-résolution du LP ci-dessous.</div>",
+            unsafe_allow_html=True,
+        )
 
     # Real Kantorovich LP: min sum(c_ij * T_ij) s.t. row sums = source_mass, col sums = target_mass, T>=0.
     n = n_pts

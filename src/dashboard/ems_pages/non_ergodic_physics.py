@@ -30,6 +30,12 @@ at -90%, not a scripted animation.
 The "1000 competing funds" are synthetic simulated entities parameterized by the user's own
 sliders, not real named funds; the "Nothierly" trajectory is one real GBM draw from a
 lower-volatility parameterization of the exact same model, not a live account or a backtest.
+
+**Protocole Léviathan**: as the real Nothierly trajectory advances along its own already-simulated
+time-average curve, each real, non-negative step of growth is accrued into the shared
+``GlobalMarketState.survival_capital`` (see ``src/dashboard/backend_simulator.py``) -- ergodicity
+economics' own point, made cross-page: capital that *survives* the non-ergodic dynamics above
+partially funds ``quantum_inspired_routing.py``'s real TT-SVD rank budget, not a fabricated transfer.
 """
 
 from __future__ import annotations
@@ -42,6 +48,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 import numpy as np
 import plotly.graph_objects as go
 import streamlit as st
+
+from src.dashboard.backend_simulator import accrue_survival_capital, get_state
 
 _BG = "#050505"
 _PANEL = "#0d0d0d"
@@ -148,6 +156,30 @@ sim = _simulate(mu_pct / 100.0, sigma_pct / 100.0, mu_n_pct / 100.0, sigma_n_pct
 t_grid = sim["t_grid"]
 competitor_paths_plot = sim["competitor_paths_plot"]
 n_paths = int(sim["n_paths"][0])
+
+
+@st.fragment(run_every="4s")
+def _accrue_survival_capital() -> None:
+    """Walks one step further along the already-simulated real Nothierly trajectory each tick,
+    accruing only its real, non-negative growth into the shared survival-capital pool -- reusing
+    the exact path this page already computed above, not drawing new random numbers."""
+    idx_key = "nep_survival_idx"
+    idx = st.session_state.get(idx_key, 0)
+    path = sim["nothierly_single"]
+    if idx + 1 < len(path) and not (np.isnan(path[idx]) or np.isnan(path[idx + 1])):
+        delta = float(path[idx + 1] - path[idx])
+        accrue_survival_capital(get_state(), max(0.0, delta))
+    st.session_state[idx_key] = (idx + 1) % (len(path) - 1)
+
+    state = get_state()
+    st.caption(
+        f"🔗 Capital de survie cumulé (état partagé, Protocole Léviathan) : **{state.survival_capital:,.1f}** "
+        f"unités -- finance {state.quantum_arbitrage_pool:,.1f} unités du pool d'arbitrage de "
+        "`quantum_inspired_routing.py`."
+    )
+
+
+_accrue_survival_capital()
 
 fig = go.Figure()
 

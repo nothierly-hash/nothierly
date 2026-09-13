@@ -303,7 +303,7 @@ from core.logger import get_logger
 from core.message_integrity import verify
 from core.nothierly_ontology import AssetClass, UniversalAsset
 from core.notifier import AlertSeverity, TelegramNotifier
-from core.redis_client import RedisUnavailableError
+from core.redis_client import RedisClient, RedisUnavailableError
 from core.schemas import (
     AGENT_CONTROL_CHANNEL_PREFIX,
     AGENT_CONTROL_STATE_REDIS_KEY_PREFIX,
@@ -734,7 +734,38 @@ class AlphaMarketMakerAgent(BaseAgent):
             await self._run_cycle()
 
     async def _run_cycle(self) -> None:
-        assert self._redis_client is not None  # guaranteed by on_start's own fail-closed check
+        # Real bug, found live via a dry run: on_start's fail-closed check only guarantees
+        # self._redis_client at startup -- BaseAgent._write_heartbeat (core/base_agent.py) nulls it
+        # out later, permanently, the instant one heartbeat write exhausts its bounded retries. A
+        # bare `assert self._redis_client is not None` here used to treat that as impossible and
+        # crash every single cycle forever once it happened (never recovering even after Redis came
+        # back, since nothing ever tried it again). Real fix: re-fetch the same process-wide
+        # RedisClient singleton (cheap -- returns the existing instance, no new connection storm) and
+        # probe it with one real command; on success, resume normally; on failure, fail safe exactly
+        # like the Master Toggle OFF branch below (cancel resting orders, skip this cycle) and retry
+        # again next cycle -- self-healing instead of a one-way trip into a permanent error loop.
+        if self._redis_client is None:
+            try:
+                # Bounded max_attempts/delays here purely as a defensive backstop for the
+                # never-actually-constructed-yet edge case (get_instance ignores these and returns
+                # the existing singleton in the realistic case -- see this method's own docstring):
+                # without them, a singleton-construction path with no other agent having connected
+                # yet would default to *unbounded* retries and could hang this one cycle forever
+                # against a genuinely dead Redis, instead of failing safe below.
+                candidate = await RedisClient.get_instance(
+                    self._settings.redis, base_delay_seconds=0.5, max_delay_seconds=2.0, max_attempts=3,
+                )
+                await candidate.execute("ping")
+            except RedisUnavailableError:
+                pass
+            else:
+                self._redis_client = candidate
+                self._log.info("alpha_engine_redis_reconnected", agent_id=self.agent_id)
+
+        if self._redis_client is None:
+            await self._cancel_all_resting_orders()
+            self._log.warning("alpha_engine_redis_unavailable_cycle_skipped", agent_id=self.agent_id)
+            return
 
         # ---- The real Master Toggle. See module docstring point 3.
         if self.control_state == AgentControlState.OFF:

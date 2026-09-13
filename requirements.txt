@@ -196,6 +196,13 @@ beautifulsoup4>=4.12.0,<5.0.0
 # on that transitive install.
 networkx>=3.0,<4.0.0
 
+# Real scipy.optimize (Optimal Transport LP, quantitative_supremacy.py), scipy.stats (Hurst-adjacent
+# and Wasserstein-distance primitives, absolute_quant_frontier.py / backend_simulator.py) -- was only
+# ever a transitive dependency before (numpy/pandas pull it in incidentally on most platforms), now
+# imported directly by this project's own code, so declared explicitly here instead of relying on
+# that transitive install.
+scipy>=1.11.0,<2.0.0
+
 # --- P2P Premium Oracle (p2p_oracle.py) -------------------------------------
 # Amazon's real, published Chronos time-series foundation model -- real probabilistic forecasting
 # of a currency's P2P premium trajectory (paid tier, see that module's own docstring). Runs on the
@@ -399,3 +406,10 @@ grpcio-tools>=1.60.0,<2.0.0
 # (src/graphql_api/schema.py), mounted onto the existing p2p_api.py FastAPI app at /graphql --
 # the [fastapi] extra pulls in strawberry.fastapi.GraphQLRouter, no separate ASGI server needed.
 strawberry-graphql[fastapi]>=0.230.0,<1.0.0
+
+# --- Millennium Conjectures & Unresolved Math (src/dashboard/ems_pages/millennium_conjectures.py) ---
+# mpmath: was only ever a transitive dependency here (sympy pulls it in) before this page -- now
+# imported directly for its real, arbitrary-precision mpmath.zeta/mpmath.zetazero (the Riemann-Siegel/
+# Turing-method zero-finding algorithm), which neither numpy nor scipy provide for complex arguments.
+# Declared explicitly rather than relied on implicitly, same discipline as networkx/grpcio above.
+mpmath>=1.3.0,<2.0.0

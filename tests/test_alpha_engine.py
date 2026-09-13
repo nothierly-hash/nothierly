@@ -355,6 +355,47 @@ async def test_live_cycle_places_two_sided_quote_when_flat(agent: AlphaMarketMak
 
 
 @pytest.mark.asyncio
+async def test_redis_client_none_reconnects_when_singleton_still_healthy(agent: AlphaMarketMakerAgent) -> None:
+    """Real bug regression, found live via a dry run (2026-09-08): BaseAgent._write_heartbeat
+    (core/base_agent.py:478) nulls agent._redis_client the instant one heartbeat write fails --
+    but the process-wide RedisClient singleton it came from is untouched. A bare
+    `assert self._redis_client is not None` in _run_cycle used to treat that as impossible and crash
+    every cycle forever afterwards. It must instead re-fetch the singleton and resume normally, same
+    cycle, once it is proven reachable again."""
+    await _seed_fresh_market_metrics(agent)
+    healthy_singleton = agent._redis_client
+    agent._redis_client = None  # exactly what _write_heartbeat does on a transient Redis blip
+
+    await agent._run_cycle()
+
+    assert agent._redis_client is healthy_singleton
+    fake = _broker(agent)
+    assert len(fake.limit_orders) == 2  # normal quoting resumed this same cycle, not just the next one
+
+
+@pytest.mark.asyncio
+async def test_redis_unavailable_fails_safe_without_crashing(agent: AlphaMarketMakerAgent) -> None:
+    """Other half of the same regression: when Redis is genuinely gone (not just this agent's stale
+    reference), _run_cycle must fail safe -- cancel resting orders, skip the cycle, never crash and
+    never place a fresh order blind to a real Master Toggle/staleness channel."""
+    await _seed_fresh_market_metrics(agent)
+    fake = _broker(agent)
+    agent._resting_order_ids = {"buy": "order-1", "sell": "order-2"}
+    agent._redis_client = None
+    RedisClient._instance = None  # Redis itself is gone process-wide, not just this agent's reference
+    # Port 1 is never a real Redis (or anything) in this test -- fails fast and deterministically,
+    # unlike pointing at settings.redis's real configured host/port, which could accidentally
+    # resolve to a real dev Redis running alongside this suite.
+    agent._settings.redis = RedisSettings(host="127.0.0.1", port=1)
+
+    await agent._run_cycle()  # must not raise
+
+    assert agent._redis_client is None
+    assert fake.cancelled_order_ids == ["order-1", "order-2"]
+    assert fake.limit_orders == []
+
+
+@pytest.mark.asyncio
 async def test_inventory_breach_hedges_instead_of_quoting(agent: AlphaMarketMakerAgent) -> None:
     """Real capital-preservation path: inventory over the cap gets a real flatten order, not a fresh quote."""
     await _seed_fresh_market_metrics(agent)

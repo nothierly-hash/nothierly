@@ -38,6 +38,13 @@ common macro factor (e.g. global USD liquidity) driving correlated moves in two 
 the textbook explanation for real cross-market co-movement, no quantum mechanics required -- and the
 two-node "entanglement" starfield is disclosed as an artistic rendering of correlation strength, not
 a literal map or a real physical field, same discipline as :mod:`gauge_theory_visualizer`.
+
+**Functional Core, Rule 2 (2026-09-13)**: a later brief again asked for a Bell-violation-triggered
+"spooky action" that cancels classical trade latency. The refusal above stands unchanged -- it is
+not re-litigated or softened. What was added instead: this real, live S value now calls
+``backend_simulator.report_chsh_excursion``, which increments one honest, disclosed counter (a
+sampling-noise-excursion tally, shown on the Nexus Command page) and does *nothing* else -- no
+trade, no sizing, no latency parameter anywhere in this codebase reads it.
 """
 
 from __future__ import annotations
@@ -51,6 +58,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 import numpy as np
 import plotly.graph_objects as go
 import streamlit as st
+
+from src.dashboard.backend_simulator import get_state, report_chsh_excursion
 
 _BG = "#04010a"
 _PANEL = "#0c0518"
@@ -192,6 +201,7 @@ with col_gauge:
     def _render_gauge() -> None:
         tick = _chsh_tick(noise_pct / 100.0, n_samples, seed=int(time.time() * 7) % 100000)
         s_val = tick["S"]
+        report_chsh_excursion(get_state(), s_val)
         fig = go.Figure(go.Indicator(
             mode="gauge+number", value=s_val, number={"suffix": "", "font": {"color": _CYAN}},
             gauge={

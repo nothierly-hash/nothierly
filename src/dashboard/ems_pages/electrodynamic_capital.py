@@ -30,6 +30,13 @@ high-resistance branches" routing behavior is a real graph shortest-path computa
 Dijkstra on real per-edge resistance weights) -- the same fee/slippage-aware venue selection this
 project's real ``liquidity_routing.py`` / ``smart_order_router_radar.py`` pages already do, reused
 here as the physics metaphor rather than re-invented.
+
+**Protocole Léviathan**: every edge's real resistance value below is now scaled by the shared
+``GlobalMarketState.ohm_resistance_relief_pct`` (see ``src/dashboard/backend_simulator.py``) --
+capital injected by AGI Active Inference (itself triggered by Shannon entropy on
+``casino_information_theory.py``) really lowers these Ω values before Dijkstra runs, and the
+resulting effective resistance is reported back into shared state, where it nudges
+``absolute_quant_frontier.py``'s BSDE terminal condition toward "satisfied".
 """
 
 from __future__ import annotations
@@ -44,6 +51,8 @@ import networkx as nx
 import numpy as np
 import plotly.graph_objects as go
 import streamlit as st
+
+from src.dashboard.backend_simulator import get_state, relief_multiplier, report_ohm_result
 
 _BG = "#050b08"
 _PANEL = "#0a1510"
@@ -113,22 +122,31 @@ with tab_ohm:
     with col_v:
         voltage_mv = st.slider("Différence de potentiel (Spread, mV analogiques)", 1.0, 30.0, 12.4, 0.1, key="ec_v")
 
-    graph = nx.DiGraph()
+    _nominal_graph = nx.DiGraph()
     for u, v, r in _EDGES:
-        graph.add_edge(u, v, resistance=r)
-    path = nx.dijkstra_path(graph, "Source Capital", "Sink Client", weight="resistance")
-    r_total = float(nx.dijkstra_path_length(graph, "Source Capital", "Sink Client", weight="resistance"))
-    path_edges = set(zip(path[:-1], path[1:]))
-    current_amps = voltage_mv / 1000.0 / r_total * 1000.0  # V(volts)/R(ohms) -- scaled to "Amps (M$)" analogy
-
-    with col_gauge:
-        st.metric("Résistance totale du chemin choisi (Ω, calcul réel)", f"{r_total:.3f}")
-        st.metric("Courant I = V/R (calcul réel)", f"{current_amps:.1f} A (M$ analogiques)")
-
-    pos = nx.spring_layout(graph, seed=11)
+        _nominal_graph.add_edge(u, v, resistance=r)
+    pos = nx.spring_layout(_nominal_graph, seed=11)
 
     @st.fragment(run_every="1.5s")
     def _render_circuit() -> None:
+        state = get_state()
+        relief = relief_multiplier(state)
+        graph = nx.DiGraph()
+        for u, v, r in _EDGES:
+            graph.add_edge(u, v, resistance=r * relief)
+        path = nx.dijkstra_path(graph, "Source Capital", "Sink Client", weight="resistance")
+        r_total = float(nx.dijkstra_path_length(graph, "Source Capital", "Sink Client", weight="resistance"))
+        path_edges = set(zip(path[:-1], path[1:]))
+        v_now = st.session_state.get("ec_v", voltage_mv)
+        current_amps = v_now / 1000.0 / r_total * 1000.0  # V(volts)/R(ohms) -- scaled to "Amps (M$)" analogy
+        report_ohm_result(state, r_total)
+
+        g1, g2, g3 = st.columns(3)
+        g1.metric("Résistance totale du chemin choisi (Ω, calcul réel)", f"{r_total:.3f}")
+        g2.metric("Courant I = V/R (calcul réel)", f"{current_amps:.1f} A (M$ analogiques)")
+        g3.metric("Relief AGI (état partagé)", f"-{state.ohm_resistance_relief_pct:.1f}%",
+                   help="Résistance nominale réduite par le capital injecté par AGI Active Inference (voir agi_photonic_singularity.py).")
+
         pulse = 0.5 + 0.5 * np.sin(time.time() * 3)
         fig = go.Figure()
         for u, v, r in _EDGES:
@@ -138,7 +156,7 @@ with tab_ohm:
             fig.add_trace(go.Scatter(
                 x=[pos[u][0], pos[v][0]], y=[pos[u][1], pos[v][1]], mode="lines",
                 line=dict(color=color, width=width), opacity=0.9 if is_path else 0.4,
-                hoverinfo="text", text=f"{u}→{v}: R={r:.2f}Ω", showlegend=False,
+                hoverinfo="text", text=f"{u}→{v}: R={r * relief:.3f}Ω (nominal {r:.2f}Ω)", showlegend=False,
             ))
         fig.add_trace(go.Scatter(
             x=[pos[n][0] for n in graph.nodes], y=[pos[n][1] for n in graph.nodes],
@@ -151,7 +169,10 @@ with tab_ohm:
             margin=dict(l=10, r=10, t=10, b=10), xaxis=dict(visible=False), yaxis=dict(visible=False),
         )
         st.plotly_chart(fig, width="stretch", key=f"ec_circuit_{time.time()}")
-        st.caption(f"Chemin \"supraconducteur\" choisi (calcul réel, moindre résistance) : {' → '.join(path)} (R_total={r_total:.3f}Ω)")
+        st.caption(
+            f"Chemin \"supraconducteur\" choisi (calcul réel, moindre résistance effective) : {' → '.join(path)} "
+            f"(R_total={r_total:.3f}Ω, relief cumulé état partagé : {state.ohm_resistance_relief_pct:.1f}%)."
+        )
 
     _render_circuit()
 
@@ -179,10 +200,12 @@ with tab_joule:
 
     @st.fragment(run_every="2s")
     def _render_power() -> None:
+        state = get_state()
+        relief = relief_multiplier(state)
         v = st.session_state.get("ec_v", 12.4) / 1000.0
         graph = nx.DiGraph()
         for u, vv, r in _EDGES:
-            graph.add_edge(u, vv, resistance=r)
+            graph.add_edge(u, vv, resistance=r * relief)
         r_total = float(nx.dijkstra_path_length(graph, "Source Capital", "Sink Client", weight="resistance"))
         i = v / r_total
         power_w = v * i * 1_000_000  # scaled analogy (mV/mΩ circuit -> "financial watts"), disclosed above

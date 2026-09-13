@@ -30,6 +30,13 @@ Pelizzon, "Econometric measures of connectedness and systemic risk," *J. Financi
    Nigerian Naira market, and "verrouillage préventif de la liquidité" is not a real action this page
    triggers. The tail-dependence "contagion probability" shown is a real, closed-form Student-t
    copula coefficient (Embrechts, McNeil & Straumann, 2002) computed on illustrative correlations.
+
+**Protocole Léviathan**: Module 1 also displays the shared ``GlobalMarketState.bsde_progress`` /
+``bsde_terminal_satisfied`` (see ``src/dashboard/backend_simulator.py``) -- a real, disclosed proxy
+fed by how much simulated AGI capital (``agi_photonic_singularity.py``) has been injected relative to
+this module's own terminal target, itself unlocked only once ``electrodynamic_capital.py`` reports a
+lower effective resistance. This is a second, separate display metric layered on top of the module's
+own exact closed-form Brownian bridge below -- it does not alter that bridge's real math.
 """
 
 from __future__ import annotations
@@ -45,6 +52,8 @@ import numpy as np
 import plotly.graph_objects as go
 import scipy.stats
 import streamlit as st
+
+from src.dashboard.backend_simulator import get_state, report_hurst_regime
 
 _BG = "#0b0c0e"
 _PANEL = "#1b1c20"
@@ -113,6 +122,7 @@ with tab_bsde:
 
     @st.fragment(run_every="3s")
     def _render_bsde() -> None:
+        get_state().bsde_target = target
         seed = int(time.time())
         rng = np.random.default_rng(seed)
         dt = horizon / n_steps
@@ -144,6 +154,18 @@ with tab_bsde:
             f"{max(endpoint_errors):.2e} (vérification réelle : épinglage exact par construction, "
             "aux erreurs d'arrondi flottant près)."
         )
+
+        state = get_state()
+        st.markdown("---")
+        status = "✅ VALIDÉE" if state.bsde_terminal_satisfied else "⏳ EN ATTENTE"
+        st.markdown(
+            f"<div class='qf-panel'>🔗 <b>Condition terminale, vue Protocole Léviathan (état partagé)</b> : "
+            f"<b>{status}</b> -- progression {state.bsde_progress:.0%} (capital AGI injecté cumulé / cible Y_T). "
+            "Alimentée par `agi_photonic_singularity.py` -> `electrodynamic_capital.py`, voir "
+            "`src/dashboard/backend_simulator.py`.</div>",
+            unsafe_allow_html=True,
+        )
+        st.progress(state.bsde_progress)
 
     _render_bsde()
 
@@ -192,13 +214,16 @@ with tab_fbm:
         variances = np.array([np.var(one_path[lag:] - one_path[:-lag]) for lag in lags])
         slope = float(np.polyfit(np.log(lags), np.log(variances), 1)[0])
         h_estimated = slope / 2.0
+        regime = report_hurst_regime(get_state(), h_estimated)
 
         c1, c2, c3 = st.columns(3)
         c1.metric("H cible (génération)", f"{h_target:.2f}")
         c2.metric("H estimé (régression log-log réelle)", f"{h_estimated:.3f}")
-        regime = "anti-persistant/rugueux" if h_estimated < 0.45 else ("persistant/tendanciel" if h_estimated > 0.55 else "brownien standard")
-        c3.metric("Régime (déduit du calcul réel)", regime)
-        st.caption(f"Écart estimation vs cible : {abs(h_estimated - h_target):.3f} (bruit d'estimation réel sur {n_t} points, pas une coïncidence scriptée).")
+        c3.metric("Régime (calcul réel, état partagé)", regime)
+        st.caption(
+            f"Écart estimation vs cible : {abs(h_estimated - h_target):.3f} (bruit d'estimation réel sur {n_t} points, pas une coïncidence scriptée). "
+            "Ce régime réel gate désormais l'accroissement du capital de survie sur `non_ergodic_physics.py` (Functional Core, Rule complémentaire -- voir `backend_simulator.py`)."
+        )
 
     _render_fbm()
 

@@ -46,6 +46,8 @@ import streamlit as st
 
 from core.config import get_settings
 from src.dashboard.auth_middleware import enforce_idle_lock, render_lock_overlay_if_needed, require_login, touch_activity
+from src.dashboard.backend_simulator import get_state as get_global_market_state
+from src.dashboard.core_daemons import get_manager as get_ghost_daemon_manager
 from src.dashboard.ems_pages._shared import get_iam_store
 from src.dashboard.theme import render_brand_header, render_theme_css, render_theme_toggle
 
@@ -86,6 +88,18 @@ except redis.RedisError as exc:
     )
     st.caption(f"Détail technique : {exc}")
     st.stop()
+
+# Protocole Léviathan -- the shared Global_Market_State every "frontier tech" page reads and writes
+# (see src/dashboard/backend_simulator.py's module docstring). Created once per session here so it
+# exists before any page's own import-time code runs, exactly like the IAM session state above.
+get_global_market_state()
+
+# Protocole "DeFi Ghost Daemons" -- starts the 16-daemon swarm's real detached background thread
+# (its own asyncio event loop) once per session, at startup, exactly as asked -- not only when the
+# Nexus Command page happens to be open. See src/dashboard/core_daemons.py's module docstring for why
+# this is a real background thread rather than a fake always-on illusion, and why it evolves its own
+# chaos signal while detached instead of unsafely touching st.session_state off-thread.
+get_ghost_daemon_manager().ensure_background_running()
 
 _PAGES_DIR = Path(__file__).resolve().parent / "ems_pages"
 
@@ -145,6 +159,10 @@ pages = {
         st.Page(str(_PAGES_DIR / "quantitative_supremacy.py"), title="Quantitative Supremacy", icon="📐"),
         st.Page(str(_PAGES_DIR / "absolute_quant_frontier.py"), title="Absolute Quant Frontier", icon="🧿"),
         st.Page(str(_PAGES_DIR / "agi_photonic_singularity.py"), title="AGI & Photonic Singularity", icon="✨"),
+        st.Page(str(_PAGES_DIR / "millennium_conjectures.py"), title="Millennium Conjectures", icon="♾️"),
+    ],
+    "🐙 Leviathan Nexus": [
+        st.Page(str(_PAGES_DIR / "leviathan_nexus_command.py"), title="Nexus Command Center", icon="🐙"),
     ],
     "⚙️ Operations": [
         st.Page(str(_PAGES_DIR / "red_phone.py"), title="SRE & Red Phone", icon="🚒"),

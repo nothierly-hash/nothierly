@@ -18,9 +18,24 @@ capability this EMS already has elsewhere: smart order routing reconnecting liqu
 fragmented venues after a shock -- see the real ``liquidity_routing.py`` / ``smart_order_router_radar.py``
 / ``internal_dark_pool.py`` pages, linked from here rather than re-invented as a fake metric.
 
+**Functional Core, Rule 4 (2026-09-13)**: this page's real graph now also feeds
+``backend_simulator.identify_liquidity_holes`` -- the real cycle basis (``networkx.cycle_basis``) of
+the exact graph drawn above, the standard algebraic-topology definition of the first Betti number's
+generators (the same β1 already shown as a metric here). Those nodes are the *only* place a
+simulated market-making order can be sized, and only when the shared Kelly gate (Casino Information
+Theory's real ``core.quant_math.kelly_criterion`` result) is positive -- see
+``backend_simulator.place_market_making_orders`` for the full rule. These remain simulated
+``GlobalMarketState`` entries only, never sent to any broker or real order book.
+
 **What is real and computed live below**: the graph's algebraic structure (giant-component size,
 connected-component count) is real graph theory computed on a real (synthetic, disclosed) NetworkX
 graph on every tick -- not a scripted animation with pre-baked numbers.
+
+**Protocole Léviathan**: the tear/repair phase and every metric below now lives in the shared
+``GlobalMarketState`` (see ``src/dashboard/backend_simulator.py``), not a page-local session key --
+a krach triggered here is what raises the chaos bias ``casino_information_theory.py`` reads on its
+Shannon-entropy module, and AGI capital injected on ``agi_photonic_singularity.py`` (via that same
+entropy trigger) now measurably speeds up this page's own repair phase.
 """
 
 from __future__ import annotations
@@ -32,9 +47,21 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 import networkx as nx
-import numpy as np
 import plotly.graph_objects as go
 import streamlit as st
+
+from src.dashboard.backend_simulator import (
+    advance_hypergraph_phase,
+    build_hypergraph_topology,
+    current_hypergraph_edges,
+    get_state,
+    hypergraph_tear_order,
+    identify_liquidity_holes,
+    place_market_making_orders,
+    report_topology,
+    simulated_liquidity_profiles,
+    trigger_hypergraph_tear,
+)
 
 _BG = "#02010a"
 _PANEL = "#0a0616"
@@ -73,57 +100,25 @@ st.markdown("")
 
 _N_NODES = 60
 
-
-@st.cache_data
-def _build_base_graph() -> tuple[list[tuple[int, int]], dict[int, tuple[float, float, float]]]:
-    """A real, disclosed synthetic scale-free graph (Barabási-Albert, seed fixed for reproducibility)
-    -- the same topology class real published research finds in real interbank/venue networks, not
-    a real correlation matrix of any real market (no such data is wired into this page)."""
-    graph = nx.barabasi_albert_graph(_N_NODES, 2, seed=7)
-    pos = nx.spring_layout(graph, dim=3, seed=42)
-    edges = list(graph.edges())
-    pos3d = {int(n): (float(p[0]), float(p[1]), float(p[2])) for n, p in pos.items()}
-    return edges, pos3d
-
-
-_BASE_EDGES, _POS3D = _build_base_graph()
-
-if "wh_phase" not in st.session_state:
-    st.session_state["wh_phase"] = "stable"
-    st.session_state["wh_removed"] = 0
+_BASE_EDGES, _POS3D = build_hypergraph_topology(_N_NODES, seed=7)
+_TEAR_ORDER = hypergraph_tear_order(len(_BASE_EDGES))
+_state = get_state()
 
 col_ctrl, col_status = st.columns([1, 2])
 with col_ctrl:
-    if st.button("⚡ Simuler un Krach (déchirure topologique)", disabled=st.session_state["wh_phase"] != "stable"):
-        st.session_state["wh_phase"] = "tearing"
-        st.session_state["wh_removed"] = 0
+    if st.button("⚡ Simuler un Krach (déchirure topologique)", disabled=_state.hypergraph_phase != "stable"):
+        trigger_hypergraph_tear(_state)
 
 _MAX_TEAR = int(len(_BASE_EDGES) * 0.45)
 
 
-def _current_edges() -> list[tuple[int, int]]:
-    removed = st.session_state["wh_removed"]
-    # Deterministic "tear order" (fixed per session) so the same edges disappear then reappear,
-    # rather than a different random subset each rerun -- a real, stable animation, not flicker.
-    rng = np.random.default_rng(123)
-    order = rng.permutation(len(_BASE_EDGES))
-    torn_idx = set(order[:removed].tolist())
-    return [e for i, e in enumerate(_BASE_EDGES) if i not in torn_idx]
-
-
 @st.fragment(run_every="1s")
 def _render_graph() -> None:
-    phase = st.session_state["wh_phase"]
-    if phase == "tearing":
-        st.session_state["wh_removed"] = min(st.session_state["wh_removed"] + 6, _MAX_TEAR)
-        if st.session_state["wh_removed"] >= _MAX_TEAR:
-            st.session_state["wh_phase"] = "repairing"
-    elif phase == "repairing":
-        st.session_state["wh_removed"] = max(st.session_state["wh_removed"] - 6, 0)
-        if st.session_state["wh_removed"] <= 0:
-            st.session_state["wh_phase"] = "stable"
+    state = get_state()
+    advance_hypergraph_phase(state, _MAX_TEAR)
+    phase = state.hypergraph_phase
 
-    edges = _current_edges()
+    edges = current_hypergraph_edges(_BASE_EDGES, state.hypergraph_removed_edges, _TEAR_ORDER)
     graph = nx.Graph()
     graph.add_nodes_from(range(_N_NODES))
     graph.add_edges_from(edges)
@@ -131,6 +126,14 @@ def _render_graph() -> None:
     components = list(nx.connected_components(graph))
     giant = max(components, key=len) if components else set()
     integrity_pct = 100.0 * len(giant) / _N_NODES
+    betti_1 = max(0, len(edges) - _N_NODES + len(components))
+    report_topology(state, integrity_pct, len(components), betti_1)
+
+    # Rule 4 (Functional Core): the real cycle basis of THIS tick's graph is the only place a
+    # simulated market-making order can be sized -- see backend_simulator.place_market_making_orders.
+    holes = identify_liquidity_holes(graph)
+    bid_liquidity, ask_liquidity = simulated_liquidity_profiles(state)
+    orders = place_market_making_orders(state, holes, bid_liquidity, ask_liquidity)
 
     edge_x: list[float | None] = []
     edge_y: list[float | None] = []
@@ -171,12 +174,30 @@ def _render_graph() -> None:
         st.markdown(f"#### 📡 Intégrité du réseau &nbsp; <span class='wh-badge'>{phase.upper()}</span>", unsafe_allow_html=True)
         st.metric("Composante géante / réseau total (calcul réel)", f"{integrity_pct:.1f}%",
                    delta=f"{len(components)} composante(s) connexe(s)")
+        st.metric("β₁ -- cycles indépendants (calcul réel, état partagé)", f"{betti_1}")
+        if state.liquidity_withdrawn:
+            st.warning("🚨 Liquidité simulée retirée -- seuil de vorticité Navier-Stokes franchi (état partagé, voir Millennium Conjectures).")
+        elif orders:
+            st.success(
+                f"📍 {len(orders)} ordre(s) limite simulé(s) placé(s) sur les {len(holes)} nœud(s) de trou(s) "
+                f"topologique(s) réels (β1={betti_1}) -- taille {orders[0][1]:.3f} chacun, Kelly f*={state.agi_kelly_fraction:.3f}, "
+                f"écart Wasserstein bid/ask={state.liquidity_gap_wasserstein:.3f} (voir Rule 4, backend_simulator.py)."
+            )
+        else:
+            st.caption(
+                f"Aucun ordre de market-making simulé : soit β1={betti_1}=0 (pas de trou topologique), "
+                f"soit Kelly f*={state.agi_kelly_fraction:.3f} <= 0 (pas d'edge net, voir Casino Information Theory)."
+            )
         if phase == "stable":
             st.caption("Réseau stable -- graphe connexe (calcul réel sur ce tick).")
         elif phase == "tearing":
-            st.caption("Déchirure en cours -- arêtes retirées d'un graphe réel, fragmentation mesurée en direct.")
+            st.caption("Déchirure en cours -- arêtes retirées d'un graphe réel, fragmentation mesurée en direct. "
+                       "Le biais de chaos transmis à Casino Information Theory (état partagé) monte avec la fragmentation.")
         else:
-            st.caption("Reconnexion en cours -- métaphore d'un vrai routage de liquidité inter-venues après un choc.")
+            boost = int(state.agi_capital_injected_total // 50)
+            st.caption(f"Reconnexion en cours -- métaphore d'un vrai routage de liquidité inter-venues après un choc. "
+                       f"Capital AGI injecté cumulé (état partagé) : {state.agi_capital_injected_total:.1f}k$ "
+                       f"(+{boost}/tick de vitesse de réparation).")
 
 
 _render_graph()

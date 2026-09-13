@@ -9,9 +9,10 @@
     },
     {
       "name": "nothierly-ems",
-      "runtimeExecutable": ".venv/Scripts/streamlit.exe",
-      "runtimeArgs": ["run", "src/dashboard/nothierly_ems.py", "--server.headless", "true", "--server.port", "8503"],
-      "port": 8503
+      "runtimeExecutable": "cmd.exe",
+      "runtimeArgs": ["/c", ".venv\\Scripts\\streamlit.exe run src/dashboard/nothierly_ems.py --server.headless true --server.port %PORT%"],
+      "port": 8503,
+      "autoPort": true
     },
     {
       "name": "p2p-api",

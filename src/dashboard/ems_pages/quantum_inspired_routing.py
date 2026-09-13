@@ -15,6 +15,12 @@ discover, but the tensor's *values* are a synthetic smooth function chosen becau
 multivariate functions are a real, well-known case with genuinely low TT-rank -- not real
 exchange-rate data) and reports the **real, measured** compression ratio and reconstruction error
 for that run, whatever they come out to be.
+
+**Protocole Léviathan**: the TT-SVD rank budget (``max_rank``) below is no longer a fixed constant --
+it now scales with the shared ``GlobalMarketState.quantum_arbitrage_pool`` (see
+``src/dashboard/backend_simulator.py``), funded by real survival-capital growth accrued on
+``non_ergodic_physics.py``. More funding buys a genuinely higher-rank (and, on this smooth synthetic
+tensor, more accurate) real decomposition -- still measured live, never asserted.
 """
 
 from __future__ import annotations
@@ -29,6 +35,8 @@ import numpy as np
 import numpy.typing as npt
 import plotly.graph_objects as go
 import streamlit as st
+
+from src.dashboard.backend_simulator import get_state, quantum_rank_budget
 
 _BG = "#000000"
 _PANEL = "#0a0a0f"
@@ -124,9 +132,16 @@ with col_wall:
 
 with col_tt:
     st.markdown('#### 🚄 Compression Tensor-Train &nbsp; <span class="qir-badge">RÉEL, MESURÉ</span>', unsafe_allow_html=True)
+    _leviathan_state = get_state()
+    _rank_budget = quantum_rank_budget(_leviathan_state)
+    st.caption(
+        f"🔗 Budget de rang TT (état partagé, Protocole Léviathan) : **{_rank_budget}** -- financé par "
+        f"{_leviathan_state.quantum_arbitrage_pool:,.1f} unités de capital de survie accumulées sur "
+        "`non_ergodic_physics.py`."
+    )
     tensor = _build_demo_tensor()
     started = time.perf_counter()
-    cores = tt_svd_decompose(tensor, max_rank=4)
+    cores = tt_svd_decompose(tensor, max_rank=_rank_budget)
     elapsed_ms = (time.perf_counter() - started) * 1000.0
     recon = tt_reconstruct(cores)
     rel_error = float(np.linalg.norm(recon - tensor) / np.linalg.norm(tensor))
@@ -137,7 +152,7 @@ with col_tt:
     c1.metric("Taille originale (réelle)", f"{original_bytes / 1024:.1f} KB")
     c2.metric("Taille compressée (réelle)", f"{compressed_bytes / 1024:.2f} KB")
     c3.metric("Ratio réel", f"{original_bytes / compressed_bytes:.1f}x")
-    st.caption(f"Erreur de reconstruction réelle : {rel_error:.2e} -- calcul réel effectué en {elapsed_ms:.2f} ms sur ce tenseur ({_DIM_SIZE}^{len(_DIM_LABELS)} = {tensor.size} valeurs, axes : {', '.join(_DIM_LABELS)}).")
+    st.caption(f"Erreur de reconstruction réelle : {rel_error:.2e} -- calcul réel effectué en {elapsed_ms:.2f} ms sur ce tenseur ({_DIM_SIZE}^{len(_DIM_LABELS)} = {tensor.size} valeurs, axes : {', '.join(_DIM_LABELS)}, rang max={_rank_budget}).")
 
     fig3d = go.Figure()
     rng = np.random.default_rng(0)

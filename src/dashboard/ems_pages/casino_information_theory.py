@@ -5,6 +5,14 @@
 already used elsewhere in this project (see that function's own docstring) -- rather than a new
 formula invented for this dashboard.
 
+**Functional Core, Rule 3 (2026-09-13)**: that same real ``kelly_criterion`` call now also decides
+AGI Active Inference's capital injection in the shared ``GlobalMarketState`` (see
+``backend_simulator.report_entropy`` / ``agi_edge_estimate``) -- injection size is exactly the
+half-Kelly fraction on a disclosed illustrative edge estimate, and the function's own negative-edge
+clip to ``f*=0`` (documented on ``kelly_criterion`` itself) is what makes "no edge -> no injection"
+real rather than a separate ad hoc rule. The entropy-ratio warning below now reports that same
+shared Kelly fraction, not a value local to this page.
+
 **Three corrections applied to the brief, each mirroring a precedent already established elsewhere
 in this project, not a new standard invented here**:
 
@@ -38,6 +46,21 @@ in this project, not a new standard invented here**:
    honestly-scoped textbook game-theory illustration (Nash, 1950) of market-making competition, with
    real pure-strategy equilibria computed live on a disclosed illustrative payoff matrix -- not a
    live measurement of any real competitor, and not a manipulative technique.
+
+**Protocole Léviathan**: the Shannon module's distribution concentration is now biased by the shared
+``GlobalMarketState.shannon_chaos_bias`` (see ``src/dashboard/backend_simulator.py``) -- a hypergraph
+tear triggered on ``wolfram_hypergraph.py`` really does flatten this real Dirichlet draw and raise the
+real entropy measured here. Crossing the disclosed entropy-ratio threshold really does draw down the
+AGI capital reserve shown on ``agi_photonic_singularity.py`` -- both effects computed live below, not
+scripted.
+
+**"State of the Art 2026" (2026-09-13)**: a further brief asked that "every trade decision show the
+exact spline function that justified it," framed as proof of a fully SEC-auditable "white box." Built
+honestly below (``backend_simulator.kan_decision_layer``): a real Kolmogorov-Arnold outer sum over the
+same three numbers already driving the Kelly gate above, printed in full -- every knot, coefficient,
+and intermediate value. It is an added transparency annotation on top of the real Kelly decision, not
+a replacement for it, and this page makes no claim that any regulator has reviewed or approved it --
+"auditable" here means the formula is fully disclosed for a reader to check by hand, nothing more.
 """
 
 from __future__ import annotations
@@ -53,6 +76,14 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from core.quant_math import kelly_criterion
+from src.dashboard.backend_simulator import (
+    ENTROPY_INJECTION_RATIO,
+    KAN_DECISION_THRESHOLD,
+    chaos_biased_distribution,
+    get_state,
+    report_entropy,
+)
+from src.dashboard.backend_simulator import shannon_entropy as _shared_shannon_entropy
 
 _BG = "#02100a"
 _PANEL = "#081a10"
@@ -190,22 +221,29 @@ with tab_shannon:
     _PAIRS = ["EUR/USD", "USDT/NGN", "BTC/USDT", "USDC/ARS", "GBP/USD", "USDT/TRY", "ETH/USDT", "USDC/BRL"]
     _N = len(_PAIRS)
 
+    _state_preview = get_state()
+    st.markdown(
+        f"<div class='cit-panel'>🕸️ Biais de chaos reçu de <b>Wolfram Hypergraph</b> (état partagé) : "
+        f"<b>{_state_preview.shannon_chaos_bias:.0%}</b> -- une déchirure topologique en cours là-bas "
+        f"aplatit réellement la distribution ci-dessous et fait monter l'entropie mesurée.</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown("")
+
     @st.fragment(run_every="2s")
     def _render_shannon() -> None:
+        state = get_state()
         seed = int(time.time())
-        rng = np.random.default_rng(seed)
-        # A real Dirichlet draw -- concentration mildly time-varying so one slot "focuses"
-        # probability mass, an honest stand-in for "the market concentrates around one zone",
-        # not a real order-flow-derived distribution.
-        focus = seed % _N
-        alpha = np.full(_N, 1.0)
-        alpha[focus] = 4.0 + 3.0 * (0.5 + 0.5 * np.sin(seed / 5.0))
-        probs = rng.dirichlet(alpha)
+        # Real Dirichlet draw, concentration now driven by the shared chaos bias (see module
+        # docstring) instead of a page-local time-varying focus -- an honest stand-in for "a
+        # hypergraph tear concentrates/disperses market attention", not a real order-flow signal.
+        probs = chaos_biased_distribution(_N, state.shannon_chaos_bias, seed)
 
-        h_real = float(-np.sum(probs * np.log2(probs)))
+        h_real = _shared_shannon_entropy(probs)
         h_max = float(np.log2(_N))
         reduction_pct = 100.0 * (h_max - h_real) / h_max
         min_entropy_slot = int(np.argmax(probs))
+        injected = report_entropy(state, h_real, h_max)
 
         colors = [_GOLD if i == min_entropy_slot else "#3a3a2a" for i in range(_N)]
         fig = go.Figure(go.Barpolar(
@@ -231,6 +269,34 @@ with tab_shannon:
             f"<b style='color:{_GOLD};'>{_PAIRS[min_entropy_slot]}</b> -- p={probs[min_entropy_slot]:.3f}. "
             "Distribution synthétique, aucun placement de liquidité réel n'en découle.</div>",
             unsafe_allow_html=True,
+        )
+        ratio = h_real / h_max if h_max > 0 else 0.0
+        if injected > 0:
+            st.warning(
+                f"🧠 Ratio d'entropie {ratio:.0%} ≥ seuil {ENTROPY_INJECTION_RATIO:.0%}, Kelly f*={state.agi_kelly_fraction:.3f} "
+                f"(half-Kelly, état partagé) -- **AGI Active Inference injecte {injected:.1f}k$** (exactement f*×réserve) "
+                "de sa réserve simulée (voir `agi_photonic_singularity.py`), ce qui réduit en direct la résistance sur "
+                "`electrodynamic_capital.py`."
+            )
+        elif ratio >= ENTROPY_INJECTION_RATIO:
+            st.caption(
+                f"Ratio d'entropie {ratio:.0%} ≥ seuil, mais Kelly f*={state.agi_kelly_fraction:.3f} <= 0 sur l'edge "
+                "estimé (état partagé) -- **aucune injection** (Rule 3, `kelly_criterion` clippe un edge négatif à 0)."
+            )
+        else:
+            st.caption(
+                f"Ratio d'entropie {ratio:.0%} (seuil de déclenchement de l'AGI, état partagé : "
+                f"{ENTROPY_INJECTION_RATIO:.0%}). Kelly f* actuel (état partagé) : {state.agi_kelly_fraction:.3f}."
+            )
+
+        st.markdown("##### 🧮 Couche de transparence KAN (annotation d'audit, pas une seconde décision)")
+        st.code(state.kan_formula_str, language="text")
+        st.caption(
+            f"f(x) = Σ φᵢ(xᵢ) (théorème de représentation de Kolmogorov-Arnold), splines linéaires par "
+            f"morceaux disclosées, coefficients fixes -- score={state.kan_decision_score:+.3f} "
+            f"({'>= seuil ' + f'{KAN_DECISION_THRESHOLD:.2f}' if state.kan_trade_active else '< seuil ' + f'{KAN_DECISION_THRESHOLD:.2f}'}). "
+            "Recalcul honnête à partir des mêmes entrées que le gate Kelly ci-dessus, affiché ici pour "
+            "audit -- ne remplace ni ne re-décide l'injection réelle."
         )
 
     _render_shannon()

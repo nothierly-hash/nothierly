@@ -41,6 +41,17 @@ working general intelligence.
    hardware exists here). The picosecond latency figure is a real, live-computed light
    time-of-flight (``t = d / (c/n_g)``) over an adjustable illustrative chip path length, not a fixed
    scripted number.
+
+**Protocole Léviathan**: Module 1 now also displays the AGI's real, shared capital-reserve ledger
+(``GlobalMarketState``, see ``src/dashboard/backend_simulator.py``) -- when ``casino_information_
+theory.py``'s live Shannon entropy crosses its disclosed threshold, this AGI really does draw down
+that reserve and inject simulated capital, visible here the moment it happens, not a fabricated
+"AGI decision" narrated after the fact.
+
+**Millennium Conjectures extension**: ``backend_simulator.report_entropy`` now also checks
+``GlobalMarketState.millennium_crisis_mode`` before allowing an injection -- a real, disclosed pause
+triggered by ``millennium_conjectures.py``'s Navier-Stokes module crossing its own real, illustrative
+peak-vorticity threshold, surfaced below rather than silently gating in the background.
 """
 
 from __future__ import annotations
@@ -56,6 +67,8 @@ import numpy as np
 import plotly.graph_objects as go
 import scipy.spatial.distance
 import streamlit as st
+
+from src.dashboard.backend_simulator import ENTROPY_INJECTION_RATIO, get_state
 
 _INK = "#1d1d1f"
 _DIM = "#6e6e73"
@@ -177,6 +190,32 @@ with tab_ai:
         c1, c2 = st.columns(2)
         c1.markdown(f'<div class="agi-metric-card"><div class="agi-metric-value">{avg_surprise:.3f}</div><div class="agi-metric-label">Surprise moyenne (calcul réel, jamais exactement 0)</div></div>', unsafe_allow_html=True)
         c2.markdown(f'<div class="agi-metric-card"><div class="agi-metric-value">{abs(x-pred):.4f}</div><div class="agi-metric-label">Écart croyance/réalité actuel (réel)</div></div>', unsafe_allow_html=True)
+
+        state = get_state()
+        st.markdown("")
+        st.markdown(
+            '<div class="agi-glass">🔗 <b>Réserve de capital de l\'inférence active (état partagé, Protocole '
+            'Léviathan)</b> -- déclenchée par l\'entropie de Shannon réelle mesurée sur '
+            '<code>casino_information_theory.py</code>, pas par la carte logistique ci-dessus.</div>',
+            unsafe_allow_html=True,
+        )
+        u1, u2, u3 = st.columns(3)
+        u1.markdown(f'<div class="agi-metric-card"><div class="agi-metric-value">{state.agi_capital_reserve:.1f}k$</div><div class="agi-metric-label">Réserve restante (simulée)</div></div>', unsafe_allow_html=True)
+        u2.markdown(f'<div class="agi-metric-card"><div class="agi-metric-value">{state.agi_capital_injected_total:.1f}k$</div><div class="agi-metric-label">Injecté cumulé (simulé, état partagé)</div></div>', unsafe_allow_html=True)
+        status_label = "ACTIVE" if state.agi_inference_active else "VEILLE"
+        status_color = _MINT if state.agi_inference_active else _DIM
+        u3.markdown(f'<div class="agi-metric-card"><div class="agi-metric-value" style="color:{status_color};">{status_label}</div><div class="agi-metric-label">Ratio entropie/max requis : ≥{ENTROPY_INJECTION_RATIO:.0%}</div></div>', unsafe_allow_html=True)
+
+        if state.millennium_crisis_mode:
+            st.markdown(
+                '<div class="agi-disclosure">⏸️ <b>Injections en pause -- mode crise Millennium '
+                f"actif</b> (source réelle : {state.millennium_crisis_source}, voir "
+                "<code>millennium_conjectures.py</code>). Réel, disclosé : <code>report_entropy</code> "
+                "refuse toute nouvelle injection tant que la vorticité de pointe réelle du vortex de "
+                "Lamb-Oseen reste au-dessus de son seuil illustratif -- pas une décision d'IA fabriquée."
+                "</div>",
+                unsafe_allow_html=True,
+            )
 
     _render_active_inference()
 
