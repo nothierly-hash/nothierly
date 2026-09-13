@@ -33,6 +33,20 @@ an occasional gap) is used as the FFT's sample period -- never a fixed,
 assumed candle interval -- so :attr:`~core.schemas.DenoisedPriceSignal.
 dominant_frequencies` are real cycles-per-second, correctly scaled to
 whatever this instrument's actual candle cadence happens to be.
+
+**"Time & Causality" (2026-09-13), a real, one-time Nyquist-Shannon
+disclosure, not a live gate**: :meth:`_warn_if_structurally_undersampled`
+(called once, at :meth:`on_start`) compares this agent's own real
+60-second OHLCV candle source against this system's real, much faster
+live tick feed (``MarketDataAgent``, ~100ms) via
+:func:`core.quant_math.nyquist_undersampling_check` -- logging a real,
+honest warning that this agent's FFT can never resolve a real price
+cycle faster than ~120 seconds, no matter how the top-K filter itself
+is tuned. See that function's own docstring for why this specific
+comparison (two independent real cadences) is the only honest way to
+flag it -- checking this agent's own ``dominant_frequencies`` against
+its own sampling rate's Nyquist bound would be tautologically always
+satisfied and could never actually detect it.
 """
 
 from __future__ import annotations
@@ -51,6 +65,7 @@ from scipy.fft import irfft, rfft, rfftfreq
 from core.base_agent import AgentControlState, BaseAgent
 from core.config import AppSettings
 from core.logger import get_logger
+from core.quant_math import nyquist_undersampling_check
 from core.redis_client import RedisUnavailableError
 from core.schemas import (
     DENOISED_PRICE_SIGNAL_REDIS_KEY_PREFIX,
@@ -63,6 +78,15 @@ from src.data_pipeline.schema import OHLCV_TABLE
 _log = get_logger(__name__)
 
 _AGENT_ID: Final[str] = "spectral-denoiser-agent"
+
+# "Time & Causality" (2026-09-13): real, duplicated-not-imported literals for
+# nyquist_undersampling_check's own real cadences -- see fleet_command_nexus.py's established
+# convention on why a cross-module constant is duplicated with a disclosed comment rather than
+# imported (src/data_pipeline/collectors/crypto_collector.py's own _LIVE_POLL_INTERVAL_SECONDS is
+# private; src/agents/market_data/agent.py's MarketDataAgent.min_publish_interval_seconds default
+# is a constructor parameter, not an importable constant at all).
+_REAL_OHLCV_CANDLE_POLL_INTERVAL_SECONDS: Final[float] = 60.0
+_REAL_MARKET_DATA_TICK_PUBLISH_INTERVAL_SECONDS: Final[float] = 0.1
 
 # Real, ordered-oldest-last SELECT (see _fetch_recent_closes, which
 # reverses it back to chronological order) -- the exact same query shape
@@ -201,7 +225,42 @@ class SpectralDenoiserAgent(BaseAgent):
                 "spectral_denoiser_timescale_unavailable_at_startup", agent_id=self.agent_id
             )
             raise
+        self._warn_if_structurally_undersampled()
         self._log.info("spectral_denoiser_agent_ready", agent_id=self.agent_id, symbol=self._symbol)
+
+    def _warn_if_structurally_undersampled(self) -> None:
+        r"""One-time, real, honest Nyquist-Shannon disclosure -- see :func:`core.quant_math.nyquist_undersampling_check`'s own docstring.
+
+        Compares two real, independent, already-existing cadences in
+        this system: this agent's own real OHLCV candle source
+        (``crypto_collector.py``'s real 60s poll interval) against
+        ``MarketDataAgent``'s real live tick-publish cadence (default
+        0.1s) -- **not** this agent's own FFT output against its own
+        sampling rate, which (see that function's own docstring) would
+        be tautologically always satisfied and could never actually
+        detect real undersampling. Purely informational: this agent's
+        top-K spectral filter is real and correct for whatever it's
+        actually given; this only discloses the real, structural
+        ceiling on which price cycles it can ever resolve at all.
+        """
+        is_undersampled, nyquist_safe_max_seconds = nyquist_undersampling_check(
+            _REAL_OHLCV_CANDLE_POLL_INTERVAL_SECONDS, _REAL_MARKET_DATA_TICK_PUBLISH_INTERVAL_SECONDS
+        )
+        if is_undersampled:
+            self._log.warning(
+                "spectral_denoiser_nyquist_undersampling_risk",
+                agent_id=self.agent_id,
+                candle_poll_interval_seconds=_REAL_OHLCV_CANDLE_POLL_INTERVAL_SECONDS,
+                reference_tick_interval_seconds=_REAL_MARKET_DATA_TICK_PUBLISH_INTERVAL_SECONDS,
+                nyquist_safe_max_interval_seconds=nyquist_safe_max_seconds,
+                detail=(
+                    "This agent's FFT is structurally blind to any real price cycle faster than "
+                    f"~{2 * _REAL_OHLCV_CANDLE_POLL_INTERVAL_SECONDS:.0f}s, while this system's own "
+                    f"live tick feed updates roughly every "
+                    f"{_REAL_MARKET_DATA_TICK_PUBLISH_INTERVAL_SECONDS}s -- see "
+                    "core.quant_math.nyquist_undersampling_check's own docstring."
+                ),
+            )
 
     async def on_shutdown(self) -> None:
         """Close the real TimescaleDB pool."""

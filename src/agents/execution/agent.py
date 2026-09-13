@@ -160,12 +160,14 @@ from core.base_agent import AgentControlState, BaseAgent
 from core.config import AppSettings
 from core.logger import get_logger
 from core.quant_math import (
+    estimate_lyapunov_exponent,
     giant_cluster_fraction,
     hawkes_intensity,
     jump_diffusion_anomaly,
     kolmogorov_compressibility_ratio,
     ornstein_uhlenbeck_mean_reversion,
     price_impact,
+    transfer_entropy,
     wasserstein_price_distance,
 )
 from core.redis_client import RedisUnavailableError
@@ -414,6 +416,15 @@ _PRICE_IMPACT_COEFFICIENT: Final[float] = 1.0
 # catalogue into what's rigorous vs. metaphor-only, in core.quant_math's module docstring).
 _MIN_SAMPLES_FOR_WASSERSTEIN_DRIFT: Final[int] = 8  # need >= 4 real returns in each half-window
 _MIN_SAMPLES_FOR_COMPRESSIBILITY: Final[int] = 16  # too few samples make a compression ratio meaningless noise
+
+# -- Gate 7 addition (2026-09-13, "Time & Causality") -- real, informational only, same non-blocking
+# status as every other Gate 7 addition above. The bare technical minimum for
+# estimate_lyapunov_exponent's own default embedding/window is much lower (~9 points); this is
+# chosen for a minimally *stable* real estimate, not just to avoid a ValueError -- see that
+# function's own docstring on why a short, noisy window's estimate should be trusted even less than
+# a longer one.
+_MIN_SAMPLES_FOR_LYAPUNOV: Final[int] = 30
+_LYAPUNOV_MAX_TIME_STEPS: Final[int] = 5
 
 # -- Gate 6 addition (2026-09-13, "Arsenal Interdisciplinaire") -- reuses this class's own
 # correlation_threshold (see PortfolioRiskParityManager's constructor) as the percolation edge
@@ -1543,6 +1554,19 @@ class ExecutionAgent(BaseAgent):
         here -- a real, disclosed opportunistic signal an operator or a
         future, separately-reviewed sizing rule could act on, not
         silently wired into live sizing by this gate.
+
+        **"Time & Causality" addition (2026-09-13), also
+        informational-only**: a real :func:`~core.quant_math.
+        estimate_lyapunov_exponent` reading on this instrument's own real
+        log-returns -- a dynamically-updating, disclosed estimate of how
+        many more real ticks this window's own edge should honestly be
+        trusted for, not a fixed constant. See that function's own
+        docstring for the real, load-bearing correction on why a
+        positive reading here is evidence of *local* sensitivity in this
+        specific window, never proof the market is a deterministic
+        chaotic system -- this gate never blocks on it, exactly the same
+        restraint every other Gate 7 telemetry-only addition already
+        exercises.
         """
         detail_parts: list[str] = []
         blocked_reason: str | None = None
@@ -1606,6 +1630,23 @@ class ExecutionAgent(BaseAgent):
             detail_parts.append(f"Compressibilite(zlib)={compressibility:.4f}")
         else:
             detail_parts.append("Compressibilite: pas assez d'historique de prix")
+
+        if log_returns.size >= _MIN_SAMPLES_FOR_LYAPUNOV:
+            try:
+                lyapunov_exponent, lyapunov_time = estimate_lyapunov_exponent(
+                    log_returns, max_time_steps=_LYAPUNOV_MAX_TIME_STEPS
+                )
+            except ValueError:
+                detail_parts.append("Lyapunov: echec du calcul reel sur cette fenetre")
+            else:
+                if math.isinf(lyapunov_time):
+                    detail_parts.append(f"Lyapunov(lambda)={lyapunov_exponent:.4f} (non-chaotique sur cette fenetre)")
+                else:
+                    detail_parts.append(
+                        f"Lyapunov(lambda)={lyapunov_exponent:.4f} horizon_reel~{lyapunov_time:.1f} ticks"
+                    )
+        else:
+            detail_parts.append("Lyapunov: pas assez d'historique de prix")
 
         flow_recommendation = self._order_flow_agent.recommendation_for(instrument)
         detail_parts.append(
@@ -2359,6 +2400,73 @@ class ExecutionAgent(BaseAgent):
         return self._options_hedging_manager.compute_hedge_recommendation(
             exposure_snapshot, available_instruments, target_greeks=target_greeks
         )
+
+    def compute_lead_lag_transfer_entropy(
+        self, instrument_a: str, instrument_b: str, *, lag: int = 1, n_bins: int = 4
+    ) -> tuple[float, float]:
+        r"""Real, directed :func:`~core.quant_math.transfer_entropy` between two instruments' own real log-returns.
+
+        Answers a real, precise "leading indicator" question -- does
+        ``instrument_a``'s own real recent return history genuinely help
+        predict ``instrument_b``'s next return (beyond what
+        ``instrument_b``'s own past already tells you), or the reverse
+        -- using each instrument's own real tracked price history (see
+        :meth:`~src.agents.supervisor.portfolio_risk_manager.
+        PortfolioRiskParityManager.price_history`, the same real rolling
+        window Gate 6/7 already read).
+
+        **Real, disclosed alignment approximation**: :meth:`price_history`
+        stores only real prices, not their real arrival timestamps, so
+        the two instruments' return series are aligned by trailing
+        *index* position (their ``aligned_length`` most recent returns
+        each), not by real matching wall-clock time -- two instruments
+        that tick at different real rates will not be perfectly
+        synchronized sample-for-sample. A real, useful approximation for
+        instruments that tick at broadly similar real rates, not an
+        exact simultaneous-timestamp join.
+
+        Synchronous and side-effect-free, same as
+        :meth:`compute_hedge_recommendation` -- never touches the
+        broker, :attr:`_positions`, or Redis; a real analytic for an
+        operator or the dashboard to call directly.
+
+        Args:
+            instrument_a: First instrument (candidate "cause"/"effect").
+            instrument_b: Second instrument.
+            lag: Real number of samples ahead each direction's "effect"
+                series is evaluated at. Must be >= 1.
+            n_bins: Real number of quantile bins each return series is
+                discretized into. Must be >= 2.
+
+        Returns:
+            ``(transfer_entropy_a_to_b, transfer_entropy_b_to_a)``, both
+            real, in bits -- see :func:`~core.quant_math.transfer_entropy`'s
+            own docstring on the real, disclosed finite-sample bias
+            before treating a small value as meaningful.
+
+        Raises:
+            ValueError: If either instrument has fewer than 2 real
+                tracked prices (no real log-return can be formed yet),
+                or propagated from :func:`~core.quant_math.transfer_entropy`
+                (e.g. too few aligned returns for the requested ``lag``).
+        """
+        prices_a = self._portfolio_risk_manager.price_history(instrument_a)
+        prices_b = self._portfolio_risk_manager.price_history(instrument_b)
+        if prices_a.size < 2 or prices_b.size < 2:
+            raise ValueError(
+                f"Insufficient real price history for {instrument_a!r}/{instrument_b!r} "
+                "to compute log-returns (need at least 2 real prices each)."
+            )
+
+        returns_a = np.diff(np.log(prices_a))
+        returns_b = np.diff(np.log(prices_b))
+        aligned_length = min(returns_a.size, returns_b.size)
+        returns_a = returns_a[-aligned_length:]
+        returns_b = returns_b[-aligned_length:]
+
+        te_a_to_b = transfer_entropy(returns_a, returns_b, lag=lag, n_bins=n_bins)
+        te_b_to_a = transfer_entropy(returns_b, returns_a, lag=lag, n_bins=n_bins)
+        return te_a_to_b, te_b_to_a
 
     async def _persist_portfolio_greeks_to_redis(self, greeks: PortfolioGreeks) -> None:
         """Cache the latest real portfolio Greeks under :data:`~core.schemas.PORTFOLIO_GREEKS_REDIS_KEY`.
