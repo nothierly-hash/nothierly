@@ -5,11 +5,27 @@ modes and its untrained-skeleton fallback: load a real
 ``torch.jit.script``-exported policy (see :func:`scripts.train_ppo.
 export_model`) if one exists, or fall back to a freshly-initialized,
 untrained :class:`~src.rl.networks.ActorCritic` -- callable via the exact
-same :meth:`RLPolicyModel.predict_action` API either way, so this
-project's own no-training-pipeline-run-yet state (true as of this
-writing: no PPO policy has actually been exported) is an honest "no
-opinion" rather than a crash or a confident-looking but meaningless
-prediction.
+same :meth:`RLPolicyModel.predict_action` API either way, so a missing
+policy file is an honest "no opinion" rather than a crash or a
+confident-looking but meaningless prediction.
+
+**Real update (2026-09-13)**: :mod:`scripts.train_ppo` has in fact been
+run -- 4 real ``torch.jit.script``-exported checkpoints exist under
+``models/`` (trained 2026-09-02). ``scripts/run_backend.py`` now passes
+the latest one to every real :class:`~src.agents.rl_signal.agent.
+RlSignalAgent` it constructs (see that script's own
+``_resolve_rl_policy_model_path``), closing a real, found gap: the
+training pipeline had produced real artifacts that were sitting unused
+on disk while production silently kept running the untrained skeleton.
+No live-trading accuracy/edge claim is made for this checkpoint --
+confirmed only that it loads correctly against the current
+:class:`~src.rl.networks.ActorCritic` architecture and produces a valid,
+deterministic action-probability distribution; a real edge claim would
+need actual backtesting this project has not run against this specific
+checkpoint (contrast :mod:`research.evaluate_apprentice`, which does run
+that real evaluation, but against a separate, research-only policy).
+Any caller (e.g. a test) that constructs this class directly with
+``model_path=None`` still gets the honest untrained skeleton, unchanged.
 """
 
 from __future__ import annotations

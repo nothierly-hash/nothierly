@@ -148,6 +148,51 @@ def _resolve_supervisor_model_paths() -> tuple[Path | None, Path | None]:
     )
     return None, None
 
+
+# Real, trained artifact (scripts/train_ppo.py, trained 2026-09-02 --
+# see that script's own module docstring for the PPO+GAE pipeline).
+# Real, disclosed gap this closes: scripts.train_ppo has in fact been
+# run (4 real torch.jit.script-exported checkpoints exist under
+# models/), but this backend never passed model_path to RlSignalAgent,
+# so it always ran RLPolicyModel's honest untrained skeleton (uniform
+# ~50/50/random action preference, no real trained knowledge) despite a
+# real trained policy sitting on disk unused. Wiring this in is the one
+# thing that was missing, not a change to the pipeline itself -- the
+# exact same shape of fix _resolve_supervisor_model_paths already made
+# for the XGBoost side. The latest (most recently trained) of the 4 real
+# checkpoints is used; re-run scripts/train_ppo.py and update this
+# filename to retrain on more recent data.
+#
+# No accuracy/live-PnL claim is made for this checkpoint -- confirmed
+# only that it loads correctly against the current ActorCritic
+# architecture and produces a valid, deterministic action-probability
+# distribution (see the manual verification this session's own notes
+# describe); an actual edge claim would need real backtesting this
+# project has not run against this exact checkpoint (see research/
+# evaluate_apprentice.py for what that real evaluation looks like on
+# the separate, research-only apprentice policy).
+_RL_POLICY_MODEL_PATH: Final[Path] = Path(__file__).resolve().parent.parent / "models" / "ppo_policy_20260902_110854.pt"
+
+
+def _resolve_rl_policy_model_path() -> Path | None:
+    """The real PPO policy path if it exists on disk, else ``None`` (the honest untrained-skeleton fallback).
+
+    ``torch.jit.load`` raises on a missing/corrupt file (unlike
+    ``RLPolicyModel``'s own ``model_path=None`` fallback) -- checking
+    existence here turns "file not found" into the same honest
+    untrained-skeleton fallback instead of crashing this whole backend
+    over one missing optional artifact (e.g. a redeploy whose build
+    context didn't carry ``models/`` this time), the same real reasoning
+    :func:`_resolve_supervisor_model_paths` already applies.
+    """
+    if _RL_POLICY_MODEL_PATH.exists():
+        return _RL_POLICY_MODEL_PATH
+    _log.warning(
+        "rl_policy_model_artifact_missing_using_untrained_skeleton",
+        model_path=str(_RL_POLICY_MODEL_PATH),
+    )
+    return None
+
 # Every instrument the signal/execution agents evaluate. Forex
 # instruments (OANDA-style, underscore) and crypto instruments
 # (ccxt.pro-native, slash) intentionally use each venue's own symbol
@@ -257,6 +302,7 @@ async def main() -> None:
     # self._last_prices) is what makes that safe -- see that class's
     # module docstring.
     supervisor_model_path, supervisor_scaler_path = _resolve_supervisor_model_paths()
+    rl_policy_model_path = _resolve_rl_policy_model_path()
 
     agents: list[
         MarketDataAgent
@@ -305,6 +351,7 @@ async def main() -> None:
         *(
             RlSignalAgent(
                 instrument,
+                model_path=rl_policy_model_path,
                 manage_own_signals=False,
                 zmq_context=shared_zmq_context,
                 manage_own_redis=False,

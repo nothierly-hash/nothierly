@@ -35,6 +35,7 @@ import numpy as np
 import numpy.typing as npt
 
 from core.logger import get_logger
+from core.quant_math import denoise_correlation_matrix_mp
 
 _log = get_logger(__name__)
 
@@ -97,6 +98,11 @@ class PortfolioRiskParityManager:
         self._correlated_exposure_pct = correlated_exposure_pct
         self._price_history: dict[str, deque[float]] = {}
 
+    @property
+    def correlation_threshold(self) -> float:
+        """This instance's real, configured correlation threshold -- see the constructor's own docstring."""
+        return self._correlation_threshold
+
     def record_price(self, instrument: str, price: float) -> None:
         """Feed ``instrument``'s latest price into its rolling history.
 
@@ -115,6 +121,20 @@ class PortfolioRiskParityManager:
     def has_sufficient_history(self, instrument: str) -> bool:
         """Whether ``instrument`` has enough recorded prices to compute a return series."""
         return len(self._price_history.get(instrument, ())) >= 3
+
+    def price_history(self, instrument: str) -> npt.NDArray[np.float64]:
+        """Real recorded price history for ``instrument``, oldest-first.
+
+        A read-only copy of the exact same rolling window
+        :meth:`record_price`/:meth:`compute_correlation` already
+        maintain -- for a caller needing the raw series itself (e.g.
+        :class:`~src.agents.execution.agent.ExecutionAgent`'s Gate 7,
+        which reuses this real history rather than tracking a second,
+        duplicate one), not just this class's own correlation/ERC
+        methods. Empty (not an error) if ``instrument`` has never been
+        recorded.
+        """
+        return np.array(self._price_history.get(instrument, ()), dtype=np.float64)
 
     def _log_returns(self, instrument: str) -> npt.NDArray[np.float64]:
         """Log-returns of ``instrument``'s recorded price history, oldest-recorded-first."""
@@ -257,6 +277,7 @@ class PortfolioRiskParityManager:
         *,
         max_iterations: int = 200,
         tolerance: float = 1e-8,
+        denoise: bool = True,
     ) -> dict[str, float]:
         """Equal Risk Contribution (ERC) capital weights across ``instruments``.
 
@@ -273,6 +294,23 @@ class PortfolioRiskParityManager:
         repeated until every contribution is within ``tolerance`` of
         equal or ``max_iterations`` is reached.
 
+        **Real Random Matrix Theory spectral cleaning (2026-09-13,
+        "Arsenal Interdisciplinaire")**: with ``denoise=True`` (the
+        default), the *correlation* matrix is real-cleaned via
+        :func:`core.quant_math.denoise_correlation_matrix_mp` before its
+        variances are reattached to build the covariance matrix ERC
+        actually optimizes over -- an uncleaned sample correlation matrix
+        estimated from a realistically short window (this class's own
+        ``lookback_window``, often not much larger than ``instruments``'
+        count) is otherwise dominated by pure estimation noise, which ERC
+        would then treat as real diversification opportunity. Silently
+        skipped (falls back to the raw, uncleaned correlation matrix, not
+        an error) when there isn't enough real shared history for the
+        Marchenko-Pastur bound to apply (see that function's own
+        ``n_samples >= n_assets`` requirement) -- a real, honest degrade
+        for a small ``instruments`` list or a short history window,
+        exactly this class's own established fail-safe convention.
+
         Args:
             instruments: Which instruments to weight. Every one must
                 have sufficient price history (see
@@ -281,6 +319,10 @@ class PortfolioRiskParityManager:
             max_iterations: Maximum fixed-point iterations.
             tolerance: Convergence threshold on the largest weight
                 change between iterations.
+            denoise: Whether to apply the real Marchenko-Pastur cleaning
+                above. ``True`` by default; set ``False`` to reproduce
+                this method's pre-2026-09-13 behavior exactly (the raw
+                sample correlation matrix, uncleaned).
 
         Returns:
             ``{instrument: weight}``, weights summing to ``1.0``.
@@ -295,25 +337,31 @@ class PortfolioRiskParityManager:
             raise ValueError("instruments must have at least 2 entries.")
 
         n = len(instruments)
-        covariance_matrix = np.zeros((n, n), dtype=np.float64)
+        correlation_matrix = np.eye(n, dtype=np.float64)
+        variances = np.zeros(n, dtype=np.float64)
+        min_samples = None
         for i in range(n):
-            for j in range(i, n):
-                if i == j:
-                    returns = self._log_returns(instruments[i])
-                    if returns.size < 2:
-                        raise InsufficientPriceHistoryError(
-                            f"Not enough price history for {instruments[i]!r}."
-                        )
-                    variance = float(np.var(returns, ddof=1))
-                else:
-                    correlation = self.compute_correlation(instruments[i], instruments[j])
-                    returns_i = self._log_returns(instruments[i])
-                    returns_j = self._log_returns(instruments[j])
-                    std_i = float(np.std(returns_i, ddof=1))
-                    std_j = float(np.std(returns_j, ddof=1))
-                    variance = correlation * std_i * std_j
-                covariance_matrix[i, j] = variance
-                covariance_matrix[j, i] = variance
+            returns_i = self._log_returns(instruments[i])
+            if returns_i.size < 2:
+                raise InsufficientPriceHistoryError(f"Not enough price history for {instruments[i]!r}.")
+            variances[i] = float(np.var(returns_i, ddof=1))
+            min_samples = returns_i.size if min_samples is None else min(min_samples, returns_i.size)
+            for j in range(i + 1, n):
+                correlation = self.compute_correlation(instruments[i], instruments[j])
+                correlation_matrix[i, j] = correlation
+                correlation_matrix[j, i] = correlation
+
+        if denoise:
+            try:
+                correlation_matrix = denoise_correlation_matrix_mp(correlation_matrix, min_samples or 0)
+            except ValueError as exc:
+                _log.debug(
+                    "risk_parity_mp_denoise_skipped_insufficient_samples",
+                    n_assets=n, min_samples=min_samples, error=str(exc),
+                )
+
+        std_devs = np.sqrt(variances)
+        covariance_matrix = correlation_matrix * np.outer(std_devs, std_devs)
 
         weights = np.full(n, 1.0 / n, dtype=np.float64)
         for _ in range(max_iterations):

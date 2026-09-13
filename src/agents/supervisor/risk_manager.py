@@ -22,7 +22,7 @@ import numpy as np
 import numpy.typing as npt
 
 from core.logger import get_logger
-from core.quant_math import Z_SCORES_BY_CONFIDENCE, parametric_var
+from core.quant_math import Z_SCORES_BY_CONFIDENCE, evt_var, parametric_var
 from core.schemas import OrderBookSnapshot
 
 _log = get_logger(__name__)
@@ -148,6 +148,79 @@ class RiskManager:
         var = parametric_var(log_returns, self._confidence_level, position_value)
         _log.debug(
             "var_calculated",
+            symbol=symbol,
+            confidence_level=self._confidence_level,
+            position_value=position_value,
+            var=var,
+        )
+        return var
+
+    def calculate_var_evt(
+        self,
+        symbol: str,
+        position_value: float,
+        *,
+        threshold_percentile: float = 0.90,
+        min_exceedances: int = 10,
+    ) -> float:
+        """Estimate Value at Risk via Extreme Value Theory (Peaks-Over-Threshold/GPD) -- no Gaussian assumption.
+
+        A real, additional VaR estimate alongside :meth:`calculate_var`,
+        not a replacement for it -- see :func:`core.quant_math.evt_var`'s
+        own docstring for the full method (McNeil & Frey, 1999) and why
+        it doesn't share :meth:`calculate_var`'s Gaussian-returns
+        assumption.
+
+        **Real prerequisite, disclosed**: this needs substantially more
+        history than :meth:`calculate_var` does -- fitting a trustworthy
+        tail distribution needs real exceedances (see
+        ``min_exceedances``), which this class's own default
+        ``lookback_window`` (``30``) essentially never provides at the
+        default ``threshold_percentile`` (``0.90`` of 30 samples leaves
+        only ~3 tail points). Construct this :class:`RiskManager` with a
+        real, substantially larger ``lookback_window`` (e.g. ``200+``) to
+        actually use this method -- :meth:`calculate_var` remains fully
+        usable at the smaller default either way.
+
+        Args:
+            symbol: Trading pair symbol to compute VaR for.
+            position_value: Notional value of the position being risk-
+                assessed. Must not be negative.
+            threshold_percentile: See :func:`core.quant_math.evt_var`.
+            min_exceedances: See :func:`core.quant_math.evt_var`.
+
+        Returns:
+            The estimated maximum loss, in ``position_value``'s currency
+            units, at this instance's configured confidence level.
+
+        Raises:
+            InsufficientHistoryError: If fewer than 3 snapshots have been
+                recorded for ``symbol``.
+            ValueError: If ``position_value`` is negative, or (propagated
+                from :func:`core.quant_math.evt_var`) too few real
+                exceedances exist over the fitted threshold for a
+                trustworthy tail estimate -- see the real prerequisite
+                above.
+        """
+        if position_value < 0:
+            raise ValueError("position_value must not be negative.")
+        if not self.has_sufficient_history(symbol):
+            raise InsufficientHistoryError(
+                f"Not enough order book history for {symbol!r} to compute VaR "
+                f"(have {len(self._mid_price_history.get(symbol, ()))}, need >= 3)."
+            )
+
+        prices: npt.NDArray[np.float64] = np.array(
+            self._mid_price_history[symbol], dtype=np.float64
+        )
+        log_returns = np.diff(np.log(prices))
+
+        var = evt_var(
+            log_returns, self._confidence_level, position_value,
+            threshold_percentile=threshold_percentile, min_exceedances=min_exceedances,
+        )
+        _log.debug(
+            "var_evt_calculated",
             symbol=symbol,
             confidence_level=self._confidence_level,
             position_value=position_value,

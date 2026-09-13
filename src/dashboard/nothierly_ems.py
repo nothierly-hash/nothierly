@@ -117,6 +117,9 @@ render_theme_css(mode)
 # this app didn't have yet when this grouping was introduced; each is added to
 # its section as its own real page lands, not stubbed in ahead of time.
 pages = {
+    "🛰️ Fleet Command Nexus": [
+        st.Page(str(_PAGES_DIR / "fleet_command_nexus.py"), title="Fleet Command Nexus", icon="🛰️", default=True),
+    ],
     "🔴 Autonomous Trading": [
         st.Page(str(_PAGES_DIR / "autonomous_command_center.py"), title="Autonomous Command Center", icon="🔴"),
         st.Page(str(_PAGES_DIR / "bilan.py"), title="Bilan", icon="💰"),
@@ -129,7 +132,7 @@ pages = {
         st.Page(str(_PAGES_DIR / "swarm_command_center.py"), title="Swarm Command Center", icon="🕸️"),
     ],
     "📊 Execution & Routing": [
-        st.Page(str(_PAGES_DIR / "command_center.py"), title="Command Center", icon="📊", default=True),
+        st.Page(str(_PAGES_DIR / "command_center.py"), title="Command Center", icon="📊"),
         st.Page(str(_PAGES_DIR / "liquidity_routing.py"), title="Liquidity Routing", icon="🔌"),
         st.Page(str(_PAGES_DIR / "smart_order_router_radar.py"), title="SOR Radar", icon="📡"),
         st.Page(str(_PAGES_DIR / "internal_dark_pool.py"), title="Internal Dark Pool", icon="🌑"),

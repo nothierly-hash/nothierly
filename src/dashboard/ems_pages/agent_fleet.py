@@ -34,6 +34,14 @@ label from a real Gaussian HMM fit on real BTCUSDT bars
 benchmark, or a real DoWhy causal-effect estimate on synthetic data
 with known ground truth -- never a number that didn't just get
 computed live.
+
+**Liaison avec Fleet Command Nexus (2026-09-13)** : un petit panneau en haut de cette page lit le vrai
+``background_snapshot()``/``redis_health()`` de ``core_daemons.LeviathanDaemonManager`` (Protocole
+"DeFi Ghost Daemons", entièrement simulé -- voir son propre docstring) et pointe vers cette page via
+``st.page_link``. Liaison réelle, bidirectionnelle en observation (Fleet Command Nexus lit en retour
+les vraies clés heartbeat/état de contrôle de cette page), mais strictement à sens unique côté écriture :
+seule cette page publie/écrit sur ``AGENT_CONTROL_CHANNEL_PREFIX``/``AGENT_CONTROL_STATE_REDIS_KEY_
+PREFIX`` -- le veto de risque simulé de Fleet Command Nexus ne pilote jamais un agent réel.
 """
 
 from __future__ import annotations
@@ -51,6 +59,7 @@ from core.schemas import (
     HEARTBEAT_REDIS_KEY_PREFIX,
     LLM_STATUS_REDIS_KEY,
 )
+from src.dashboard.core_daemons import get_manager as get_ghost_daemon_manager
 from src.dashboard.ems_pages._shared import get_redis_client, safe_get
 from src.dashboard.theme import status_badge
 
@@ -107,6 +116,17 @@ st.title("🤖 Agent Fleet Command")
 st.caption("Statut réel de chaque micro-agent, et contrôle réel LIVE / SHADOW / OFF -- voir core/base_agent.py.")
 
 r = get_redis_client()
+
+with st.container(border=True):
+    st.caption("🔗 Liaison réelle avec Fleet Command Nexus (lecture seule -- voir docstring de ce module)")
+    _ghost_manager = get_ghost_daemon_manager()
+    _ghost_bg = _ghost_manager.background_snapshot()
+    _ghost_redis_ok, _ghost_redis_rtt = _ghost_manager.redis_health()
+    col_ghost_redis, col_ghost_zmq, col_ghost_tick = st.columns(3)
+    col_ghost_redis.metric("Redis Ghost Daemons (PING réel)", f"{_ghost_redis_rtt:.2f} ms" if _ghost_redis_ok else "HORS LIGNE")
+    col_ghost_zmq.metric("Bus ZMQ isolé (Protocole Ghost Daemons)", "LIÉ" if _ghost_bg["zmq_bound"] else "NON LIÉ")
+    col_ghost_tick.metric("Tick swarm (16 daemons, simulé)", _ghost_bg["tick"])
+    st.page_link("ems_pages/fleet_command_nexus.py", label="Ouvrir Fleet Command Nexus (audit complet, simulation mathématique)", icon="🛰️")
 
 st.subheader("🟢 Tier 1 -- Flotte de production")
 

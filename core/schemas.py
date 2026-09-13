@@ -219,6 +219,18 @@ class MarketMetrics(BaseModel):
             offline training's future-return labels, ...) has any way to
             reconstruct an absolute price level -- spread/imbalance alone
             describe the book's *shape*, not *where* it is.
+        top_of_book_liquidity: Real summed volume across every level of
+            both sides of the underlying snapshot (``sum(bid volumes) +
+            sum(ask volumes)``), added for :class:`~src.agents.execution.
+            agent.ExecutionAgent`'s Gate 7 ("StochasticCore") price-impact
+            model -- see :func:`core.quant_math.price_impact`'s own
+            docstring on why a real liquidity reading (not a stand-in
+            proxy) matters there. ``0.0`` (the default) means "unknown,"
+            not "zero real liquidity" -- only a caller building this via
+            :meth:`from_order_book_snapshot` (i.e. from a real snapshot)
+            ever sets a genuine positive value; anything constructing this
+            model directly (every pre-existing call site, including every
+            test in this repo) keeps working unchanged.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -228,6 +240,7 @@ class MarketMetrics(BaseModel):
     spread: float = Field(ge=0)
     order_book_imbalance: float = Field(ge=-1, le=1)
     mid_price: float = Field(gt=0)
+    top_of_book_liquidity: float = Field(ge=0, default=0.0)
 
     @field_validator("timestamp")
     @classmethod
@@ -255,6 +268,7 @@ class MarketMetrics(BaseModel):
             spread=spread,
             order_book_imbalance=imbalance,
             mid_price=mid_price,
+            top_of_book_liquidity=bid_volume + ask_volume,
         )
 
 
@@ -561,6 +575,11 @@ TOPOLOGY_FRAGILITY_ALERT_TOPIC: Final[str] = "TOPOLOGY_FRAGILITY_ALERT"
 
 FEATURES_TOPIC: Final[str] = "FEATURES"
 
+# Topic src.agents.spectral_denoiser.agent.SpectralDenoiserAgent publishes each instrument's latest
+# FFT-denoised price signal on -- see DenoisedPriceSignal below for the payload shape. No consumer
+# wired in yet (a new, standalone signal source, not yet required by ExecutionAgent's consensus).
+DENOISED_PRICE_SIGNAL_TOPIC: Final[str] = "DENOISED_PRICE_SIGNAL"
+
 # =============================================================================
 # Swarm AI -- Scout / Analyst / Risk Gate reactive pipeline (scout_agent.py /
 # analyst_agent.py / risk_gate_agent.py). ZeroMQ carries the real instant
@@ -642,6 +661,24 @@ def spot_price_redis_key(base_symbol: str, quote_symbol: str) -> str:
 # src.agents.supervisor.feature_confirmation and FeatureStore's own
 # docstring for why this exists alongside the ZMQ publish above.
 FEATURE_VECTOR_REDIS_KEY_PREFIX: Final[str] = "feature_vector:"
+
+# Redis STRING key prefix (+ instrument), TTL'd, SpectralDenoiserAgent
+# persists its latest DenoisedPriceSignal under -- same "ZMQ publish +
+# Redis cache, both real, neither the source of truth for the other"
+# pattern as FEATURE_VECTOR_REDIS_KEY_PREFIX above (a late poller reads
+# this; a live subscriber reads the ZMQ publish; both see the same data).
+DENOISED_PRICE_SIGNAL_REDIS_KEY_PREFIX: Final[str] = "denoised_price_signal:"
+
+# Redis STRING key prefix (+ instrument), TTL'd, ExecutionAgent.
+# compute_optimal_trajectory persists its latest real OptimalExecutionSchedule
+# under -- Redis-only (see that model's own docstring on why this isn't
+# also a ZMQ publish), read by a real dashboard impact-curve chart.
+OPTIMAL_EXECUTION_SCHEDULE_REDIS_KEY_PREFIX: Final[str] = "optimal_execution_schedule:"
+
+# Redis STRING key (no per-instrument suffix -- one real, single portfolio-level snapshot), TTL'd,
+# ExecutionAgent.compute_portfolio_greeks persists its latest real PortfolioGreeks under --
+# Redis-only, same reasoning as OPTIMAL_EXECUTION_SCHEDULE_REDIS_KEY_PREFIX above.
+PORTFOLIO_GREEKS_REDIS_KEY: Final[str] = "nothierly_portfolio_greeks"
 
 # Redis key prefix (+ agent_id) core.base_agent.BaseAgent.run's tick loop
 # writes a fresh timestamp under, with a short TTL, every tick -- a
@@ -948,3 +985,209 @@ class FeatureVector(BaseModel):
     bb_upper: float = Field(ge=-1, le=1)
     bb_lower: float = Field(ge=-1, le=1)
     atr: float = Field(ge=-1, le=1)
+
+
+class DenoisedPriceSignal(BaseModel):
+    """One instrument's latest real FFT-denoised close-price window.
+
+    Published by :class:`~src.agents.spectral_denoiser.agent.
+    SpectralDenoiserAgent` on :data:`DENOISED_PRICE_SIGNAL_TOPIC`, and
+    persisted under :data:`DENOISED_PRICE_SIGNAL_REDIS_KEY_PREFIX` -- the
+    same "ZMQ publish + Redis cache" pairing :class:`FeatureVector`
+    already establishes.
+
+    **This is the wire/cache shape, not the PyTorch tensor itself**:
+    :meth:`~src.agents.spectral_denoiser.agent.SpectralDenoiserAgent.
+    _to_feature_tensor` builds a real ``torch.Tensor`` from
+    ``denoised_window`` for any in-process caller doing feature
+    engineering directly against this agent -- but ZMQ/Redis only ever
+    carry JSON (the same real serialization boundary every other
+    schema/topic in this module already has), so a downstream consumer
+    reading this off the wire reconstructs its own tensor from the plain
+    float list here (``torch.tensor(signal.denoised_window,
+    dtype=torch.float32)``), never receives one directly.
+
+    Attributes:
+        instrument: Which instrument this denoised window is for.
+        timestamp: Unix epoch seconds this signal was computed at.
+        denoised_window: The most recent ``publish_window_size`` real
+            denoised close prices, chronological order (oldest first) --
+            not the full FFT input window, to keep this message small for
+            low-latency delivery; a consumer needing the full window
+            reads TimescaleDB directly, the same real source this agent
+            itself reads from.
+        dominant_frequencies: Real dominant frequency components (cycles
+            per second, derived from the real observed candle spacing --
+            never an assumed fixed interval), the ``top_k_frequencies``
+            most energetic components of the real FFT, descending by
+            magnitude.
+        dominant_magnitudes: Each entry in ``dominant_frequencies``'s real
+            spectral magnitude, same order/length.
+        noise_energy_removed_pct: Real fraction (0-100) of total spectral
+            energy discarded by the top-K low-pass filter -- how much of
+            the original signal was judged "noise" this cycle, not a
+            fabricated confidence figure.
+        window_size: How many real candles the FFT was computed over this
+            cycle (the real input window size, which can be smaller than
+            the agent's configured ``lookback_candles`` early in an
+            instrument's history).
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    instrument: str = Field(min_length=1)
+    timestamp: float = Field(gt=0)
+    denoised_window: list[float] = Field(min_length=1)
+    dominant_frequencies: list[float] = Field(default_factory=list)
+    dominant_magnitudes: list[float] = Field(default_factory=list)
+    noise_energy_removed_pct: float = Field(ge=0, le=100)
+    window_size: int = Field(gt=0)
+
+    @model_validator(mode="after")
+    def _validate_dominant_arrays_same_length(self) -> DenoisedPriceSignal:
+        if len(self.dominant_frequencies) != len(self.dominant_magnitudes):
+            raise ValueError("dominant_frequencies and dominant_magnitudes must be the same length.")
+        return self
+
+
+class OptimalExecutionSchedule(BaseModel):
+    """One real Almgren-Chriss execution schedule + impact cost curve for a proposed meta-order.
+
+    Cached under :data:`OPTIMAL_EXECUTION_SCHEDULE_REDIS_KEY_PREFIX` by
+    :meth:`~src.agents.execution.agent.ExecutionAgent.
+    compute_optimal_trajectory` -- the wire/cache shape of
+    :class:`~src.agents.supervisor.optimal_execution_scheduler.
+    ExecutionSchedule`, the same "internal dataclass vs. JSON-serializable
+    cache model" split :class:`DenoisedPriceSignal` already establishes.
+    Not published on ZMQ (unlike every other schema in this module) --
+    this is a computed planning artifact for an operator/dashboard to
+    consult, not an opinion another agent consensus-arbitrates over.
+
+    Attributes:
+        instrument: Which instrument this schedule was computed for.
+        timestamp: Unix epoch seconds this schedule was computed at.
+        order_size: The real total quantity this schedule was computed
+            for.
+        execution_horizon_seconds: The real total time this schedule
+            spans.
+        trajectory: Real remaining-inventory curve (``n_steps + 1``
+            points).
+        trade_sizes: Real per-slice trade quantity (``n_steps`` points),
+            after the real participation-rate cap.
+        temporary_impact: Real per-slice temporary price impact
+            (``n_steps`` points).
+        permanent_impact: Real cumulative permanent price impact
+            (``n_steps`` points).
+        was_participation_capped: Whether real expected volume was too
+            thin to complete ``order_size`` within the horizon at the
+            uncapped rate -- see :class:`~src.agents.supervisor.
+            optimal_execution_scheduler.ExecutionSchedule`'s own
+            docstring.
+        total_estimated_temporary_cost: See that same class's docstring.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    instrument: str = Field(min_length=1)
+    timestamp: float = Field(gt=0)
+    order_size: float = Field(gt=0)
+    execution_horizon_seconds: float = Field(gt=0)
+    trajectory: list[float] = Field(min_length=2)
+    trade_sizes: list[float] = Field(min_length=1)
+    temporary_impact: list[float] = Field(min_length=1)
+    permanent_impact: list[float] = Field(min_length=1)
+    was_participation_capped: bool
+    total_estimated_temporary_cost: float = Field(ge=0)
+
+
+class OptionContract(BaseModel):
+    """A real options contract specification -- not a live market/broker connection.
+
+    Real, disclosed execution boundary: this project has no real options
+    broker connection (OANDA is FX/CFD spot only) -- see
+    :class:`~src.agents.supervisor.options_hedging_manager.
+    OptionsHedgingManager`'s own module docstring for why every position
+    against this contract is necessarily a simulated/paper fill, the same
+    honest MOCK_MODE/SHADOW convention every other broker gap in this
+    project already discloses, never a real order.
+
+    Attributes:
+        underlying: The real underlying instrument (e.g. ``"BTC/USDT"``).
+        strike: Real strike price. Must be positive.
+        expiry: Real, timezone-aware expiry timestamp. Must be in the future.
+        option_type: ``"call"`` or ``"put"``.
+        contract_size: Real underlying units per contract (e.g. Deribit
+            crypto options are typically 1 underlying unit per contract).
+            Must be positive.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    underlying: str = Field(min_length=1)
+    strike: float = Field(gt=0)
+    expiry: datetime
+    option_type: Literal["call", "put"]
+    contract_size: float = Field(gt=0, default=1.0)
+
+    @field_validator("expiry")
+    @classmethod
+    def _validate_expiry(cls, value: datetime) -> datetime:
+        return _require_timezone_aware(value)
+
+
+class OptionPosition(BaseModel):
+    """One real (necessarily paper-filled) options position -- see :class:`OptionContract`'s own docstring.
+
+    Attributes:
+        contract: The real contract specification.
+        quantity: Real signed number of contracts (positive = long,
+            negative = short). Must not be zero.
+        entry_premium: Real per-contract premium at entry (from a real
+            Black-Scholes evaluation against real market inputs at the
+            time -- see :meth:`~src.agents.supervisor.
+            options_hedging_manager.OptionsHedgingManager.open_position`).
+            Must be ``>= 0``.
+        entry_timestamp: Unix epoch seconds this position was opened at.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    contract: OptionContract
+    quantity: float
+    entry_premium: float = Field(ge=0)
+    entry_timestamp: float = Field(gt=0)
+
+    @field_validator("quantity")
+    @classmethod
+    def _validate_quantity_nonzero(cls, value: float) -> float:
+        if value == 0:
+            raise ValueError("quantity must not be zero.")
+        return value
+
+
+class PortfolioGreeks(BaseModel):
+    """Real aggregate Greeks across every tracked position (options + underlying spot/CFD).
+
+    Cached under :data:`PORTFOLIO_GREEKS_REDIS_KEY_PREFIX` -- Redis-only,
+    like :class:`OptimalExecutionSchedule`, not a ZMQ-published opinion.
+
+    Attributes:
+        timestamp: Unix epoch seconds this snapshot was computed at.
+        delta: Real aggregate delta (a real spot/CFD position of size
+            :math:`x` contributes exactly :math:`x` -- its own real,
+            trivial "delta").
+        gamma: Real aggregate gamma (spot/CFD positions contribute
+            exactly ``0`` -- gamma is a real second-derivative property
+            options alone carry in this system).
+        vega: Real aggregate vega (same real spot/CFD ``0``-contribution
+            reasoning as gamma).
+        theta: Real aggregate theta.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    timestamp: float = Field(gt=0)
+    delta: float
+    gamma: float
+    vega: float
+    theta: float

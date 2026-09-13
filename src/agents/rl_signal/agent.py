@@ -12,8 +12,10 @@ agent.ExecutionAgent`'s docstring for why two independent decision-makers
 never execute directly.
 
 **Position-tracking gap** (documented, not fixed here): the PPO policy
-was trained (or will be, once :mod:`scripts.train_ppo` has actually been
-run) against an observation that includes the *current position* --
+was trained (:mod:`scripts.train_ppo` has in fact been run -- see
+:mod:`~src.agents.rl_signal.policy_model`'s own "Real update" note on the
+real checkpoint now wired into ``scripts/run_backend.py``) against an
+observation that includes the *current position* --
 :class:`~src.rl.trading_env.MarketEnv`'s ``0.0``/``1.0`` convention. This
 live agent has no execution-tracked position of its own to report (only
 :class:`~src.agents.execution.agent.ExecutionAgent` knows that), so it
