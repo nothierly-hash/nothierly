@@ -314,13 +314,46 @@ class XgboostSignalAgent(BaseAgent):
             await self._shutdown()
 
     async def _run_polling_loop(self) -> None:
-        """The real fetch-decide-publish loop -- a separate coroutine (not inlined in :meth:`run`) so it can run alongside :meth:`~core.base_agent.BaseAgent._listen_for_control_commands`."""
+        """The real fetch-decide-publish loop -- a separate coroutine (not inlined in :meth:`run`) so it can run alongside :meth:`~core.base_agent.BaseAgent._listen_for_control_commands`.
+
+        **Real bug found live (2026-09-14), during this project's own
+        multi-hour shadow-run stress test**: a real, transient Redis
+        contention spike during the concurrent 17-agent startup burst
+        made two live instances' very first ``_fetch_latest_state()``
+        call see ``redis_latency_ms=inf`` -- a real, correctly-detected
+        condition -- but the *old* behavior here (``break``ing out of
+        this loop entirely on :class:`EmergencyStopError`) meant one
+        transient, one-off blip permanently silenced that instance's
+        real signal generation for the rest of the process's life
+        (73+ minutes and counting, confirmed live), with no self-healing
+        and no way for an operator to recover it short of restarting the
+        whole backend. **Not a relaxation of the actual safety
+        condition** -- :meth:`_check_kill_switch`'s own trip conditions
+        are untouched, exactly as strict as before, and the *global*
+        Kill Switch this trips still requires a real human
+        :func:`~core.security.reset_kill_switch` call regardless (see
+        that function's own docstring) -- :class:`~src.agents.execution.
+        agent.ExecutionAgent` still refuses every real order until that
+        happens. This only fixes what happens to *this one instance's
+        own polling loop* afterward: it keeps re-checking every cycle
+        (the same real condition it already re-evaluates for every other
+        exception type below) instead of going permanently dark, so a
+        genuinely transient trip clears itself on the next real, healthy
+        read -- and an instance that was never actually recovered stays
+        silent for exactly as long as the real condition keeps failing,
+        no differently than before.
+        """
         while self._running:
             cycle_started_at = time.monotonic()
             try:
                 await self._run_signal_cycle()
-            except EmergencyStopError:
-                break
+            except EmergencyStopError as exc:
+                self._log.warning(
+                    "xgboost_signal_cycle_skipped_emergency_mode",
+                    agent_id=self.agent_id,
+                    reason=str(exc),
+                    detail="Local Kill Switch condition still active this cycle -- re-checking next cycle, not permanently stopping.",
+                )
             except Exception:
                 self._consecutive_error_count += 1
                 self._log.exception(
@@ -368,6 +401,7 @@ class XgboostSignalAgent(BaseAgent):
 
         # Reaching here means every Kill Switch condition passed.
         self._consecutive_error_count = 0
+        self._emergency_mode = False
 
         if state.market_metrics is None:
             self._log.debug("xgboost_signal_no_market_data_yet", agent_id=self.agent_id)
@@ -556,7 +590,7 @@ class XgboostSignalAgent(BaseAgent):
             raise EmergencyStopError("; ".join(reasons))
 
     async def _trigger_kill_switch(self, reasons: list[str]) -> None:
-        """Enter emergency mode: log critical, trip the global Kill Switch, stop the loop.
+        """Enter emergency mode: log critical, trip the global Kill Switch.
 
         Unlike this agent's previous (chapter 8) design, this no longer
         cancels orders directly -- it has no trading client to cancel
@@ -566,12 +600,30 @@ class XgboostSignalAgent(BaseAgent):
         *any* agent's signal, a stronger and more appropriate reaction
         now that execution is centralized there.
 
+        **Real bug fixed here (2026-09-14, the other half of the same
+        real fix in :meth:`_run_polling_loop`)**: this used to also set
+        ``self._running = False`` directly -- independent of, and
+        completely bypassing, :meth:`_run_polling_loop`'s own
+        ``except EmergencyStopError`` handling. Fixing that ``except``
+        branch alone (so it logs and continues instead of ``break``-ing)
+        was not sufficient on its own: the polling loop's *own*
+        ``while self._running:`` condition still went false on this
+        line the very first time any real trip occurred, ending the
+        loop after exactly one cycle regardless -- confirmed live via a
+        standalone repro (``task.done()`` was already ``True`` after
+        the first trip, with no exception, precisely because of this
+        line). Removed for the identical reason the other half was
+        fixed: this stays a real, correctly-detected trip -- the
+        *global* Kill Switch it trips below is completely unaffected
+        and still requires a real human :func:`~core.security.
+        reset_kill_switch` call regardless of this instance's own
+        ``_running`` state.
+
         Args:
             reasons: Human-readable description of every Kill Switch
                 condition that was met.
         """
         self._emergency_mode = True
-        self._running = False
         self._log.critical(
             "LOCAL_KILL_SWITCH_ACTIVATED",
             agent_id=self.agent_id,
