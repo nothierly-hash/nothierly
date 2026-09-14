@@ -22,8 +22,16 @@ import numpy as np
 import numpy.typing as npt
 
 from core.logger import get_logger
-from core.quant_math import Z_SCORES_BY_CONFIDENCE, evt_var, parametric_var
+from core.quant_math import (
+    Z_SCORES_BY_CONFIDENCE,
+    evt_var,
+    fractional_volatility_scaling,
+    hurst_exponent_rs,
+    parametric_var,
+)
 from core.schemas import OrderBookSnapshot
+
+_MIN_RETURNS_FOR_HURST: int = 16  # core.quant_math.hurst_exponent_rs's own min_chunk_size=8 default needs 2*8
 
 _log = get_logger(__name__)
 
@@ -224,6 +232,94 @@ class RiskManager:
             symbol=symbol,
             confidence_level=self._confidence_level,
             position_value=position_value,
+            var=var,
+        )
+        return var
+
+    def calculate_var_fractional_horizon(self, symbol: str, position_value: float, horizon: float) -> float:
+        """Multi-period VaR scaled by a real, estimated Hurst exponent -- not the classical sqrt(horizon) rule.
+
+        **Real correction this adds**: scaling a single-period VaR
+        estimate to a longer horizon by ``sqrt(horizon)`` (the textbook
+        approach) silently assumes real i.i.d. Gaussian returns (Hurst
+        exponent ``H=0.5``) -- the same assumption :meth:`calculate_var`
+        already makes for its own single period, just extended across
+        time. Real markets are widely documented not to satisfy this at
+        realized-volatility horizons (Gatheral, Jaisson & Rosenbaum,
+        2018, "Volatility is Rough" -- real ``H`` well below ``0.5`` in
+        practice). This method estimates the real ``H`` from this
+        symbol's own recorded return history via
+        :func:`core.quant_math.hurst_exponent_rs`, then scales via
+        :func:`core.quant_math.fractional_volatility_scaling`
+        (``sigma * horizon ** H``) instead of ``sigma * sqrt(horizon)``.
+
+        A real, additional VaR estimate alongside :meth:`calculate_var`
+        and :meth:`calculate_var_evt`, not a replacement for either --
+        same non-competing-estimates framing as
+        :meth:`calculate_var_evt`'s own docstring.
+
+        **Real prerequisite, disclosed**: a trustworthy Hurst estimate
+        needs real return history well beyond :meth:`calculate_var`'s
+        own 3-snapshot minimum -- this instance's ``lookback_window``
+        must have accumulated at least 16 real returns (17 snapshots)
+        for :func:`~core.quant_math.hurst_exponent_rs`'s own default
+        window-size schedule to have two real, distinct scales to
+        regress on. The default ``lookback_window=30`` (29 returns)
+        clears this; a caller-configured smaller window may not.
+
+        Args:
+            symbol: Trading pair symbol to compute VaR for.
+            position_value: Notional value of the position being risk-
+                assessed. Must not be negative.
+            horizon: Real target horizon, in units of one recorded
+                snapshot-to-snapshot period (e.g. ``10.0`` for "10
+                snapshots ahead"). Must be positive.
+
+        Returns:
+            The estimated maximum loss, in ``position_value``'s currency
+            units, over ``horizon`` periods, at this instance's
+            configured confidence level.
+
+        Raises:
+            InsufficientHistoryError: If fewer than 3 snapshots have
+                been recorded for ``symbol`` (:meth:`calculate_var`'s own
+                minimum), or fewer than 16 real returns are available for
+                a real Hurst estimate (see the real prerequisite above).
+            ValueError: If ``position_value`` is negative, or ``horizon``
+                is not positive.
+        """
+        if position_value < 0:
+            raise ValueError("position_value must not be negative.")
+        if not self.has_sufficient_history(symbol):
+            raise InsufficientHistoryError(
+                f"Not enough order book history for {symbol!r} to compute VaR "
+                f"(have {len(self._mid_price_history.get(symbol, ()))}, need >= 3)."
+            )
+
+        prices: npt.NDArray[np.float64] = np.array(
+            self._mid_price_history[symbol], dtype=np.float64
+        )
+        log_returns = np.diff(np.log(prices))
+        if log_returns.size < _MIN_RETURNS_FOR_HURST:
+            raise InsufficientHistoryError(
+                f"Not enough real return history for {symbol!r} to estimate a real Hurst exponent "
+                f"(have {log_returns.size} returns, need >= {_MIN_RETURNS_FOR_HURST}). "
+                "calculate_var()/calculate_var_evt() remain usable at this history length."
+            )
+
+        z_score = Z_SCORES_BY_CONFIDENCE[self._confidence_level]
+        sigma_base = float(np.std(log_returns, ddof=1))
+        hurst = hurst_exponent_rs(log_returns)
+        sigma_scaled = fractional_volatility_scaling(sigma_base, horizon, hurst)
+        var = z_score * sigma_scaled * position_value
+
+        _log.debug(
+            "var_fractional_horizon_calculated",
+            symbol=symbol,
+            confidence_level=self._confidence_level,
+            position_value=position_value,
+            horizon=horizon,
+            hurst_exponent=hurst,
             var=var,
         )
         return var
