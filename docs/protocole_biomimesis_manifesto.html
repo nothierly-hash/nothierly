@@ -1,0 +1,383 @@
+<title>Protocole Biomimesis</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@700;800;900&family=Newsreader:ital,wght@0,400;0,500;0,600;1,400;1,500&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+  :root{
+    --void:#050506;
+    --surface:#0c0c11;
+    --surface-2:#121218;
+    --hairline:rgba(255,255,255,.10);
+    --hairline-2:rgba(255,255,255,.06);
+    --text:#e9eaef;
+    --text-dim:#9098a8;
+    --text-faint:#5a616f;
+    --cyan:#00e5ff;
+    --cyan-dim:rgba(0,229,255,.55);
+    --gold:#e8c468;
+    --blood:#c81e3a;
+    --serif:'Newsreader', ui-serif, Georgia, serif;
+    --display:'Big Shoulders Display', ui-sans-serif, system-ui, sans-serif;
+    --mono:'JetBrains Mono', ui-monospace, 'Consolas', monospace;
+  }
+
+  *{box-sizing:border-box;}
+  html{background:var(--void);}
+  body{
+    background:var(--void);
+    color:var(--text);
+    font-family:var(--serif);
+    font-size:17px;
+    line-height:1.62;
+    -webkit-font-smoothing:antialiased;
+  }
+  ::selection{background:var(--cyan-dim);color:#00151a;}
+
+  a{color:var(--cyan);}
+
+  .sheet{
+    max-width:840px;
+    margin:0 auto;
+    padding:5.5rem 2rem 6rem;
+  }
+
+  /* ---------- Header ---------- */
+  .classhead{
+    display:flex;
+    justify-content:space-between;
+    align-items:baseline;
+    gap:1rem;
+    font-family:var(--mono);
+    font-size:.72rem;
+    letter-spacing:.14em;
+    text-transform:uppercase;
+    color:var(--text-faint);
+    border-bottom:1px solid var(--hairline-2);
+    padding-bottom:.9rem;
+    margin-bottom:3.4rem;
+    flex-wrap:wrap;
+  }
+  .classhead span.dot{color:var(--blood);}
+
+  .masthead{margin-bottom:3.6rem;}
+  .eyebrow{
+    font-family:var(--mono);
+    font-size:.78rem;
+    letter-spacing:.22em;
+    text-transform:uppercase;
+    color:var(--cyan);
+    margin:0 0 1.1rem;
+  }
+  h1{
+    font-family:var(--display);
+    font-weight:900;
+    text-transform:uppercase;
+    font-size:clamp(2.9rem,8vw,5.4rem);
+    line-height:.92;
+    letter-spacing:.005em;
+    text-wrap:balance;
+    margin:0 0 1.3rem;
+    color:#fff;
+  }
+  h1 em{
+    font-style:normal;
+    color:var(--void);
+    background:var(--cyan);
+    padding:0 .12em;
+  }
+  .subhead{
+    font-family:var(--serif);
+    font-style:italic;
+    font-weight:400;
+    font-size:1.28rem;
+    color:var(--text-dim);
+    max-width:34ch;
+    text-wrap:balance;
+  }
+
+  /* ---------- Manifesto ---------- */
+  .manifesto{
+    margin:3.2rem 0 4rem;
+    padding-left:1.6rem;
+    border-left:2px solid var(--hairline);
+  }
+  .manifesto p{
+    max-width:62ch;
+    font-size:1.14rem;
+    color:#d7d9e2;
+    margin:0 0 1.15rem;
+  }
+  .manifesto p:last-child{margin-bottom:0;}
+  .manifesto strong{
+    color:#fff;
+    font-weight:600;
+  }
+  .pull{
+    font-family:var(--display);
+    font-weight:800;
+    text-transform:uppercase;
+    font-size:clamp(1.5rem,3.6vw,2.15rem);
+    line-height:1.12;
+    color:var(--gold);
+    letter-spacing:.005em;
+    margin:2.1rem 0 2.4rem;
+    max-width:20ch;
+    text-wrap:balance;
+  }
+
+  /* ---------- Pulse divider (Hawkes-decay motif) ---------- */
+  .pulse{
+    width:100%;
+    height:34px;
+    display:block;
+    margin:3.4rem 0;
+    opacity:.75;
+  }
+  .pulse path{
+    fill:none;
+    stroke:var(--cyan);
+    stroke-width:1.3;
+    stroke-linecap:round;
+    stroke-linejoin:round;
+  }
+
+  /* ---------- Section label ---------- */
+  .section-label{
+    font-family:var(--mono);
+    font-size:.72rem;
+    letter-spacing:.18em;
+    text-transform:uppercase;
+    color:var(--text-faint);
+    margin:0 0 2rem;
+  }
+
+  /* ---------- Organe cards ---------- */
+  .organes{
+    display:flex;
+    flex-direction:column;
+    gap:0;
+  }
+  .organe{
+    display:grid;
+    grid-template-columns:9.5rem 1fr;
+    gap:1.6rem 2.1rem;
+    padding:2.15rem 0;
+    border-top:1px solid var(--hairline-2);
+  }
+  .organe:last-child{border-bottom:1px solid var(--hairline-2);}
+
+  .organe-id{
+    font-family:var(--mono);
+    font-size:.72rem;
+    letter-spacing:.1em;
+    text-transform:uppercase;
+    color:var(--text-faint);
+    padding-top:.2rem;
+  }
+  .organe-id .num{
+    display:block;
+    font-family:var(--display);
+    font-weight:800;
+    font-size:2rem;
+    color:var(--surface-2);
+    -webkit-text-stroke:1px var(--hairline);
+    line-height:1;
+    margin-bottom:.5rem;
+  }
+  .organe-id .law{
+    display:block;
+    color:var(--cyan);
+    margin-top:.35rem;
+  }
+
+  .organe-body h2{
+    font-family:var(--display);
+    font-weight:800;
+    text-transform:uppercase;
+    font-size:1.55rem;
+    letter-spacing:.005em;
+    color:#fff;
+    margin:0 0 .65rem;
+  }
+  .tag{
+    display:inline-block;
+    font-family:var(--mono);
+    font-size:.76rem;
+    color:var(--gold);
+    background:rgba(232,196,104,.08);
+    border:1px solid rgba(232,196,104,.28);
+    border-radius:3px;
+    padding:.2rem .55rem;
+    margin:0 0 1.05rem;
+  }
+  .organe-body p{
+    font-size:1.01rem;
+    color:var(--text-dim);
+    max-width:56ch;
+    margin:0 0 .85rem;
+  }
+  .organe-body p:last-child{margin-bottom:0;}
+  .organe-body strong{color:#dfe3ee;font-weight:600;}
+  .edge{
+    font-family:var(--mono);
+    font-size:.86rem;
+    color:var(--text);
+    border-top:1px dashed var(--hairline);
+    padding-top:.8rem;
+    margin-top:1.1rem;
+  }
+  .edge b{color:var(--cyan);font-weight:600;}
+
+  /* ---------- Closer ---------- */
+  .closer{
+    margin-top:4rem;
+    padding-top:2.6rem;
+    border-top:1px solid var(--hairline);
+    display:grid;
+    grid-template-columns:1fr auto;
+    gap:2rem;
+    align-items:end;
+  }
+  .closer p{
+    font-family:var(--serif);
+    font-style:italic;
+    font-size:1.3rem;
+    line-height:1.5;
+    color:#eceef3;
+    max-width:38ch;
+    text-wrap:balance;
+    margin:0;
+  }
+  .closer .stamp{
+    font-family:var(--mono);
+    font-size:.72rem;
+    letter-spacing:.12em;
+    text-transform:uppercase;
+    color:var(--blood);
+    border:1px solid rgba(200,30,58,.45);
+    padding:.55rem .8rem;
+    white-space:nowrap;
+    transform:rotate(-2deg);
+  }
+
+  footer{
+    margin-top:3.2rem;
+    font-family:var(--mono);
+    font-size:.7rem;
+    color:var(--text-faint);
+    display:flex;
+    justify-content:space-between;
+    gap:1rem;
+    flex-wrap:wrap;
+  }
+
+  @media (max-width:640px){
+    .sheet{padding:3.2rem 1.25rem 4rem;}
+    .organe{grid-template-columns:1fr;gap:.6rem;}
+    .organe-id{display:flex;align-items:center;gap:.6rem;}
+    .organe-id .num{margin:0;font-size:1.5rem;}
+    .organe-id .law{margin:0;}
+    .closer{grid-template-columns:1fr;}
+  }
+</style>
+
+<div class="sheet">
+
+  <div class="classhead">
+    <span>Nothierly Systems <span class="dot">●</span> Confidentiel — Investisseurs Institutionnels</span>
+    <span>Réf. NTH-BIOMIM-01</span>
+  </div>
+
+  <div class="masthead">
+    <p class="eyebrow">Synthèse architecturale</p>
+    <h1>Protocole<br><em>Biomimesis</em></h1>
+    <p class="subhead">Cinq lois qui gouvernent la survie du vivant, transposées en cinq organes qui gouvernent la survie du capital.</p>
+  </div>
+
+  <div class="manifesto">
+    <p>Les marchés financiers ne sont pas des systèmes clos. Ce sont des écosystèmes — proie et prédateur, hôte et pathogène, niche et compétiteur. La sélection naturelle a passé trois milliards d'années à résoudre le problème que la finance quantitative tente de résoudre depuis trente ans : <strong>opérer en présence d'une incertitude radicale, sans garantie, et survivre quand même.</strong></p>
+    <p>Nothierly n'emprunte pas une image à la biologie pour habiller un pitch. Chaque loi ci-dessous est ancrée dans un organe réel du système — un module nommé, une porte d'exécution, un modèle calculé à chaque tick. Là où la biologie s'arrête à la métaphore, l'architecture, elle, s'arrête au code.</p>
+  </div>
+
+  <p class="pull">Un organisme ne négocie pas avec son environnement. Il s'y adapte, ou il en sort.</p>
+
+  <svg class="pulse" viewBox="0 0 800 34" preserveAspectRatio="none" aria-hidden="true">
+    <path d="M0,17 L120,17 L134,17 L142,2 L150,30 L158,10 L166,22 L174,17 L188,17 L 260,17 L 274,17 L282,2 L290,30 L298,10 L306,22 L314,17 L 420,17 L 434,17 L442,2 L450,30 L458,10 L466,22 L474,17 L 620,17 L 634,17 L642,2 L650,30 L658,10 L666,22 L674,17 L800,17" />
+  </svg>
+
+  <p class="section-label">Cartographie — 5 organes / 5 pressions de sélection</p>
+
+  <div class="organes">
+
+    <div class="organe">
+      <div class="organe-id">
+        <span class="num">I</span>
+        <span class="law">Lotka–Volterra</span>
+        <span class="law">Dynamique proie / prédateur</span>
+      </div>
+      <div class="organe-body">
+        <h2>L'instinct de chasse</h2>
+        <span class="tag">Fleet_Command_Arbiter · Porte 7 (StochasticCore)</span>
+        <p>Un prédateur qui charge une proie absente meurt de faim. Avant chaque entrée, le système mesure <strong>l'impact de prix que son propre ordre générerait</strong> (loi en racine carrée, Almgren-Chriss) et <strong>la résistance réelle de la liquidité disponible</strong> (convexité en r⁻⁴, analogie Hagen-Poiseuille). Si la proie est trop maigre, la porte se ferme — avant exécution, pas après.</p>
+        <p class="edge"><b>Edge financier :</b> famine de slippage éliminée par construction, jamais par surveillance a posteriori.</p>
+      </div>
+    </div>
+
+    <div class="organe">
+      <div class="organe-id">
+        <span class="num">II</span>
+        <span class="law">Épidémiologie</span>
+        <span class="law">Vitesse de contagion</span>
+      </div>
+      <div class="organe-body">
+        <h2>La sécurité immunitaire</h2>
+        <span class="tag">Gate 6 · PortfolioRiskParityManager — Gate 7 · Hawkes / Jump-Diffusion</span>
+        <p>Un système immunitaire ne compte pas les morts, il détecte la vitesse d'infection. L'agent de risque calcule en continu <strong>l'intensité d'un processus auto-excitateur</strong> sur le flux d'ordres — la signature mathématique d'une cascade en train de s'auto-alimenter — et la <strong>concentration structurelle</strong> du portefeuille via un seuil de percolation. Le capital est isolé au premier signe de fracture locale, avant qu'elle ne devienne systémique.</p>
+        <p class="edge"><b>Edge financier :</b> isolement du capital sur signal de contagion précoce, pas sur confirmation du krach.</p>
+      </div>
+    </div>
+
+    <div class="organe">
+      <div class="organe-id">
+        <span class="num">III</span>
+        <span class="law">Hebb · Sélection darwinienne</span>
+        <span class="law">Plasticité &amp; adaptation</span>
+      </div>
+      <div class="organe-body">
+        <h2>Plasticité &amp; évolution</h2>
+        <span class="tag">supervisor-agent (XGBoost) · rl-signal-agent (PPO)</span>
+        <p>Un organisme statique perd la course aux armements. Les agents Alpha portent des poids <strong>appris sur données de marché réelles</strong> — un modèle à gradient boosté, une politique entraînée par renforcement — et sont <strong>réentraînés à intervalle régulier</strong> à mesure que le régime de marché se déplace. Ce n'est pas une promesse d'auto-évolution perpétuelle : c'est une adaptation mesurée, versionnée, et rejouable.</p>
+        <p class="edge"><b>Edge financier :</b> dérive de régime absorbée par mise à jour disciplinée, jamais par un modèle figé au jour de son déploiement.</p>
+      </div>
+    </div>
+
+    <div class="organe">
+      <div class="organe-id">
+        <span class="num">IV</span>
+        <span class="law">Principe de Gause</span>
+        <span class="law">Exclusion compétitive</span>
+      </div>
+      <div class="organe-body">
+        <h2>Survie stratégique</h2>
+        <span class="tag">P2P Premium Scanner · Optimal Execution Scheduler</span>
+        <p>Deux espèces ne peuvent occuper durablement la même niche. Nothierly ne dispute jamais la profondeur de Wall Street sur son propre terrain — la convexité d'impact y punit structurellement quiconque n'a pas sa taille. Le capital est routé vers les écarts que la taille institutionnelle ne peut mathématiquement pas exploiter : primes P2P inter-devises, exécution fractionnée sous le seuil où l'impact devient coûteux.</p>
+        <p class="edge"><b>Edge financier :</b> alpha de niche structurellement inaccessible aux acteurs contraints par leur propre échelle.</p>
+      </div>
+    </div>
+
+  </div>
+
+  <svg class="pulse" viewBox="0 0 800 34" preserveAspectRatio="none" aria-hidden="true">
+    <path d="M0,17 L120,17 L134,17 L142,2 L150,30 L158,10 L166,22 L174,17 L188,17 L 260,17 L 274,17 L282,2 L290,30 L298,10 L306,22 L314,17 L 420,17 L 434,17 L442,2 L450,30 L458,10 L466,22 L474,17 L 620,17 L 634,17 L642,2 L650,30 L658,10 L666,22 L674,17 L800,17" />
+  </svg>
+
+  <div class="closer">
+    <p>Un prédateur ne survit pas parce qu'il est le plus fort. Il survit parce qu'il n'entre jamais dans un combat qu'il peut perdre.</p>
+    <span class="stamp">Vérifié · Codé · Mesuré</span>
+  </div>
+
+  <footer>
+    <span>NOTHIERLY SYSTEMS — PROTOCOLE BIOMIMESIS</span>
+    <span>Document de synthèse — usage interne &amp; investisseurs qualifiés</span>
+  </footer>
+
+</div>
