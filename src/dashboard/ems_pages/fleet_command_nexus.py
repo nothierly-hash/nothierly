@@ -59,6 +59,29 @@ fabriquer un chiffre) :
   d'exécution réelle (voir le docstring de ``options_hedging_manager.py``) : toute position
   d'option affichée ici est nécessairement simulée (paper-fill) -- ce projet n'a aucun vrai courtier
   d'options ; seul son prix Black-Scholes est réel.
+- **Module 9 (Smart Order Router -- Historique Réel de Routage, ajouté 2026-09-14, audit des 9
+  pages "lois mathématiques")** : le brief demandait de "lier" 9 pages frontière (Macro-
+  Entanglement, Tensor Train Optimizer, Apex Leviathan, Wolfram Hypergraph, Dynamic Kelly
+  Optimizer, Ohm's Law Financial Routing, Quantitative Supremacy, Absolute Quant Frontier,
+  Millennium Conjectures) à ce module de production. Audit fait honnêtement, page par page, avant
+  de câbler quoi que ce soit (voir la demande explicite de l'utilisateur de séparer le réel du
+  simulé) : **8 des 9 pages exécutent de vraies maths sur des données synthétiques/illustratives,
+  par conception délibérée et déjà disclosée** (ex. Tensor Train Optimizer décompose un tenseur
+  synthétique lisse ; Macro-Entanglement calcule un vrai CHSH sur un modèle classique simulé) --
+  les câbler dans la vraie télémétrie de production ferait entrer une donnée simulée dans un
+  système réel, exactement ce que ce projet refuse partout ailleurs (voir le docstring de
+  ``core_daemons.py``). Aucune de ces 8 n'est donc câblée ici -- refusé honnêtement, pas oublié.
+  La 9ème piste, ``src/execution/smart_order_router.py`` (routage multi-venues crypto réel, appelé
+  depuis ``liquidity_routing.py``), est la seule des 9 à être réellement câblable : ce module a
+  déjà sa propre intégration Kill Switch/``safe_financial_call``/MOCK_MODE réelle, et persiste
+  chaque décision de routage **réellement exécutée** (jamais un simple aperçu) sur
+  ``core.schemas.SOR_ROUTING_LOG_REDIS_KEY``. Module 9 lit cette même clé réelle, en lecture seule
+  -- Fleet Command Nexus n'avait jusqu'ici aucune visibilité sur cette autre filière d'exécution
+  réelle du projet. Note honnête : ``build_allocation_plan`` lui-même (le calcul d'aperçu, sans
+  exécution) nécessiterait des connexions réelles à 4 exchanges crypto que ``ExecutionAgent`` ne
+  détient pas aujourd'hui -- l'ajouter à la Porte 7 par tick exigerait une vraie décision
+  d'architecture (faire tenir ces connexions à ``ExecutionAgent``), pas une simple ligne de
+  télémétrie ; non fait ici, disclosé plutôt que bricolé.
 - **Module 6 (Portes d'Exécution, ajouté 2026-09-13, "Protocole 7-Gates Convergence" puis étendu le
   même jour par "Protocole Stochastic Core")** : distinct de tout ce qui précède -- Modules 1-4 sont le
   swarm mathématique **simulé** ``core_daemons.py``/DeFi Ghost Daemons ; Module 6 est la **vraie**
@@ -98,6 +121,7 @@ ceux-là restent uniquement sur ``agent_fleet.py``, la seule page autorisée à 
 
 from __future__ import annotations
 
+import json
 import math
 import sys
 import time
@@ -111,7 +135,12 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from core.base_agent import AgentControlState
-from core.schemas import AGENT_CONTROL_STATE_REDIS_KEY_PREFIX, HEARTBEAT_REDIS_KEY_PREFIX, PORTFOLIO_GREEKS_REDIS_KEY
+from core.schemas import (
+    AGENT_CONTROL_STATE_REDIS_KEY_PREFIX,
+    HEARTBEAT_REDIS_KEY_PREFIX,
+    PORTFOLIO_GREEKS_REDIS_KEY,
+    SOR_ROUTING_LOG_REDIS_KEY,
+)
 from src.dashboard.backend_simulator import autonomous_heartbeat, get_state
 from src.dashboard.core_daemons import (
     DAEMON_META,
@@ -123,7 +152,7 @@ from src.dashboard.core_daemons import (
     get_swarm_state,
     heartbeat as ghost_daemon_heartbeat,
 )
-from src.dashboard.ems_pages._shared import get_redis_client, safe_get, safe_get_json, safe_keys
+from src.dashboard.ems_pages._shared import get_redis_client, safe_get, safe_get_json, safe_keys, safe_lrange
 
 # =============================================================================
 # Institutional Glassmorphism -- palette + CSS
@@ -783,6 +812,68 @@ def _render_portfolio_greeks() -> None:
     st.markdown("</div>", unsafe_allow_html=True)
 
 
+# =============================================================================
+# Module 9 -- Smart Order Router : historique réel de routage (production réelle)
+# =============================================================================
+
+_SOR_SIDE_LABEL: Final[dict[str, str]] = {"BUY": "ACHAT", "SELL": "VENTE"}
+
+
+@st.fragment(run_every="5s")
+def _render_smart_order_router_history() -> None:
+    """Lit le vrai journal des décisions de routage réellement exécutées par
+    ``src/execution/smart_order_router.py`` (``core.schemas.SOR_ROUTING_LOG_REDIS_KEY``) -- lecture
+    seule, voir le docstring de ce module (section Module 9) pour l'audit complet des 9 pages
+    "lois mathématiques" et pourquoi seule celle-ci est honnêtement câblable ici."""
+    r = get_redis_client()
+    st.markdown('<div class="fcn-glass fcn-glass-steel">', unsafe_allow_html=True)
+    st.markdown(
+        "##### 🔀 Module 9 · Smart Order Router — Historique Réel de Routage "
+        '&nbsp;<span class="fcn-badge-real">🔒 RÉEL — PRODUCTION</span>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        '<div class="fcn-disclosure" style="border-left-color:#eef2ff;background:rgba(255,255,255,0.04);color:#dfe3ee;">'
+        "🔗 Télémétrie réelle de <code>src/execution/smart_order_router.py</code> -- chaque ligne "
+        "ci-dessous est une décision de routage <b>réellement exécutée</b> (jamais un simple aperçu "
+        "<code>build_allocation_plan</code>), avec son vrai gain effectif-prix contre le pire niveau "
+        "utilisé. Aucune des 8 autres pages \"lois mathématiques\" auditées le 2026-09-14 n'est "
+        "câblée ici -- leurs maths sont réelles mais tournent sur des données synthétiques/"
+        "illustratives par conception, et y mélanger une donnée simulée serait exactement ce que ce "
+        "projet refuse ailleurs.</div>",
+        unsafe_allow_html=True,
+    )
+
+    raw_entries = safe_lrange(r, SOR_ROUTING_LOG_REDIS_KEY, 10)
+    if not raw_entries:
+        st.info(
+            "Aucune décision de routage réelle pour l'instant -- ce panneau s'allume dès le premier "
+            "vrai routage multi-venues exécuté depuis la page Liquidity Routing."
+        )
+        st.markdown("</div>", unsafe_allow_html=True)
+        return
+
+    for raw in raw_entries:
+        try:
+            record = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        age_s = max(0.0, time.time() - record.get("timestamp", time.time()))
+        side_label = _SOR_SIDE_LABEL.get(record.get("side", ""), record.get("side", "?"))
+        fully_filled = record.get("fully_filled", False)
+        savings = record.get("savings_usd", 0.0)
+        venues = ", ".join(a.get("broker_id", "?") for a in record.get("allocations", []))
+        st.markdown(
+            f"**{record.get('symbol', '?')}** -- {side_label} "
+            f"{record.get('allocated_quantity', '?')}/{record.get('requested_quantity', '?')} "
+            f"&nbsp;·&nbsp; il y a {age_s:.1f}s "
+            + ("&nbsp;🟢 rempli entièrement" if fully_filled else "&nbsp;🟡 partiellement rempli")
+        )
+        st.caption(f"Venues réelles utilisées : {venues or '—'} &nbsp;·&nbsp; gain réel vs pire niveau : ${savings:,.4f}")
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
 _render_daemon_matrix()
 st.markdown("")
 _render_infra_channel()
@@ -798,3 +889,5 @@ st.markdown("")
 _render_optimal_execution_curve()
 st.markdown("")
 _render_portfolio_greeks()
+st.markdown("")
+_render_smart_order_router_history()
