@@ -1031,6 +1031,25 @@ class DenoisedPriceSignal(BaseModel):
             cycle (the real input window size, which can be smaller than
             the agent's configured ``lookback_candles`` early in an
             instrument's history).
+        cwt_dominant_period_seconds: "Signal, Physique, Algo" (2026-09-14)
+            addition -- real, **time-localized** dominant real cycle
+            length (in seconds), from a real Morlet Continuous Wavelet
+            Transform evaluated only at the most recent real candle
+            (see :func:`core.quant_math.morlet_wavelet_transform`).
+            Complementary to (never a replacement for)
+            ``dominant_frequencies`` above, which describes the whole
+            real fetched window at once via a single, real Fourier
+            transform -- this instead answers "what real cycle length
+            dominates *right now*," honestly reframing (not escaping)
+            the same Gabor-Heisenberg time/frequency tradeoff that
+            single-window FFT is fixed to one point of. ``None`` when
+            the real fetched window was too short to evaluate any real
+            candidate scale.
+        cwt_dominant_power: Real wavelet power at
+            ``cwt_dominant_period_seconds`` -- how energetically that
+            specific real cycle is currently present, not a normalized
+            confidence score. ``None`` under the same condition as
+            ``cwt_dominant_period_seconds``.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -1042,6 +1061,8 @@ class DenoisedPriceSignal(BaseModel):
     dominant_magnitudes: list[float] = Field(default_factory=list)
     noise_energy_removed_pct: float = Field(ge=0, le=100)
     window_size: int = Field(gt=0)
+    cwt_dominant_period_seconds: float | None = Field(default=None, gt=0)
+    cwt_dominant_power: float | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
     def _validate_dominant_arrays_same_length(self) -> DenoisedPriceSignal:

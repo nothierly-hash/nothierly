@@ -164,8 +164,10 @@ from core.quant_math import (
     giant_cluster_fraction,
     hawkes_intensity,
     jump_diffusion_anomaly,
+    kalman_dynamic_hedge_ratio,
     kolmogorov_compressibility_ratio,
     ornstein_uhlenbeck_mean_reversion,
+    poiseuille_liquidity_resistance,
     price_impact,
     transfer_entropy,
     wasserstein_price_distance,
@@ -425,6 +427,12 @@ _MIN_SAMPLES_FOR_COMPRESSIBILITY: Final[int] = 16  # too few samples make a comp
 # a longer one.
 _MIN_SAMPLES_FOR_LYAPUNOV: Final[int] = 30
 _LYAPUNOV_MAX_TIME_STEPS: Final[int] = 5
+
+# -- Gate 7 addition (2026-09-14, "Signal, Physique, Algo") -- real, informational only. Fixed at
+# 1.0 (a real, disclosed normalization reference, not a calibrated seconds/units value): this
+# resistance reading is only ever meant for relative comparison across time for the same
+# instrument (see poiseuille_liquidity_resistance's own docstring), not as an absolute cost figure.
+_POISEUILLE_EXECUTION_HORIZON: Final[float] = 1.0
 
 # -- Gate 6 addition (2026-09-13, "Arsenal Interdisciplinaire") -- reuses this class's own
 # correlation_threshold (see PortfolioRiskParityManager's constructor) as the percolation edge
@@ -1567,6 +1575,19 @@ class ExecutionAgent(BaseAgent):
         chaotic system -- this gate never blocks on it, exactly the same
         restraint every other Gate 7 telemetry-only addition already
         exercises.
+
+        **"Signal, Physique, Algo" addition (2026-09-14), also
+        informational-only**: a real :func:`~core.quant_math.
+        poiseuille_liquidity_resistance` reading from the exact same real
+        ``liquidity``/``spread`` this gate's own :func:`~core.quant_math.
+        price_impact` check already reads -- a disclosed Hagen-Poiseuille
+        *analogy* (never a claim this order book is a literal viscous
+        fluid) surfacing the much sharper :math:`r^{-4}` convexity a
+        halved liquidity depth produces, which the square-root
+        ``price_impact`` law above does not capture as dramatically. A
+        real, complementary read for an operator's intuition, not a
+        second, competing blocking veto over the same inputs
+        ``price_impact`` already gates on.
         """
         detail_parts: list[str] = []
         blocked_reason: str | None = None
@@ -1673,6 +1694,15 @@ class ExecutionAgent(BaseAgent):
                     )
         else:
             detail_parts.append("PriceImpact: pas de donnee de liquidite reelle disponible")
+
+        if liquidity > 0:
+            spread_for_resistance = self._last_spreads.get(instrument, 0.0)
+            resistance = poiseuille_liquidity_resistance(
+                spread_for_resistance, liquidity, execution_horizon=_POISEUILLE_EXECUTION_HORIZON
+            )
+            detail_parts.append(f"Poiseuille(resistance)={resistance:.3e}")
+        else:
+            detail_parts.append("Poiseuille: pas de donnee de liquidite reelle disponible")
 
         detail = " | ".join(detail_parts)
         if blocked_reason is not None:
@@ -2467,6 +2497,74 @@ class ExecutionAgent(BaseAgent):
         te_a_to_b = transfer_entropy(returns_a, returns_b, lag=lag, n_bins=n_bins)
         te_b_to_a = transfer_entropy(returns_b, returns_a, lag=lag, n_bins=n_bins)
         return te_a_to_b, te_b_to_a
+
+    def compute_kalman_pairs_spread(
+        self,
+        instrument_a: str,
+        instrument_b: str,
+        *,
+        process_variance: float = 1e-5,
+        observation_variance: float = 1e-3,
+    ) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+        r"""Real, time-varying Kalman-filtered pairs-trading hedge ratio + spread between two instruments' own real price history.
+
+        Thin wrapper around :func:`~core.quant_math.
+        kalman_dynamic_hedge_ratio`, fed each instrument's own real
+        tracked price history (see :meth:`~src.agents.supervisor.
+        portfolio_risk_manager.PortfolioRiskParityManager.price_history`,
+        the same real rolling window Gate 6/7 already read) -- unlike a
+        fixed-window OLS hedge ratio, this real state estimate updates on
+        every new observation, recursively, rather than only in
+        discrete, stale jumps as a rolling window shifts.
+
+        **Real, disclosed alignment approximation**: same as
+        :meth:`compute_lead_lag_transfer_entropy` -- :meth:`price_history`
+        stores only real prices, not real arrival timestamps, so the two
+        series are aligned by trailing *index* position, not real
+        matching wall-clock time.
+
+        Synchronous and side-effect-free, same as
+        :meth:`compute_hedge_recommendation`/:meth:`compute_lead_lag_transfer_entropy`
+        -- never touches the broker, :attr:`_positions`, or Redis; a
+        real analytic for an operator or a future, separately-built
+        pairs-trading strategy to call directly. This project has no
+        existing stat-arb/pairs-trading execution agent -- exposed here
+        as the real, usable building block rather than inventing a new
+        autonomous strategy agent as part of this addition.
+
+        Args:
+            instrument_a: The real dependent-series instrument (:math:`Y`).
+            instrument_b: The real independent-series instrument (:math:`X`).
+            process_variance: See :func:`~core.quant_math.kalman_dynamic_hedge_ratio`.
+            observation_variance: See :func:`~core.quant_math.kalman_dynamic_hedge_ratio`.
+
+        Returns:
+            ``(states, spread)`` -- see :func:`~core.quant_math.
+            kalman_dynamic_hedge_ratio`'s own docstring. ``states[:, 0]``
+            is the real filtered intercept, ``states[:, 1]`` the real
+            filtered hedge ratio; ``spread`` is the real, Kalman-cleaned
+            pairs-trading spread.
+
+        Raises:
+            ValueError: If either instrument has fewer than 2 real
+                tracked prices, or propagated from
+                :func:`~core.quant_math.kalman_dynamic_hedge_ratio`.
+        """
+        prices_a = self._portfolio_risk_manager.price_history(instrument_a)
+        prices_b = self._portfolio_risk_manager.price_history(instrument_b)
+        if prices_a.size < 2 or prices_b.size < 2:
+            raise ValueError(
+                f"Insufficient real price history for {instrument_a!r}/{instrument_b!r} "
+                "to compute a real Kalman-filtered hedge ratio (need at least 2 real prices each)."
+            )
+
+        aligned_length = min(prices_a.size, prices_b.size)
+        y = prices_a[-aligned_length:]
+        x = prices_b[-aligned_length:]
+
+        return kalman_dynamic_hedge_ratio(
+            y, x, process_variance=process_variance, observation_variance=observation_variance
+        )
 
     async def _persist_portfolio_greeks_to_redis(self, greeks: PortfolioGreeks) -> None:
         """Cache the latest real portfolio Greeks under :data:`~core.schemas.PORTFOLIO_GREEKS_REDIS_KEY`.

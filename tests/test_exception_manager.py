@@ -13,6 +13,7 @@ syscall at the very end is intercepted.
 from __future__ import annotations
 
 import asyncio
+import socket
 from typing import Any, Generator
 
 import pytest
@@ -262,6 +263,79 @@ async def test_fatal_exception_is_recorded_by_a_fake_publisher(
     assert publisher.published[0].topic == SYSTEM_FATAL_EXCEPTION_TOPIC
     assert publisher.published[0].sender_id == "test-agent"
     assert publisher.published[0].data["message"] == "boom happened"
+
+
+@pytest.mark.asyncio
+async def test_transient_network_error_is_logged_but_does_not_trigger_shutdown(
+    exit_calls: list[int], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real bug fixed 2026-09-14: an orphaned OSError-family exception (see module docstring)
+    must be logged, never escalated to graceful_shutdown -- unlike every other exception type."""
+    loop = asyncio.get_running_loop()
+    shutdown_ran: list[bool] = []
+
+    async def shutdown_callback() -> None:
+        shutdown_ran.append(True)
+
+    install_global_exception_handler(loop, shutdown_callback, sender_id="test-agent")
+
+    new_tasks = await _run_and_collect_new_tasks(
+        loop, {"exception": socket.gaierror("getaddrinfo failed"), "message": "gaierror exception in shielded future"},
+        monkeypatch,
+    )
+
+    assert new_tasks == []  # no graceful_shutdown task (or publish/notify task) was ever scheduled
+    assert shutdown_ran == []
+    assert exit_calls == []
+
+
+@pytest.mark.asyncio
+async def test_transient_network_error_subclasses_are_also_tolerated(
+    exit_calls: list[int], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop = asyncio.get_running_loop()
+    shutdown_ran: list[bool] = []
+
+    async def shutdown_callback() -> None:
+        shutdown_ran.append(True)
+
+    install_global_exception_handler(loop, shutdown_callback, sender_id="test-agent")
+
+    for exc in (ConnectionResetError("reset"), TimeoutError("timed out"), OSError("generic os error")):
+        new_tasks = await _run_and_collect_new_tasks(
+            loop, {"exception": exc, "message": str(exc)}, monkeypatch,
+        )
+        assert new_tasks == []
+
+    assert shutdown_ran == []
+    assert exit_calls == []
+
+
+@pytest.mark.asyncio
+async def test_non_network_exception_still_triggers_real_shutdown_after_a_network_error(
+    exit_calls: list[int], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The transient-network tolerance must not weaken handling of a genuinely fatal exception."""
+    loop = asyncio.get_running_loop()
+    shutdown_ran: list[bool] = []
+
+    async def shutdown_callback() -> None:
+        shutdown_ran.append(True)
+
+    install_global_exception_handler(loop, shutdown_callback, sender_id="test-agent")
+
+    ignored_tasks = await _run_and_collect_new_tasks(
+        loop, {"exception": socket.gaierror("getaddrinfo failed"), "message": "network blip"}, monkeypatch,
+    )
+    assert ignored_tasks == []
+
+    new_tasks = await _run_and_collect_new_tasks(
+        loop, {"exception": ValueError("a real bug"), "message": "a real bug"}, monkeypatch,
+    )
+    results = await asyncio.gather(*new_tasks, return_exceptions=True)
+
+    assert shutdown_ran == [True]
+    assert any(isinstance(r, _ExitCalled) and r.code == 1 for r in results)
 
 
 @pytest.mark.asyncio

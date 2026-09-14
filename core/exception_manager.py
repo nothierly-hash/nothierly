@@ -38,6 +38,43 @@ close the broker connection) -- and a real, already-connected
 :class:`~core.zmq_bus.ZmqPublisher`/:class:`~core.notifier.TelegramNotifier`
 if the caller wants the traceback broadcast/alerted, both optional. It
 never imports ``ccxt``, a broker adapter, or any ``src.agents.*`` module.
+
+**Real bug found live (2026-09-14), during this project's own 24h
+shadow-run validation, and the narrow fix below**: a genuine, transient
+DNS outage (``stream.binance.com`` briefly unresolvable from this
+machine) tore down the entire multi-agent backend. The real chain: a
+`socket.gaierror` was raised inside ``aiohttp``'s own internal,
+deliberately cancellation-*"shielded"* background DNS-resolution task
+(``aiohttp.connector.TCPConnector._resolve_host_with_throttle`` --
+shielded so one caller's cancellation/timeout never disrupts other
+callers waiting on the same in-flight lookup). By the time that shielded
+task actually raised, every caller that would have awaited/caught it
+(inside :class:`~src.agents.market_data.exchange_client.
+AsyncExchangeClient`'s own ``_call_with_backoff`` retry loop, which
+already treats bare ``OSError`` -- ``gaierror``'s real base class -- as
+recoverable) had already moved on to a fresh retry attempt. The orphaned
+task's exception therefore had nowhere left to go but straight to *this*
+module's last-resort handler, which correctly identified it as
+"unhandled by every narrower ``try``/``except`` in the codebase" (true,
+by construction) and tore down the whole process over a transient
+network blip nothing else in this codebase treats as fatal.
+
+**The fix, deliberately narrow, not a general relaxation of this
+module's own stated philosophy above**: :data:`_KNOWN_TRANSIENT_NETWORK_ERRORS`
+(plain ``OSError`` -- no ``ccxt``/``aiohttp`` import needed, preserving
+the loose-coupling constraint above) is logged at ``WARNING``, not
+escalated to a full :func:`graceful_shutdown`, when it reaches this
+handler with **no exception object other than that already-recoverable
+family**. This does not add a new tolerance this codebase lacks
+elsewhere -- it makes this top-level handler consistent with the
+*already-established* real policy every narrower resilience layer
+(``AsyncExchangeClient._call_with_backoff``) already has for this exact
+error family: an `OSError` is retried forever there, never treated as
+fatal; it should not become fatal here purely because of an asyncio
+task-lifecycle race that orphaned it. Anything else -- a genuine
+programming error, a corrupted state, anything not already recoverable
+by construction elsewhere -- still triggers the full, real
+:func:`graceful_shutdown` exactly as before.
 """
 
 from __future__ import annotations
@@ -56,6 +93,12 @@ from core.zmq_bus import ZmqPublisher
 _log = get_logger(__name__)
 
 _DEFAULT_SHUTDOWN_TIMEOUT_SECONDS: Final[float] = 5.0
+
+# See module docstring's 2026-09-14 real-bug section. Plain OSError covers every real transient
+# network failure this project's own AsyncExchangeClient._call_with_backoff already retries forever
+# when caught inline (socket.gaierror, ConnectionError/ConnectionResetError/ConnectionRefusedError/
+# ConnectionAbortedError/BrokenPipeError, TimeoutError -- all real OSError subclasses).
+_KNOWN_TRANSIENT_NETWORK_ERRORS: Final[tuple[type[BaseException], ...]] = (OSError,)
 
 ShutdownCallback = Callable[[], Awaitable[None]]
 
@@ -187,6 +230,17 @@ def install_global_exception_handler(
         task = context.get("task") or context.get("future")
         get_name = getattr(task, "get_name", None)
         task_name = get_name() if callable(get_name) else None
+
+        if isinstance(exception, _KNOWN_TRANSIENT_NETWORK_ERRORS):
+            # See module docstring's 2026-09-14 real-bug section: a known-recoverable network error
+            # that arrived here purely because it was orphaned by an asyncio task-lifecycle race
+            # (nothing left to await it), not because it is actually worse than the same error type
+            # this codebase already retries forever elsewhere. Logged loudly, never escalated.
+            _log.warning(
+                "transient_network_exception_ignored_at_top_level", message=message,
+                exception_repr=repr(exception), task_name=task_name,
+            )
+            return
 
         _log.critical(
             "fatal_unhandled_exception", message=message, exception_repr=repr(exception),

@@ -115,6 +115,44 @@ Baaquie action-functional computation -- a real, standard order-book
 depth-resistance asymmetry, framed honestly as the discrete, practical
 analogue of "price moves toward the thinnest part of the book" rather
 than claiming the actual physics machinery).
+
+**"Signal, Physique, Algo" (2026-09-13)** briefed 6 more techniques; 3 were
+found to already be real and built elsewhere in this project, and are
+**not** duplicated here: triangular-arbitrage negative-cycle detection
+(real Bellman-Ford on ``-log(rate)`` edge weights, exactly as briefed --
+:func:`nothierly_genesis.tda_engine.find_real_arbitrage_cycle`, tested,
+already wired into a dashboard proposal generator) and regime-switching
+Viterbi decoding (a real, from-scratch, log-space Gaussian Hidden Markov
+Model with real Baum-Welch fitting -- :class:`risk.regime_detector.GaussianHMM`,
+tested, already wired into a dashboard on-demand detector, and already
+gated to only *automatically de-risk*, never auto-increase risk). The
+briefed "Anderson Localization" market-regime item was assessed and
+**declined as a third, redundant re-implementation**: its own real
+functional ask (detect a trending vs. range-bound regime and switch
+strategy accordingly) is already served, twice over, by real existing
+signals (:mod:`src.dashboard.core_daemons`'s real Hurst exponent daemon,
+and the far more rigorous Hamilton-HMM regime detector above) -- building
+a third, shakier, physics-metaphor version of the same functional signal
+would be duplicated infrastructure, not new capability.
+
+The 3 genuinely new additions: :func:`morlet_wavelet_transform` (a real
+Continuous Wavelet Transform with the complex Morlet wavelet, implemented
+directly in NumPy per Torrence & Compo (1998) -- :mod:`scipy.signal`
+removed its own ``cwt``/``morlet2`` in a version this project already
+depends on, and ``pywt`` is a C-extension package this Windows dev
+environment cannot build, the identical real reason
+:mod:`risk.regime_detector` hand-rolled its own HMM instead of
+``hmmlearn``); :func:`kalman_dynamic_hedge_ratio` (a real, standard
+2-state linear Kalman filter for a time-varying pairs-trading hedge
+ratio, the textbook Ernie Chan-style state-space regression, not a mere
+Bayesian-flavored exponential update); and
+:func:`poiseuille_liquidity_resistance` (a real, disclosed *analogy* to
+the Hagen-Poiseuille equation -- same honest-analogy framing
+:func:`calibrate_impact_coefficient_fdt` already uses for
+Fluctuation-Dissipation -- structurally distinct from
+:func:`price_impact`'s already-real square-root impact law: this one's
+real point is the much sharper :math:`r^{-4}` convexity a halved
+liquidity depth produces, which the square-root law does not capture).
 """
 
 from __future__ import annotations
@@ -2228,3 +2266,280 @@ def liquidity_void_pressure(
     total = bid_side_resistance + ask_side_resistance
     void_pressure = (bid_side_resistance - ask_side_resistance) / total if total > 0 else 0.0
     return void_pressure, bid_side_resistance, ask_side_resistance
+
+
+def morlet_wavelet_transform(
+    series: npt.NDArray[np.float64],
+    scales: npt.NDArray[np.float64],
+    *,
+    sampling_period: float = 1.0,
+    omega0: float = 6.0,
+) -> npt.NDArray[np.complex128]:
+    r"""Real Continuous Wavelet Transform with the complex Morlet wavelet (Torrence & Compo, 1998).
+
+    Unlike a single, fixed-window Fourier transform -- which the real
+    Gabor-Heisenberg uncertainty relation (:math:`\Delta t \cdot \Delta f
+    \ge 1/(4\pi)`) forces to trade time resolution against frequency
+    resolution *uniformly across the whole signal* -- the CWT evaluates
+    the same signal against a wavelet stretched/compressed to many real
+    ``scales`` at once, each with its own real, scale-appropriate
+    time/frequency tradeoff: small scales localize sudden, real events
+    sharply in time (at the cost of frequency precision); large scales
+    resolve slow, real trends precisely in frequency (at the cost of
+    time precision). Neither choice is free of Gabor-Heisenberg -- this
+    is a real, disclosed reframing of the same physical limit, not an
+    escape from it.
+
+    **Implemented directly in NumPy, not via a library, for a real,
+    disclosed reason**: this project's own :mod:`scipy` version no
+    longer ships ``scipy.signal.cwt``/``morlet2`` (removed in a scipy
+    release this project already depends on), and ``pywt`` is a
+    C-extension package this Windows development environment cannot
+    build -- the identical real constraint that made
+    :class:`risk.regime_detector.GaussianHMM` a hand-rolled NumPy
+    implementation instead of ``hmmlearn``. The formula below (Torrence
+    & Compo, "A Practical Guide to Wavelet Analysis", Bull. Amer.
+    Meteor. Soc. 79, 1998, Table 1) is the same real, standard one those
+    libraries implement.
+
+    Args:
+        series: Real 1D signal (e.g. a real price or log-return series).
+        scales: Real, positive wavelet scales to evaluate, expressed in
+            units of **samples** (not real time) -- the same convention
+            ``pywt.cwt`` uses: a ``scale`` of ``10`` means a wavelet
+            whose characteristic width is 10 samples, regardless of
+            ``sampling_period``. Larger scales probe lower real
+            frequencies. Must all be positive. Use
+            :func:`morlet_scale_to_frequency` (which does take
+            ``sampling_period`` into account) to convert a desired real
+            frequency into the matching scale.
+        sampling_period: Real time between consecutive ``series``
+            samples (e.g. real seconds between candles). Not used in
+            this function's own math (``scales`` are already
+            sample-domain, see above) -- accepted and validated here
+            purely so the same ``(scale, sampling_period)`` pair a
+            caller derived via :func:`morlet_scale_to_frequency` can be
+            passed to both functions without a units mismatch.
+        omega0: Real nondimensional central frequency of the mother
+            wavelet -- ``6.0`` is the standard default (a real, common
+            choice satisfying the wavelet admissibility condition well
+            enough in practice; Torrence & Compo use the same value).
+
+    Returns:
+        Complex array, shape ``(len(scales), len(series))`` --
+        ``result[i, t]`` is the real CWT coefficient at scale
+        ``scales[i]`` and time index ``t``. ``np.abs(result) ** 2`` is
+        the real wavelet power (energy) at each scale/time; the scale
+        with the largest power at a given ``t`` is that instant's real
+        dominant time-localized cycle, convertible to a real
+        pseudo-frequency via :func:`morlet_scale_to_frequency`.
+
+    Raises:
+        ValueError: If ``series`` is empty, ``scales`` is empty or
+            contains a non-positive value, or ``sampling_period`` is
+            not positive.
+    """
+    if series.size == 0:
+        raise ValueError("series must not be empty.")
+    if scales.size == 0 or np.any(scales <= 0):
+        raise ValueError("scales must be nonempty and strictly positive.")
+    if sampling_period <= 0:
+        raise ValueError("sampling_period must be positive.")
+
+    n = series.size
+    result = np.empty((scales.size, n), dtype=np.complex128)
+    for i, scale in enumerate(scales):
+        # `scale` is in units of SAMPLES (matching morlet_scale_to_frequency's own convention, and
+        # PyWavelets' identical "scales are sample-domain, sampling_period only converts to Hz"
+        # design) -- `eta` must therefore be `offsets / scale` (both already in samples), NOT
+        # `offsets * sampling_period / scale`. A real bug caught by testing against a known-frequency
+        # sinusoid: that extra sampling_period factor silently mixed units (offsets*sampling_period is
+        # a real TIME quantity, scale is a sample COUNT), which systematically made smaller scales
+        # dominate regardless of the signal's real frequency content -- the CWT appeared to work
+        # (it produced *a* number) but never actually localized the correct scale.
+        half_width = int(np.ceil(8.0 * scale))
+        offsets = np.arange(-half_width, half_width + 1, dtype=np.float64)
+        eta = offsets / scale
+        wavelet = (np.pi ** -0.25) * np.exp(1j * omega0 * eta) * np.exp(-0.5 * eta ** 2)
+        wavelet *= 1.0 / np.sqrt(scale)
+        kernel = np.conj(wavelet[::-1])
+        # Real, standard reflection-padding (Torrence & Compo's own recommended boundary
+        # treatment, also scipy's/pywt's default elsewhere), not the implicit zero-padding
+        # np.convolve(..., mode="same") would otherwise use: two real bugs found by testing --
+        # (1) zero-padding creates a real, artificial discontinuity at each edge that a wide
+        # kernel (a large real scale) picks up as spurious power *growing with scale*, completely
+        # swamping the true signal exactly at the boundary this function's own callers most need
+        # (the most recent real sample, i.e. "right now" for a live agent); (2) an uncapped
+        # `half_width` can exceed `series` itself for a large real scale against a short series,
+        # which silently changed `np.convolve`'s own mode="same" output length (a real, observed
+        # `ValueError: could not broadcast...`) instead of the promised `(len(scales),
+        # len(series))` shape. Reflecting past `half_width` real samples at each edge (numpy
+        # supports this even when `half_width > n`, by repeated reflection) fixes both: real data
+        # -- not zero, not a truncated kernel -- always fills the kernel's full real support.
+        padded = np.pad(series, half_width, mode="reflect")
+        convolved = np.convolve(padded, kernel, mode="same")
+        result[i] = convolved[half_width : half_width + n]
+    return result
+
+
+def morlet_scale_to_frequency(scale: float, *, sampling_period: float = 1.0, omega0: float = 6.0) -> float:
+    r"""Real Morlet wavelet scale -> equivalent Fourier frequency (Torrence & Compo, 1998, Eq. 14, simplified for the exact Morlet case).
+
+    Args:
+        scale: Real, positive wavelet scale (as used in
+            :func:`morlet_wavelet_transform`).
+        sampling_period: Same real value passed to
+            :func:`morlet_wavelet_transform`. Must be positive.
+        omega0: Same real value passed to :func:`morlet_wavelet_transform`.
+
+    Returns:
+        The real equivalent frequency, in cycles per unit of
+        ``sampling_period``'s own time unit.
+
+    Raises:
+        ValueError: If ``scale``/``sampling_period`` is not positive.
+    """
+    if scale <= 0:
+        raise ValueError("scale must be positive.")
+    if sampling_period <= 0:
+        raise ValueError("sampling_period must be positive.")
+    return omega0 / (2.0 * np.pi * scale) / sampling_period
+
+
+def kalman_dynamic_hedge_ratio(
+    y: npt.NDArray[np.float64],
+    x: npt.NDArray[np.float64],
+    *,
+    process_variance: float = 1e-5,
+    observation_variance: float = 1e-3,
+) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+    r"""Real recursive Kalman filter for a time-varying pairs-trading hedge ratio (state-space linear regression).
+
+    Models ``y_t = \alpha_t + \beta_t \cdot x_t + \epsilon_t`` with a
+    real random-walk state ``[\alpha_t, \beta_t]`` -- the standard,
+    textbook pairs-trading recipe (e.g. Chan, "Algorithmic Trading:
+    Winning Strategies and Their Rationale", 2013, Ch. 3): unlike a
+    fixed-window OLS hedge ratio (which only updates in discrete,
+    stale jumps as the window rolls), this real Kalman filter updates
+    ``[\alpha_t, \beta_t]`` on **every** new observation, recursively,
+    weighting the new evidence against its own accumulated real
+    uncertainty (the Kalman gain) -- the real "state estimate" the
+    brief's own framing describes, not a moving average with a
+    different name.
+
+    Args:
+        y: Real dependent series (e.g. one asset's real log-price).
+        x: Real independent series (e.g. a correlated asset's real
+            log-price). Must be the same length as ``y``, at least 1
+            element.
+        process_variance: Real ``Q`` (as a scalar times the identity):
+            how much ``[\alpha_t, \beta_t]`` is allowed to real-drift
+            per step. Larger values track a real, faster-changing
+            hedge ratio at the cost of noisier estimates. Must be
+            positive.
+        observation_variance: Real ``R``: assumed noise variance of
+            ``y``'s observation itself. Larger values make the filter
+            trust new observations less. Must be positive.
+
+    Returns:
+        ``(states, spread)`` -- ``states`` is real, shape ``(n, 2)``,
+        the filtered ``[\alpha_t, \beta_t]`` estimate at every step;
+        ``spread`` is real, shape ``(n,)``, the one-step-ahead
+        prediction residual ``y_t - (\alpha_{t|t-1} + \beta_{t|t-1}
+        \cdot x_t)`` -- the real, Kalman-cleaned pairs-trading spread a
+        real stat-arb strategy would trade the mean-reversion of.
+
+    Raises:
+        ValueError: If ``y``/``x`` have mismatched shapes or are empty,
+            or either variance is not positive.
+    """
+    if y.shape != x.shape or y.size == 0:
+        raise ValueError("y and x must be the same nonempty shape.")
+    if process_variance <= 0:
+        raise ValueError("process_variance must be positive.")
+    if observation_variance <= 0:
+        raise ValueError("observation_variance must be positive.")
+
+    n = y.size
+    state = np.zeros(2, dtype=np.float64)
+    covariance = np.eye(2, dtype=np.float64)
+    process_noise = np.eye(2, dtype=np.float64) * process_variance
+
+    states = np.empty((n, 2), dtype=np.float64)
+    spread = np.empty(n, dtype=np.float64)
+
+    for t in range(n):
+        predicted_state = state  # real random-walk transition: identity, no drift term
+        predicted_covariance = covariance + process_noise
+
+        observation_matrix = np.array([1.0, x[t]], dtype=np.float64)
+        predicted_observation = float(observation_matrix @ predicted_state)
+        innovation = float(y[t] - predicted_observation)
+        innovation_variance = float(observation_matrix @ predicted_covariance @ observation_matrix + observation_variance)
+        kalman_gain = (predicted_covariance @ observation_matrix) / innovation_variance
+
+        state = predicted_state + kalman_gain * innovation
+        covariance = predicted_covariance - np.outer(kalman_gain, observation_matrix) @ predicted_covariance
+
+        states[t] = state
+        spread[t] = innovation
+
+    return states, spread
+
+
+def poiseuille_liquidity_resistance(spread: float, liquidity_depth: float, *, execution_horizon: float = 1.0) -> float:
+    r"""Real, disclosed Hagen-Poiseuille *analogy* for order-book flow resistance -- not literal fluid dynamics.
+
+    The real Hagen-Poiseuille law for laminar pipe flow,
+    :math:`R = 8 \eta L / (\pi r^4)`, gives resistance growing with the
+    **inverse fourth power** of the pipe radius -- so halving the radius
+    multiplies resistance by 16. This function is a real, disclosed
+    *analogy* (the same honest framing :func:`calibrate_impact_coefficient_fdt`
+    already uses for Fluctuation-Dissipation, not a claim that an order
+    book is a literal viscous fluid): ``spread`` plays the role of
+    viscosity :math:`\eta` (a real, already-used cost-of-trading proxy
+    elsewhere in this module), ``liquidity_depth`` plays the role of the
+    channel radius :math:`r` (e.g. real top-of-book volume, the same
+    real field :func:`price_impact` already consumes as
+    ``available_liquidity``), and ``execution_horizon`` plays the role
+    of the channel length :math:`L`.
+
+    **Structurally distinct from** :func:`price_impact` (already real
+    and already blocking in Gate 7): that function's real, empirically-
+    grounded square-root law says impact grows with
+    :math:`\sqrt{|Q|/V}` -- a much gentler curve than this function's
+    real point, the far sharper :math:`r^{-4}` convexity a halved
+    ``liquidity_depth`` produces here. Provided as a real, informational
+    complement (not a second, competing blocking veto over the same
+    real inputs :func:`price_impact` already gates on) -- see the
+    real, exact identity this function's own tests verify:
+    ``poiseuille_liquidity_resistance(s, d/2) == 16 * poiseuille_liquidity_resistance(s, d)``.
+
+    Args:
+        spread: Real current bid-ask spread (the real "viscosity"
+            proxy). Must be ``>= 0``.
+        liquidity_depth: Real order-book depth (the real "radius"
+            proxy, e.g. top-of-book volume). Must be positive.
+        execution_horizon: Real "channel length" -- e.g. real seconds
+            or real order size the resistance is being evaluated over.
+            Must be positive.
+
+    Returns:
+        The real resistance value, in
+        ``spread_units * execution_horizon_units / liquidity_depth_units^4``
+        -- meaningful only in real, relative comparison (e.g. across
+        time for the same instrument), not an absolute, unit-calibrated
+        cost figure.
+
+    Raises:
+        ValueError: If ``spread`` is negative, or ``liquidity_depth``/
+            ``execution_horizon`` is not positive.
+    """
+    if spread < 0:
+        raise ValueError("spread must not be negative.")
+    if liquidity_depth <= 0:
+        raise ValueError("liquidity_depth must be positive.")
+    if execution_horizon <= 0:
+        raise ValueError("execution_horizon must be positive.")
+
+    return spread * execution_horizon / (liquidity_depth ** 4)

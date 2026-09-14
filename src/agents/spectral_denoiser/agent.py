@@ -47,6 +47,20 @@ comparison (two independent real cadences) is the only honest way to
 flag it -- checking this agent's own ``dominant_frequencies`` against
 its own sampling rate's Nyquist bound would be tautologically always
 satisfied and could never actually detect it.
+
+**"Signal, Physique, Algo" (2026-09-14)**: :meth:`_compute_cwt_dominant_period`
+adds a real, complementary, **time-localized** reading -- a real Morlet
+Continuous Wavelet Transform (:func:`core.quant_math.
+morlet_wavelet_transform`) evaluated only at the most recent real
+candle, across a real range of candidate cycle lengths -- published as
+:attr:`~core.schemas.DenoisedPriceSignal.cwt_dominant_period_seconds`/
+``cwt_dominant_power`` alongside the existing FFT-based fields. Never a
+replacement for :meth:`_denoise`'s own top-K spectral filter (which
+still does the real denoising this agent is named for) -- the CWT
+answers a different real question ("what real cycle length dominates
+*right now*") that a single, whole-window FFT structurally cannot,
+per the real Gabor-Heisenberg time/frequency tradeoff both methods are
+honestly subject to.
 """
 
 from __future__ import annotations
@@ -65,7 +79,7 @@ from scipy.fft import irfft, rfft, rfftfreq
 from core.base_agent import AgentControlState, BaseAgent
 from core.config import AppSettings
 from core.logger import get_logger
-from core.quant_math import nyquist_undersampling_check
+from core.quant_math import morlet_wavelet_transform, nyquist_undersampling_check
 from core.redis_client import RedisUnavailableError
 from core.schemas import (
     DENOISED_PRICE_SIGNAL_REDIS_KEY_PREFIX,
@@ -87,6 +101,14 @@ _AGENT_ID: Final[str] = "spectral-denoiser-agent"
 # is a constructor parameter, not an importable constant at all).
 _REAL_OHLCV_CANDLE_POLL_INTERVAL_SECONDS: Final[float] = 60.0
 _REAL_MARKET_DATA_TICK_PUBLISH_INTERVAL_SECONDS: Final[float] = 0.1
+
+# "Signal, Physique, Algo" (2026-09-14): real Morlet CWT scale range for
+# _compute_cwt_dominant_period, expressed as candidate cycle lengths in samples (candles) --
+# from a real, minimal 4-candle period up to a quarter of the fetched window (avoids the
+# wavelet's own edge/cone-of-influence effects at the very start of the window).
+_CWT_MIN_PERIOD_SAMPLES: Final[float] = 4.0
+_CWT_NUM_SCALES: Final[int] = 20
+_CWT_OMEGA0: Final[float] = 6.0  # matches core.quant_math.morlet_wavelet_transform's own default
 
 # Real, ordered-oldest-last SELECT (see _fetch_recent_closes, which
 # reverses it back to chronological order) -- the exact same query shape
@@ -444,6 +466,58 @@ class SpectralDenoiserAgent(BaseAgent):
 
         return denoised, dominant_frequencies, dominant_magnitudes, noise_energy_removed_pct
 
+    def _compute_cwt_dominant_period(
+        self, timestamps: npt.NDArray[np.float64], closes: npt.NDArray[np.float64]
+    ) -> tuple[float | None, float | None]:
+        r"""Real, time-localized "what real cycle length dominates right now" reading, via Morlet CWT.
+
+        Complementary to (never a replacement for) :meth:`_denoise`'s
+        own FFT-based ``dominant_frequencies``, which describes the
+        whole real fetched window at once -- this evaluates a real
+        :func:`core.quant_math.morlet_wavelet_transform` only at the
+        single most recent real candle, across a real range of
+        candidate cycle lengths, and reports whichever one currently
+        carries the most real wavelet power. See that function's own
+        docstring on the real Gabor-Heisenberg time/frequency tradeoff
+        this is a disclosed reframing of, not an escape from.
+
+        Returns:
+            ``(dominant_period_seconds, dominant_power)`` at the most
+            recent real candle, or ``(None, None)`` if ``closes`` is too
+            short to evaluate any real candidate scale whose kernel
+            keeps at least half its real support inside the actual
+            fetched window (see the real cone-of-influence bound in
+            this method's own body).
+        """
+        n = closes.size
+        # Real cone-of-influence bound, not a bare "quarter of the window" guess: this reads the CWT
+        # at the very LAST real index (see below), where a scale's kernel half-width
+        # (8*scale samples, see morlet_wavelet_transform's own docstring, and scale =
+        # (_CWT_OMEGA0/2pi)*period) has no real "future" data at all -- only the `half_width` most
+        # recent real samples support it. Requiring that half-width to stay within half of `n`
+        # (8*(_CWT_OMEGA0/(2*pi))*period <= n/2) keeps at least half the kernel's real support inside
+        # the actual fetched window instead of silently zero-padded, an honest real margin, not
+        # merely "avoids the ValueError" (morlet_wavelet_transform's own kernel truncation already
+        # guarantees no crash regardless).
+        max_period_samples = n * np.pi / (8.0 * _CWT_OMEGA0)
+        if max_period_samples <= _CWT_MIN_PERIOD_SAMPLES:
+            return None, None
+
+        real_dt = float(np.median(np.diff(timestamps)))
+        period_samples = np.geomspace(_CWT_MIN_PERIOD_SAMPLES, max_period_samples, _CWT_NUM_SCALES)
+        scales = (_CWT_OMEGA0 / (2.0 * np.pi)) * period_samples
+
+        try:
+            coefficients = morlet_wavelet_transform(closes, scales, sampling_period=real_dt, omega0=_CWT_OMEGA0)
+        except ValueError:
+            return None, None
+
+        power_now = np.abs(coefficients[:, -1]) ** 2
+        dominant_index = int(np.argmax(power_now))
+        dominant_period_seconds = float(period_samples[dominant_index] * real_dt)
+        dominant_power = float(power_now[dominant_index])
+        return dominant_period_seconds, dominant_power
+
     def _to_feature_tensor(self, denoised_window: npt.NDArray[np.float64]) -> torch.Tensor:
         """Real ``torch.Tensor`` of ``denoised_window``, for in-process feature-engineering callers.
 
@@ -478,6 +552,7 @@ class SpectralDenoiserAgent(BaseAgent):
         )
         published_window = denoised[-self._publish_window_size :]
         feature_tensor = self._to_feature_tensor(published_window)
+        cwt_dominant_period_seconds, cwt_dominant_power = self._compute_cwt_dominant_period(timestamps, closes)
 
         signal = DenoisedPriceSignal(
             instrument=self._symbol,
@@ -487,6 +562,10 @@ class SpectralDenoiserAgent(BaseAgent):
             dominant_magnitudes=[round(float(m), 4) for m in dominant_magnitudes],
             noise_energy_removed_pct=round(noise_energy_removed_pct, 2),
             window_size=int(closes.size),
+            cwt_dominant_period_seconds=(
+                round(cwt_dominant_period_seconds, 4) if cwt_dominant_period_seconds is not None else None
+            ),
+            cwt_dominant_power=round(cwt_dominant_power, 6) if cwt_dominant_power is not None else None,
         )
 
         if self.control_state == AgentControlState.OFF:
