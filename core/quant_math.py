@@ -182,6 +182,27 @@ model fitting -- so this stays at the real, honestly-scoped level of
 "Hurst-adjusted VaR horizon scaling," not a full rough Bergomi options-
 pricing engine, which would need market inputs this system does not
 have.
+
+**"La Geometrie Tropicale" (2026-09-14)** adds real tropical (min-plus)
+semiring algebra: :func:`tropical_matrix_multiply` (the semiring
+operation itself, made explicit and directly usable) and
+:func:`tropical_shortest_paths`/:func:`reconstruct_tropical_path` (real
+all-pairs shortest paths via Floyd-Warshall, itself exactly tropical
+semiring transitive closure). **Checked for overlap first**: this
+project's Smart Order Router (:mod:`src.execution.smart_order_router`)
+does real fee-inclusive water-filling across venues for a single,
+direct instrument -- it has no graph/shortest-path structure at all, so
+there is nothing there to "reformulate." A real, already-existing
+Bellman-Ford *is* used elsewhere (:func:`~nothierly_genesis.tda_engine.
+find_real_arbitrage_cycle`, single-source negative-cycle detection for
+arbitrage) -- itself already a real tropical-semiring algorithm, just
+never named as such, and **not duplicated here**: this module's new
+functions answer a different real question that detector cannot (the
+cheapest multi-hop path between two *specific*, arbitrary nodes, not
+"does a profitable closed cycle exist"), wired into a new, complementary
+function, :func:`~nothierly_genesis.tda_engine.find_cheapest_conversion_path`,
+reusing the exact same real ``-log(rate)`` edge-weight graph
+:func:`~nothierly_genesis.tda_engine.build_market_graph` already builds.
 """
 
 from __future__ import annotations
@@ -2739,3 +2760,155 @@ def fractional_volatility_scaling(sigma_base: float, horizon: float, hurst_expon
         raise ValueError("horizon must be positive.")
 
     return float(sigma_base * (horizon ** hurst_exponent))
+
+
+def tropical_matrix_multiply(a: npt.NDArray[np.float64], b: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
+    r"""Real tropical (min-plus) semiring matrix product: :math:`(A \otimes B)[i,j] = \min_k (A[i,k] + B[k,j])`.
+
+    The tropical semiring replaces ordinary :math:`(+, \times)` with
+    :math:`(\min, +)`: "addition" becomes ``min``, "multiplication"
+    becomes ``+``. This is the real algebraic structure underlying
+    shortest-path computation in general -- :func:`nothierly_genesis.
+    tda_engine.find_real_arbitrage_cycle`'s Bellman-Ford is already a
+    real, working instance of it (each Bellman-Ford relaxation step,
+    ``dist[v] = min(dist[v], dist[u] + weight(u, v))``, is exactly one
+    tropical vector-matrix multiplication), just never named as such
+    there. This function makes the semiring operation itself explicit
+    and directly usable: a length-``k`` walk's minimum total weight
+    between every pair of nodes is exactly the ordinary matrix power
+    ``W`` tropically-multiplied by itself ``k-1`` times, standard
+    tropical/min-plus algebra (see e.g. Butkovič, "Max-linear Systems:
+    Theory and Algorithms", 2010, on the closely related max-plus
+    semiring -- min-plus is the same structure with the order reversed).
+
+    Args:
+        a: Real ``(n, m)`` weight matrix. ``np.inf`` entries mean "no
+            edge" (the tropical semiring's additive identity).
+        b: Real ``(m, p)`` weight matrix, same convention.
+
+    Returns:
+        The real ``(n, p)`` tropical product.
+
+    Raises:
+        ValueError: If ``a``'s column count doesn't match ``b``'s row
+            count.
+    """
+    if a.shape[1] != b.shape[0]:
+        raise ValueError(f"a's column count ({a.shape[1]}) must match b's row count ({b.shape[0]}).")
+
+    return np.min(a[:, :, np.newaxis] + b[np.newaxis, :, :], axis=1)
+
+
+def tropical_shortest_paths(
+    weight_matrix: npt.NDArray[np.float64],
+) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.int_]]:
+    r"""Real all-pairs shortest paths via tropical (min-plus) semiring transitive closure -- Floyd-Warshall's own real algebraic structure.
+
+    **Genuinely complementary to, not a reimplementation of,
+    Bellman-Ford** (already real and already used by
+    :func:`~nothierly_genesis.tda_engine.find_real_arbitrage_cycle`):
+    Bellman-Ford there answers "does a profitable closed cycle exist
+    from this one source" -- it does not give the cheapest route
+    between two *different*, arbitrary nodes. This function computes
+    that: the real cheapest multi-hop path between every pair of nodes
+    at once, directly useful for Smart Order Router synthetic routing
+    (e.g. "no venue prices asset A -> asset C directly at a good rate,
+    but a cheap A -> B -> C route exists") -- a real capability the
+    existing cycle detector does not provide.
+
+    Uses the standard Floyd-Warshall dynamic program, :math:`dist[i][j]
+    \leftarrow \min(dist[i][j],\, dist[i][k] + dist[k][j])` for each
+    intermediate node :math:`k` in turn -- itself exactly the tropical
+    semiring's transitive closure (each iteration tropically
+    "multiplies in" one more intermediate node), the matrix-algebra
+    generalization of :func:`tropical_matrix_multiply` above to
+    repeated composition over every intermediate node rather than one
+    explicit matrix product.
+
+    Args:
+        weight_matrix: Real ``(n, n)`` directed edge-weight matrix.
+            ``weight_matrix[i, j]`` is the real edge weight from node
+            ``i`` to node ``j`` (e.g. ``-log(rate)``, the same real
+            convention :func:`~nothierly_genesis.tda_engine.
+            build_market_graph` already uses), or ``np.inf`` for "no
+            direct edge." Diagonal must be all zeros (real distance
+            from a node to itself).
+
+    Returns:
+        ``(distance_matrix, predecessor_matrix)``.
+        ``distance_matrix[i, j]`` is the real cheapest total weight of
+        any path from ``i`` to ``j`` (``np.inf`` if unreachable).
+        ``predecessor_matrix[i, j]`` is the index of the real
+        second-to-last node on that cheapest path from ``i`` to ``j``
+        (``-1`` if ``i == j`` or ``j`` is unreachable from ``i``) -- feed
+        to :func:`reconstruct_tropical_path` to recover the real node
+        sequence.
+
+    Raises:
+        ValueError: If ``weight_matrix`` isn't square, or its diagonal
+            isn't all zeros.
+        ArithmeticError: If a real negative-weight cycle is detected
+            (a node's real shortest distance to itself comes out
+            negative) -- shortest paths are undefined in that case (see
+            :func:`~nothierly_genesis.tda_engine.find_real_arbitrage_cycle`
+            for finding and reporting the real cycle itself instead).
+    """
+    n = weight_matrix.shape[0]
+    if weight_matrix.ndim != 2 or weight_matrix.shape[0] != weight_matrix.shape[1]:
+        raise ValueError(f"weight_matrix must be square 2D, got shape {weight_matrix.shape}.")
+    if not np.allclose(np.diag(weight_matrix), 0.0):
+        raise ValueError("weight_matrix diagonal must be all zeros (real distance from a node to itself).")
+
+    dist = weight_matrix.copy()
+    pred = np.full((n, n), -1, dtype=np.int_)
+    for i in range(n):
+        for j in range(n):
+            if i != j and np.isfinite(weight_matrix[i, j]):
+                pred[i, j] = i
+
+    for k in range(n):
+        via_k = dist[:, k, np.newaxis] + dist[np.newaxis, k, :]
+        improved = via_k < dist
+        dist = np.where(improved, via_k, dist)
+        pred = np.where(improved, pred[k, :][np.newaxis, :], pred)
+
+    if np.any(np.diag(dist) < 0):
+        raise ArithmeticError(
+            "Real negative-weight cycle detected (a node's shortest distance to itself is negative) -- "
+            "all-pairs shortest paths are undefined here. Use "
+            "nothierly_genesis.tda_engine.find_real_arbitrage_cycle to locate the real cycle."
+        )
+
+    return dist, pred
+
+
+def reconstruct_tropical_path(predecessor_matrix: npt.NDArray[np.int_], source: int, target: int) -> list[int]:
+    """Real node-index path from ``source`` to ``target``, walked back from :func:`tropical_shortest_paths`'s predecessor matrix.
+
+    Args:
+        predecessor_matrix: The real ``predecessor_matrix`` returned by
+            :func:`tropical_shortest_paths`.
+        source: Real source node index.
+        target: Real target node index.
+
+    Returns:
+        The real node-index path from ``source`` to ``target``
+        (inclusive of both endpoints), in order. ``[source]`` if
+        ``source == target``.
+
+    Raises:
+        ValueError: If ``target`` is unreachable from ``source`` (no
+            real path exists in ``predecessor_matrix``).
+    """
+    if source == target:
+        return [source]
+    if predecessor_matrix[source, target] == -1:
+        raise ValueError(f"No real path exists from node {source} to node {target}.")
+
+    path = [target]
+    current = target
+    while current != source:
+        current = int(predecessor_matrix[source, current])
+        path.append(current)
+    path.reverse()
+    return path

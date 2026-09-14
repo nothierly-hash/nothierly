@@ -73,6 +73,7 @@ import numpy.typing as npt
 from ripser import ripser
 
 from core.logger import get_logger
+from core.quant_math import reconstruct_tropical_path, tropical_shortest_paths
 
 _log = get_logger(__name__)
 
@@ -198,6 +199,80 @@ def find_real_arbitrage_cycle(graph: nx.DiGraph, *, source: str = MARKET_NODES[0
         cycle = cycle[pivot:-1] + cycle[:pivot] + [source]
 
     return cycle, profit_multiplier
+
+
+def find_cheapest_conversion_path(graph: nx.DiGraph, source: str, target: str) -> tuple[list[str], float] | None:
+    """Real cheapest multi-hop conversion path between two *specific* nodes -- what :func:`find_real_arbitrage_cycle` cannot answer.
+
+    Bellman-Ford above answers "does a profitable closed cycle exist
+    starting and ending at one source" -- it says nothing about the
+    cheapest way to convert node ``source`` into a *different* node
+    ``target`` when no single direct edge between them exists (e.g. no
+    venue quotes ``source -> target`` directly, but a real, cheap
+    ``source -> intermediate -> target`` route does). This function
+    answers that real, distinct question via
+    :func:`core.quant_math.tropical_shortest_paths` -- real tropical
+    (min-plus) semiring all-pairs shortest paths -- reusing the exact
+    same real ``weight = -log(m(i, j))`` convention ``graph`` already
+    carries from :func:`build_market_graph`, so a negative total weight
+    here means exactly what it means there: real value gained, not
+    lost, converting through this path.
+
+    **Why this calls :func:`core.quant_math.tropical_shortest_paths`
+    rather than networkx's own ``floyd_warshall_predecessor_and_distance``**
+    (already real, already correct, and ``networkx`` is already a hard
+    dependency of this very module): the actual tropical-algebra
+    primitive is kept in :mod:`core.quant_math` on purpose, as a
+    reusable, dependency-light NumPy function usable directly on a raw
+    rate matrix from anywhere in this project (e.g. a future
+    :mod:`src.execution.smart_order_router` caller with no
+    :mod:`networkx` graph object at all) -- not because networkx's own
+    equivalent was unknown or found lacking.
+
+    Args:
+        graph: A real directed graph from :func:`build_market_graph`
+            (or any graph using the same ``weight = -log(m)`` edge
+            convention).
+        source: Real source node. Must be a node of ``graph``.
+        target: Real target node. Must be a node of ``graph``.
+
+    Returns:
+        ``(path_nodes, value_multiplier)`` -- the real cheapest node
+        path from ``source`` to ``target`` (inclusive of both
+        endpoints) and the real, exact value multiplier converting 1
+        unit of ``source`` all the way to ``target`` along it
+        (``> 1.0`` means the path *gains* value net of every real fee
+        along the way). ``None`` if ``target`` is unreachable from
+        ``source``.
+
+    Raises:
+        ValueError: If ``source``/``target`` is not a node of ``graph``.
+        ArithmeticError: If ``graph`` contains a real negative-weight
+            cycle (propagated from :func:`core.quant_math.
+            tropical_shortest_paths`) -- shortest paths are undefined in
+            that case; use :func:`find_real_arbitrage_cycle` to locate
+            and report the real cycle itself instead.
+    """
+    if source not in graph:
+        raise ValueError(f"source {source!r} is not a node of graph.")
+    if target not in graph:
+        raise ValueError(f"target {target!r} is not a node of graph.")
+
+    nodes = list(graph.nodes())
+    node_index = {name: i for i, name in enumerate(nodes)}
+    weight_matrix = nx.to_numpy_array(graph, nodelist=nodes, weight="weight", nonedge=np.inf)
+    np.fill_diagonal(weight_matrix, 0.0)  # real distance from a node to itself, regardless of any self-loop edge
+
+    distance_matrix, predecessor_matrix = tropical_shortest_paths(weight_matrix)
+
+    src_idx, tgt_idx = node_index[source], node_index[target]
+    if not np.isfinite(distance_matrix[src_idx, tgt_idx]):
+        return None
+
+    path_indices = reconstruct_tropical_path(predecessor_matrix, src_idx, tgt_idx)
+    path_nodes = [nodes[i] for i in path_indices]
+    value_multiplier = math.exp(-float(distance_matrix[src_idx, tgt_idx]))
+    return path_nodes, value_multiplier
 
 
 def _build_friction_graph(nodes: Sequence[str] = MARKET_NODES, edges: MarketEdges = MARKET_EDGES) -> nx.Graph:
