@@ -20,6 +20,20 @@ existing ceiling, never replacing it:
    to total portfolio risk (Equal Risk Contribution / ERC), rather than
    equal notional -- the standard "risk parity" allocation.
 
+**2026-09-14, "La Geometrie de l'Information"**: adds a third
+capability, :meth:`compute_regime_transition_geodesic` (plus its
+informational sibling :meth:`compute_regime_distance`) -- a real,
+Fisher-Rao-geodesic-based sequence of ERC weight allocations for
+transitioning from the current live covariance regime to a different
+target regime, rather than one discontinuous jump or a naive linear
+blend of covariance matrices (which distorts the real risk geometry --
+see :func:`core.quant_math.spd_geodesic_interpolation`'s own docstring).
+Both real, closed-form primitives (:func:`~core.quant_math.
+spd_fisher_rao_distance`, :func:`~core.quant_math.spd_geodesic_interpolation`)
+live in :mod:`core.quant_math`, this class's own established pattern for
+where the actual math lives (see :func:`denoise_correlation_matrix_mp`
+above).
+
 Pure, stateless-with-respect-to-positions in the same sense as
 :class:`~src.agents.supervisor.risk_manager.RiskManager`: this class
 tracks price history for its own correlation/covariance estimates, but
@@ -35,7 +49,7 @@ import numpy as np
 import numpy.typing as npt
 
 from core.logger import get_logger
-from core.quant_math import denoise_correlation_matrix_mp
+from core.quant_math import denoise_correlation_matrix_mp, spd_fisher_rao_distance, spd_geodesic_interpolation
 
 _log = get_logger(__name__)
 
@@ -336,6 +350,19 @@ class PortfolioRiskParityManager:
         if len(instruments) < 2:
             raise ValueError("instruments must have at least 2 entries.")
 
+        covariance_matrix = self._build_covariance_matrix(instruments, denoise=denoise)
+        return self._solve_erc_weights(
+            covariance_matrix, instruments, max_iterations=max_iterations, tolerance=tolerance
+        )
+
+    def _build_covariance_matrix(self, instruments: list[str], *, denoise: bool) -> npt.NDArray[np.float64]:
+        """The real, live covariance matrix across ``instruments`` -- the exact construction :meth:`compute_risk_parity_weights` always used, extracted so :meth:`compute_regime_transition_geodesic` can reuse it unchanged rather than duplicating it.
+
+        Raises:
+            InsufficientPriceHistoryError: If any instrument lacks
+                sufficient history, or a pair doesn't share enough
+                overlapping history for the covariance estimate.
+        """
         n = len(instruments)
         correlation_matrix = np.eye(n, dtype=np.float64)
         variances = np.zeros(n, dtype=np.float64)
@@ -361,8 +388,19 @@ class PortfolioRiskParityManager:
                 )
 
         std_devs = np.sqrt(variances)
-        covariance_matrix = correlation_matrix * np.outer(std_devs, std_devs)
+        covariance_matrix: npt.NDArray[np.float64] = correlation_matrix * np.outer(std_devs, std_devs)
+        return covariance_matrix
 
+    @staticmethod
+    def _solve_erc_weights(
+        covariance_matrix: npt.NDArray[np.float64],
+        instruments: list[str],
+        *,
+        max_iterations: int,
+        tolerance: float,
+    ) -> dict[str, float]:
+        """The real Choueifaty-style ERC fixed-point solver, extracted so :meth:`compute_regime_transition_geodesic` can run it against an arbitrary (e.g. geodesically-interpolated) covariance matrix, not only this instance's own live-tracked one."""
+        n = len(instruments)
         weights = np.full(n, 1.0 / n, dtype=np.float64)
         for _ in range(max_iterations):
             portfolio_variance = float(weights @ covariance_matrix @ weights)
@@ -380,3 +418,134 @@ class PortfolioRiskParityManager:
             weights = new_weights
 
         return dict(zip(instruments, (float(w) for w in weights)))
+
+    def compute_regime_distance(
+        self, instruments: list[str], target_covariance_matrix: npt.NDArray[np.float64], *, denoise: bool = True
+    ) -> float:
+        """Real Fisher-Rao distance between this instance's current live covariance and a proposed target regime's covariance.
+
+        A real, quantified answer to "how different is the target
+        regime from where the portfolio actually is right now" --
+        informational, not a blocking gate: a caller (e.g. an operator,
+        or a future automated regime-shift handler) can use a large
+        real distance here as a signal to rebalance more urgently via
+        :meth:`compute_regime_transition_geodesic`, or a small one as a
+        signal that the current :meth:`compute_risk_parity_weights`
+        allocation is still close to appropriate.
+
+        Args:
+            instruments: Which instruments define both covariance
+                matrices' row/column order. Every one must have
+                sufficient live price history (see
+                :meth:`has_sufficient_history`).
+            target_covariance_matrix: Real ``(n, n)`` symmetric
+                positive-definite covariance matrix for the *target*
+                regime, in the same ``instruments`` order (e.g. a
+                different historical window's covariance, or a fitted
+                per-state covariance from :class:`~risk.regime_detector.
+                GaussianHMM` -- this method accepts the matrix directly
+                rather than importing that class, keeping this one
+                pure and reusable regardless of which detector produced
+                the target).
+
+        Returns:
+            The real, non-negative Fisher-Rao distance (see
+            :func:`core.quant_math.spd_fisher_rao_distance`) between the
+            current live covariance matrix and ``target_covariance_matrix``.
+
+        Raises:
+            ValueError: If ``instruments`` has fewer than 2 entries, or
+                ``target_covariance_matrix`` isn't a real, valid
+                symmetric positive-definite matrix of matching size.
+            InsufficientPriceHistoryError: If any instrument lacks
+                sufficient live history.
+        """
+        if len(instruments) < 2:
+            raise ValueError("instruments must have at least 2 entries.")
+
+        current_covariance_matrix = self._build_covariance_matrix(instruments, denoise=denoise)
+        return spd_fisher_rao_distance(current_covariance_matrix, target_covariance_matrix)
+
+    def compute_regime_transition_geodesic(
+        self,
+        instruments: list[str],
+        target_covariance_matrix: npt.NDArray[np.float64],
+        *,
+        num_steps: int = 5,
+        denoise: bool = True,
+        max_iterations: int = 200,
+        tolerance: float = 1e-8,
+    ) -> list[dict[str, float]]:
+        """Real, geodesically-fair sequence of ERC weight allocations transitioning from the current regime to a target regime.
+
+        **The real problem this solves**: :meth:`compute_risk_parity_weights`
+        gives a single, real ERC solution for whatever covariance matrix
+        it's handed -- it has no notion of *transitioning* from one
+        regime's allocation to another's. Jumping straight to a new
+        target regime's ERC weights the instant a regime shift is
+        detected is one real option; naively linearly blending two
+        covariance matrices before solving ERC is another, but distorts
+        the real underlying risk geometry (linear interpolation on
+        covariance matrices does not correspond to a constant rate of
+        real statistical change -- see :func:`core.quant_math.
+        spd_geodesic_interpolation`'s own docstring). This method instead
+        interpolates along the *real* Fisher-Rao geodesic
+        (:func:`core.quant_math.spd_geodesic_interpolation`) between the
+        current live covariance and ``target_covariance_matrix``, solving
+        real ERC weights (:meth:`_solve_erc_weights`, the exact same
+        solver :meth:`compute_risk_parity_weights` uses) at each real
+        intermediate step -- a real, principled glide path a caller can
+        phase a live rebalance across, rather than one discontinuous
+        jump.
+
+        Args:
+            instruments: Which instruments to weight, defining both
+                covariance matrices' row/column order. Every one must
+                have sufficient live price history.
+            target_covariance_matrix: Real ``(n, n)`` symmetric
+                positive-definite target-regime covariance matrix, same
+                ``instruments`` order -- see :meth:`compute_regime_distance`'s
+                own docstring for where this real matrix can come from.
+            num_steps: How many real points to compute along the
+                geodesic, including both endpoints (e.g. ``5`` gives
+                ``t = 0.0, 0.25, 0.5, 0.75, 1.0``). Must be at least 2.
+            denoise: Same Marchenko-Pastur cleaning as
+                :meth:`compute_risk_parity_weights`, applied to the
+                current live covariance matrix only (``target_covariance_matrix``
+                is used as given -- this method has no basis to clean a
+                matrix it didn't estimate from raw returns itself).
+            max_iterations: Passed through to each real ERC solve.
+            tolerance: Passed through to each real ERC solve.
+
+        Returns:
+            A real, ordered list of ``num_steps`` weight dicts (each
+            summing to ``1.0``), the first being (very close to) today's
+            actual :meth:`compute_risk_parity_weights` result, the last
+            being the real target regime's ERC weights.
+
+        Raises:
+            ValueError: If ``instruments`` has fewer than 2 entries,
+                ``num_steps < 2``, or ``target_covariance_matrix`` isn't a
+                real, valid symmetric positive-definite matrix of
+                matching size.
+            InsufficientPriceHistoryError: If any instrument lacks
+                sufficient live history.
+        """
+        if len(instruments) < 2:
+            raise ValueError("instruments must have at least 2 entries.")
+        if num_steps < 2:
+            raise ValueError("num_steps must be at least 2.")
+
+        current_covariance_matrix = self._build_covariance_matrix(instruments, denoise=denoise)
+
+        path: list[dict[str, float]] = []
+        for t in np.linspace(0.0, 1.0, num_steps):
+            step_covariance_matrix = spd_geodesic_interpolation(
+                current_covariance_matrix, target_covariance_matrix, float(t)
+            )
+            path.append(
+                self._solve_erc_weights(
+                    step_covariance_matrix, instruments, max_iterations=max_iterations, tolerance=tolerance
+                )
+            )
+        return path
