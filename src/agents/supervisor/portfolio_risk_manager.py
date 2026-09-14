@@ -34,6 +34,18 @@ live in :mod:`core.quant_math`, this class's own established pattern for
 where the actual math lives (see :func:`denoise_correlation_matrix_mp`
 above).
 
+**2026-09-14, "HRP p-adique / ultrametrique"**: adds a fourth
+capability, :meth:`compute_hierarchical_risk_parity_weights` -- Lopez de
+Prado's real Hierarchical Risk Parity, a genuinely different real
+portfolio-construction method from :meth:`compute_risk_parity_weights`'s
+ERC (tree-clustering + recursive bisection instead of one flat
+fixed-point equalization), returning the same ``{instrument: weight}``
+shape for direct comparison. See :func:`~core.quant_math.
+hierarchical_risk_parity_weights`'s own docstring for the real,
+disclosed correction on what "p-adic" honestly means here (a shared
+ultrametric *structure* with p-adic numbers, not p-adic arithmetic
+itself).
+
 Pure, stateless-with-respect-to-positions in the same sense as
 :class:`~src.agents.supervisor.risk_manager.RiskManager`: this class
 tracks price history for its own correlation/covariance estimates, but
@@ -49,7 +61,12 @@ import numpy as np
 import numpy.typing as npt
 
 from core.logger import get_logger
-from core.quant_math import denoise_correlation_matrix_mp, spd_fisher_rao_distance, spd_geodesic_interpolation
+from core.quant_math import (
+    denoise_correlation_matrix_mp,
+    hierarchical_risk_parity_weights,
+    spd_fisher_rao_distance,
+    spd_geodesic_interpolation,
+)
 
 _log = get_logger(__name__)
 
@@ -417,6 +434,52 @@ class PortfolioRiskParityManager:
                 break
             weights = new_weights
 
+        return dict(zip(instruments, (float(w) for w in weights)))
+
+    def compute_hierarchical_risk_parity_weights(
+        self, instruments: list[str], *, linkage_method: str = "single", denoise: bool = True
+    ) -> dict[str, float]:
+        """Real Hierarchical Risk Parity (HRP) weights -- a genuinely different, complementary allocation from :meth:`compute_risk_parity_weights`'s ERC, not a second name for the same result.
+
+        Where ERC solves one flat fixed-point equalizing every
+        instrument's risk contribution simultaneously, HRP
+        (:func:`core.quant_math.hierarchical_risk_parity_weights`)
+        clusters correlated instruments first (via a real dendrogram,
+        see that function's own docstring on why its leaf order is a
+        real, mathematically guaranteed ultrametric) and only then
+        allocates recursively within that tree -- never inverting the
+        full covariance matrix, the real, documented reason it stays
+        numerically well-behaved even when ``instruments`` contains a
+        near-degenerate pair (two nearly perfectly correlated
+        instruments), a real case ERC's own fixed-point iteration does
+        not have the same guarantee against.
+
+        Args:
+            instruments: Which instruments to weight. Every one must
+                have sufficient price history (see
+                :meth:`has_sufficient_history`).
+            linkage_method: Passed through to
+                :func:`core.quant_math.hierarchical_risk_parity_weights`.
+            denoise: Same real Marchenko-Pastur correlation cleaning as
+                :meth:`compute_risk_parity_weights`, applied identically
+                before the covariance matrix is built.
+
+        Returns:
+            ``{instrument: weight}``, weights summing to ``1.0`` -- same
+            shape as :meth:`compute_risk_parity_weights`'s own return,
+            for direct side-by-side comparison.
+
+        Raises:
+            ValueError: If ``instruments`` has fewer than 2 entries.
+            InsufficientPriceHistoryError: If any instrument lacks
+                sufficient history, or a pair doesn't share enough
+                overlapping history for the covariance estimate.
+        """
+        if len(instruments) < 2:
+            raise ValueError("instruments must have at least 2 entries.")
+
+        covariance_matrix = self._build_covariance_matrix(instruments, denoise=denoise)
+        weights = hierarchical_risk_parity_weights(covariance_matrix, linkage_method=linkage_method)
         return dict(zip(instruments, (float(w) for w in weights)))
 
     def compute_regime_distance(

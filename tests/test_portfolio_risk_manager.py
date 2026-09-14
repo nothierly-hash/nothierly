@@ -4,11 +4,12 @@ No dedicated test file existed for this class before this one -- these
 tests both establish a real regression safety net for the 2026-09-14
 refactor that extracted _build_covariance_matrix/_solve_erc_weights out
 of compute_risk_parity_weights (so compute_regime_transition_geodesic
-could reuse them without duplicating the ERC solver), and cover the new
-Fisher-Rao-geodesic methods themselves. See
+and compute_hierarchical_risk_parity_weights could reuse them without
+duplicating the ERC solver / covariance construction), and cover the new
+Fisher-Rao-geodesic and Hierarchical Risk Parity methods themselves. See
 src/agents/supervisor/portfolio_risk_manager.py's own module docstring
-and core/quant_math.py's "La Geometrie de l'Information" entry for the
-underlying real math.
+and core/quant_math.py's "La Geometrie de l'Information" / "HRP
+p-adique / ultrametrique" entries for the underlying real math.
 """
 
 from __future__ import annotations
@@ -171,3 +172,45 @@ def test_regime_distance_raises_insufficient_history_for_an_unrecorded_instrumen
     target_covariance = manager._build_covariance_matrix(instruments, denoise=False)
     with pytest.raises(InsufficientPriceHistoryError):
         manager.compute_regime_distance(["BTC/USDT", "NEVER_RECORDED"], target_covariance)
+
+
+# =============================================================================
+# compute_hierarchical_risk_parity_weights
+# =============================================================================
+
+
+def test_hrp_weights_sum_to_one_and_are_positive() -> None:
+    manager = PortfolioRiskParityManager(lookback_window=100)
+    _feed_real_random_walk(manager, "A", n=100, sigma=0.01, seed=21)
+    _feed_real_random_walk(manager, "B", n=100, sigma=0.02, seed=22)
+    _feed_real_random_walk(manager, "C", n=100, sigma=0.015, seed=23)
+
+    weights = manager.compute_hierarchical_risk_parity_weights(["A", "B", "C"], denoise=False)
+    assert sum(weights.values()) == pytest.approx(1.0, rel=1e-6)
+    assert all(w > 0 for w in weights.values())
+    assert set(weights.keys()) == {"A", "B", "C"}
+
+
+def test_hrp_two_asset_case_is_real_inverse_variance_not_ercs_inverse_volatility() -> None:
+    """A real, documented distinction between the two methods, not a bug: ERC's 2-asset closed form is
+    inverse-VOLATILITY (1/sigma, Maillard/Roncalli/Teiletche 2010); HRP's own published recursive-bisection
+    formula (Lopez de Prado's getRecBipart, using each singleton cluster's own variance) is inverse-VARIANCE
+    (1/sigma^2) -- they genuinely disagree here, and asserting they agree would be testing the wrong thing."""
+    manager = PortfolioRiskParityManager(lookback_window=500)
+    _feed_real_random_walk(manager, "LOW_VOL", n=500, sigma=0.005, seed=31)
+    _feed_real_random_walk(manager, "HIGH_VOL", n=500, sigma=0.020, seed=32)
+
+    erc_weights = manager.compute_risk_parity_weights(["LOW_VOL", "HIGH_VOL"], denoise=False)
+    hrp_weights = manager.compute_hierarchical_risk_parity_weights(["LOW_VOL", "HIGH_VOL"], denoise=False)
+
+    # ERC: inverse-volatility ratio 0.020/0.005 = 4 -> LOW_VOL weight ~0.8
+    assert erc_weights["LOW_VOL"] == pytest.approx(0.8, rel=0.1)
+    # HRP: inverse-variance ratio 0.020^2/0.005^2 = 16 -> LOW_VOL weight ~16/17 = 0.941
+    assert hrp_weights["LOW_VOL"] == pytest.approx(16.0 / 17.0, rel=0.1)
+    assert hrp_weights["LOW_VOL"] > erc_weights["LOW_VOL"]  # HRP tilts harder toward the lower-variance asset here
+
+
+def test_hrp_rejects_too_few_instruments() -> None:
+    manager, _instruments = _instruments_and_manager()
+    with pytest.raises(ValueError, match="at least 2"):
+        manager.compute_hierarchical_risk_parity_weights(["BTC/USDT"])
