@@ -390,6 +390,32 @@ _GATE_NAMES: Final[tuple[str, str, str, str, str, str, str, str]] = (
     "Control State",
 )
 
+# -- 2026-09-14, "Logique Combinatoire" -- real Boolean-algebra transition guard for PositionState.status.
+#
+# Real correction to the brief's own framing, made before writing any code: this project already has
+# a real, working AND-chain of sequential boolean gates (the 8 gates above, "Protocole 7-Gates
+# Convergence") -- Gate 2 (Cooldown) already refuses a duplicate entry the same way the brief's own
+# `IF (Signal_Alpha==1) AND (Risk_Limit==0) AND ...` example describes. What the brief's "ghost state
+# from a badly managed loop" framing actually pointed at, once investigated directly against this
+# file's own real concurrency model, was narrower and more serious than a loop bug: _place_order and
+# _close_position are each reachable from two independent, concurrently-running asyncio listeners
+# (the ZMQ signal/price bus, and the Redis manual-override channel -- see ExecutionAgent.run's own
+# asyncio.gather). Gate 2's check and PositionState's eventual mutation are separated by several real
+# `await` points (sizing calc, a Redis gate-report publish, real broker price/balance/margin lookups)
+# -- a real, demonstrable check-then-act race where both listeners could see the same instrument as
+# FLAT and both proceed. The load-bearing fix for that real race is ExecutionAgent._lock_for's
+# per-instrument asyncio.Lock (see _place_order/_close_position), not a state-transition table by
+# itself -- a transition table cannot prevent two callers from each independently observing a valid
+# pre-transition state before either one mutates it. _VALID_POSITION_TRANSITIONS below is the real,
+# literal, honestly-scoped answer to the brief's own specific ask (a Boolean truth table governing
+# which position-status transitions are legal, formally excluding exactly the LONG->LONG/SHORT->SHORT
+# "ghost state" duplicate the brief worried about) -- a defense-in-depth invariant enforced at both
+# real mutation sites, layered on top of the lock that actually closes the race, not a substitute for
+# it.
+_VALID_POSITION_TRANSITIONS: Final[frozenset[tuple[str, str]]] = frozenset(
+    {("FLAT", "LONG"), ("FLAT", "SHORT"), ("LONG", "FLAT"), ("SHORT", "FLAT")}
+)
+
 # -- Gate 7 "StochasticCore" (2026-09-13, "Protocole Stochastic Core") -----
 #
 # Real model parameters, not fitted per-instrument (no real, sufficiently
@@ -547,6 +573,36 @@ class PositionState:
     opened_at: float | None = None
     entered_as_simulated: bool = False
     entered_as_shadow_controlled: bool = False
+
+    def assert_valid_transition(self, new_status: Literal["FLAT", "LONG", "SHORT"]) -> None:
+        """Real Boolean-algebra guard: raises if ``(self.status, new_status)`` is not one of the 4 legal position transitions.
+
+        See :data:`_VALID_POSITION_TRANSITIONS`'s own module-level
+        comment for what real problem this formalizes and what it does
+        not (the per-instrument lock, not this table, is what actually
+        prevents two concurrent callers from racing to the same
+        transition). Called at both of this class's real mutation
+        sites -- :meth:`ExecutionAgent._place_order` and
+        :meth:`ExecutionAgent._close_position` -- immediately before
+        the assignment, so an invalid transition is caught at the exact
+        real point it would otherwise silently happen, not discovered
+        later from its downstream effects.
+
+        Raises:
+            ValueError: If ``(self.status, new_status)`` is not one of
+                the 4 legal transitions (``FLAT->LONG``, ``FLAT->SHORT``,
+                ``LONG->FLAT``, ``SHORT->FLAT``) -- most notably
+                catching the real "ghost state" the brief describes:
+                ``LONG->LONG``/``SHORT->SHORT`` (opening a second
+                position on top of an already-open one) and
+                ``LONG->SHORT``/``SHORT->LONG`` (flipping direction
+                without ever passing back through ``FLAT``).
+        """
+        if (self.status, new_status) not in _VALID_POSITION_TRANSITIONS:
+            raise ValueError(
+                f"Invalid position transition: {self.status!r} -> {new_status!r}. "
+                f"Legal transitions are {sorted(_VALID_POSITION_TRANSITIONS)!r}."
+            )
 
 
 @dataclass(frozen=True)
@@ -732,6 +788,11 @@ class ExecutionAgent(BaseAgent):
         self._positions: dict[str, PositionState] = {}
         self._last_prices: dict[str, float] = {}
         self._current_exposure = 0.0
+        # 2026-09-14, "Logique Combinatoire" -- the real fix for a real cross-listener check-then-act
+        # race found by direct investigation (see _VALID_POSITION_TRANSITIONS's own module-level
+        # comment): one real asyncio.Lock per instrument, created lazily on first use so this never
+        # needs to know the full instrument set up front.
+        self._instrument_locks: dict[str, asyncio.Lock] = {}
 
         # Gate 7 "StochasticCore" real inputs -- see _gate_7_stochastic_core.
         # _tick_events: per-instrument (timestamp, |order_book_imbalance|)
@@ -757,6 +818,19 @@ class ExecutionAgent(BaseAgent):
     def _position_for(self, instrument: str) -> PositionState:
         """Return (creating if needed) the :class:`PositionState` for ``instrument``."""
         return self._positions.setdefault(instrument, PositionState())
+
+    def _lock_for(self, instrument: str) -> asyncio.Lock:
+        """The one real :class:`asyncio.Lock` serializing every position-state read-check-mutate sequence for ``instrument``.
+
+        Held for the full duration of :meth:`_place_order` and
+        :meth:`_close_position` (see :data:`_VALID_POSITION_TRANSITIONS`'s
+        own module-level comment for the real race this closes) --
+        created lazily per instrument, never shared across instruments,
+        so two different instruments' entries/exits remain fully
+        concurrent with each other; only two operations on the *same*
+        instrument are ever serialized.
+        """
+        return self._instrument_locks.setdefault(instrument, asyncio.Lock())
 
     def _open_position_count(self) -> int:
         """How many instruments currently have a non-``FLAT`` position open."""
@@ -1977,143 +2051,155 @@ class ExecutionAgent(BaseAgent):
                 (only for the real, consensus-driven path, matching this
                 method's original behavior before this refactor: a
                 manual override was never logged there).
+
+        **2026-09-14, "Logique Combinatoire"**: the whole real body below
+        now runs under :meth:`_lock_for` (``instrument``) -- see
+        :data:`_VALID_POSITION_TRANSITIONS`'s own module-level comment
+        for the real cross-listener race this closes (Gate 2's cooldown
+        check and this method's own position mutation used to be
+        separated by several real ``await`` points with nothing
+        preventing another concurrent call for the same instrument from
+        interleaving in between).
         """
-        report, current_price, account_balance, raw_units = await self._validate_execution_gates(
-            instrument, direction, signals
-        )
-
-        if signals is not None:
-            risk_pct = await self._get_dynamic_risk_pct() if report.all_passed else None
-            await self.generate_decision_report(
-                instrument=instrument,
-                consensus_result="consensus",
-                rl_signal=signals.get("rl-signal-agent"),
-                xgb_signal=signals.get("supervisor-agent"),
-                current_price=current_price if current_price is not None else self._last_prices.get(instrument),
-                risk_pct=risk_pct,
-                execution_action=("BUY" if direction == 1 else "SELL") if report.all_passed else "HOLD",
+        async with self._lock_for(instrument):
+            report, current_price, account_balance, raw_units = await self._validate_execution_gates(
+                instrument, direction, signals
             )
 
-        if not report.all_passed:
-            first_failed = next(gate for gate in report.gates if gate.status == "FAILED")
-            self._log.warning(
-                "consensus_entry_rejected_by_gate",
-                agent_id=self.agent_id, instrument=instrument,
-                gate_number=first_failed.number, gate_name=first_failed.name, detail=first_failed.detail,
-            )
-            return
-
-        assert current_price is not None and account_balance is not None  # report.all_passed guarantees both were resolved
-        simulate_this_entry = report.final_action in ("MOCK_ORDER", "SHADOW_ORDER")
-        shadow_controlled = report.final_action == "SHADOW_ORDER"
-        # Recomputed, not threaded back from _validate_execution_gates:
-        # deterministic given current_price/direction/_stop_loss_pct, and
-        # only needed here for the MOCK_MODE_SIMULATED_ORDER log line below.
-        stop_loss_price = (
-            current_price * (1 - self._stop_loss_pct)
-            if direction == 1
-            else current_price * (1 + self._stop_loss_pct)
-        )
-
-        # OANDA's real order API requires whole (integer) units; neither
-        # MOCK_MODE nor SHADOW ever calls it (see simulate_this_entry
-        # above), and internal bookkeeping/PnL math (see
-        # _close_position) works identically for fractional units, so
-        # both keep raw_units' full precision instead of truncating it.
-        # This matters concretely for a high-price-per-unit instrument
-        # like BTC/USDT: at this project's default $10,000 capital and
-        # 1% risk, a single BTC entry sizes to roughly 0.11 units --
-        # int() truncation would silently round every such entry to
-        # zero, and this agent would never open a crypto position at
-        # all under either simulated mode.
-        units: float = raw_units if simulate_this_entry else float(int(raw_units))
-        if direction == -1:
-            units = -units
-        if abs(units) < 1e-9:
-            self._log.warning(
-                "consensus_order_size_rounds_to_zero_units",
-                agent_id=self.agent_id,
-                instrument=instrument,
-                target=raw_units,
-            )
-            return
-
-        if simulate_this_entry:
-            self._log.warning(
-                "MOCK_MODE_SIMULATED_ORDER" if self._mock_mode else "SHADOW_MODE_SIMULATED_ORDER",
-                agent_id=self.agent_id,
-                instrument=instrument,
-                direction="BUY" if direction == 1 else "SELL",
-                units=round(units, 6),
-                entry_price=current_price,
-                stop_loss_price=round(stop_loss_price, 5),
-                confidence=round(confidence, 4),
-                detail=(
-                    "MOCK_MODE=true: no real OANDA call was made."
-                    if self._mock_mode
-                    else "control_state=SHADOW (operator-set): no real OANDA call was made."
-                ),
-            )
-            await self._log_fill(
-                instrument=instrument,
-                action="ENTRY_LONG" if direction == 1 else "ENTRY_SHORT",
-                price=current_price,
-                units=units,
-                latency_ms=0.0,
-                agent_control_shadow=shadow_controlled,
-            )
-        else:
-            order_start = time.monotonic()
-            try:
-                order = await safe_financial_call(
-                    self._trading_client.create_market_order, instrument, int(units), retry_on_failure=False
-                )
-            except FinancialCallAbortedError:
-                self._log.error(
-                    "consensus_order_execution_aborted",
-                    agent_id=self.agent_id,
+            if signals is not None:
+                risk_pct = await self._get_dynamic_risk_pct() if report.all_passed else None
+                await self.generate_decision_report(
                     instrument=instrument,
-                    direction=direction,
-                    units=units,
-                    detail="Global Kill Switch has been tripped -- see prior log line.",
+                    consensus_result="consensus",
+                    rl_signal=signals.get("rl-signal-agent"),
+                    xgb_signal=signals.get("supervisor-agent"),
+                    current_price=current_price if current_price is not None else self._last_prices.get(instrument),
+                    risk_pct=risk_pct,
+                    execution_action=("BUY" if direction == 1 else "SELL") if report.all_passed else "HOLD",
+                )
+
+            if not report.all_passed:
+                first_failed = next(gate for gate in report.gates if gate.status == "FAILED")
+                self._log.warning(
+                    "consensus_entry_rejected_by_gate",
+                    agent_id=self.agent_id, instrument=instrument,
+                    gate_number=first_failed.number, gate_name=first_failed.name, detail=first_failed.detail,
                 )
                 return
-            order_latency_ms = (time.monotonic() - order_start) * 1000.0
-            await self._log_fill(
-                instrument=instrument,
-                action="ENTRY_LONG" if direction == 1 else "ENTRY_SHORT",
-                price=current_price,
-                units=units,
-                latency_ms=order_latency_ms,
-            )
-            self._log.info(
-                "consensus_order_executed",
-                agent_id=self.agent_id,
-                instrument=instrument,
-                order_id=order.get("id"),
-                direction=direction,
-                units=units,
-            )
-            execution = TradeExecution(
-                symbol=instrument,
-                side=TradeSide.BUY if direction == 1 else TradeSide.SELL,
-                cost=abs(units) * current_price,
-                order_id=str(order.get("id", "unknown")),
-            )
-            await self.publish(_TRADE_EXECUTED_TOPIC, execution.model_dump(mode="json"))
 
-        position = self._position_for(instrument)
-        position.status = "LONG" if direction == 1 else "SHORT"
-        position.entry_price = current_price
-        position.units_held = units
-        position.highest_seen_price = current_price if direction == 1 else None
-        position.lowest_seen_price = current_price if direction == -1 else None
-        position.cooldown_until = None
-        position.opened_at = time.time()
-        position.entered_as_simulated = simulate_this_entry
-        position.entered_as_shadow_controlled = shadow_controlled
-        self._current_exposure += abs(units) * current_price
-        await self._publish_active_positions()
+            assert current_price is not None and account_balance is not None  # report.all_passed guarantees both were resolved
+            simulate_this_entry = report.final_action in ("MOCK_ORDER", "SHADOW_ORDER")
+            shadow_controlled = report.final_action == "SHADOW_ORDER"
+            # Recomputed, not threaded back from _validate_execution_gates:
+            # deterministic given current_price/direction/_stop_loss_pct, and
+            # only needed here for the MOCK_MODE_SIMULATED_ORDER log line below.
+            stop_loss_price = (
+                current_price * (1 - self._stop_loss_pct)
+                if direction == 1
+                else current_price * (1 + self._stop_loss_pct)
+            )
+
+            # OANDA's real order API requires whole (integer) units; neither
+            # MOCK_MODE nor SHADOW ever calls it (see simulate_this_entry
+            # above), and internal bookkeeping/PnL math (see
+            # _close_position) works identically for fractional units, so
+            # both keep raw_units' full precision instead of truncating it.
+            # This matters concretely for a high-price-per-unit instrument
+            # like BTC/USDT: at this project's default $10,000 capital and
+            # 1% risk, a single BTC entry sizes to roughly 0.11 units --
+            # int() truncation would silently round every such entry to
+            # zero, and this agent would never open a crypto position at
+            # all under either simulated mode.
+            units: float = raw_units if simulate_this_entry else float(int(raw_units))
+            if direction == -1:
+                units = -units
+            if abs(units) < 1e-9:
+                self._log.warning(
+                    "consensus_order_size_rounds_to_zero_units",
+                    agent_id=self.agent_id,
+                    instrument=instrument,
+                    target=raw_units,
+                )
+                return
+
+            if simulate_this_entry:
+                self._log.warning(
+                    "MOCK_MODE_SIMULATED_ORDER" if self._mock_mode else "SHADOW_MODE_SIMULATED_ORDER",
+                    agent_id=self.agent_id,
+                    instrument=instrument,
+                    direction="BUY" if direction == 1 else "SELL",
+                    units=round(units, 6),
+                    entry_price=current_price,
+                    stop_loss_price=round(stop_loss_price, 5),
+                    confidence=round(confidence, 4),
+                    detail=(
+                        "MOCK_MODE=true: no real OANDA call was made."
+                        if self._mock_mode
+                        else "control_state=SHADOW (operator-set): no real OANDA call was made."
+                    ),
+                )
+                await self._log_fill(
+                    instrument=instrument,
+                    action="ENTRY_LONG" if direction == 1 else "ENTRY_SHORT",
+                    price=current_price,
+                    units=units,
+                    latency_ms=0.0,
+                    agent_control_shadow=shadow_controlled,
+                )
+            else:
+                order_start = time.monotonic()
+                try:
+                    order = await safe_financial_call(
+                        self._trading_client.create_market_order, instrument, int(units), retry_on_failure=False
+                    )
+                except FinancialCallAbortedError:
+                    self._log.error(
+                        "consensus_order_execution_aborted",
+                        agent_id=self.agent_id,
+                        instrument=instrument,
+                        direction=direction,
+                        units=units,
+                        detail="Global Kill Switch has been tripped -- see prior log line.",
+                    )
+                    return
+                order_latency_ms = (time.monotonic() - order_start) * 1000.0
+                await self._log_fill(
+                    instrument=instrument,
+                    action="ENTRY_LONG" if direction == 1 else "ENTRY_SHORT",
+                    price=current_price,
+                    units=units,
+                    latency_ms=order_latency_ms,
+                )
+                self._log.info(
+                    "consensus_order_executed",
+                    agent_id=self.agent_id,
+                    instrument=instrument,
+                    order_id=order.get("id"),
+                    direction=direction,
+                    units=units,
+                )
+                execution = TradeExecution(
+                    symbol=instrument,
+                    side=TradeSide.BUY if direction == 1 else TradeSide.SELL,
+                    cost=abs(units) * current_price,
+                    order_id=str(order.get("id", "unknown")),
+                )
+                await self.publish(_TRADE_EXECUTED_TOPIC, execution.model_dump(mode="json"))
+
+            position = self._position_for(instrument)
+            new_status: Literal["LONG", "SHORT"] = "LONG" if direction == 1 else "SHORT"
+            position.assert_valid_transition(new_status)
+            position.status = new_status
+            position.entry_price = current_price
+            position.units_held = units
+            position.highest_seen_price = current_price if direction == 1 else None
+            position.lowest_seen_price = current_price if direction == -1 else None
+            position.cooldown_until = None
+            position.opened_at = time.time()
+            position.entered_as_simulated = simulate_this_entry
+            position.entered_as_shadow_controlled = shadow_controlled
+            self._current_exposure += abs(units) * current_price
+            await self._publish_active_positions()
 
     async def calculate_position_size(
         self, instrument: str, current_price: float, stop_loss_price: float, account_balance: float
@@ -3225,94 +3311,110 @@ class ExecutionAgent(BaseAgent):
                 situation this project's own asset-class gap causes
                 today: no live price ever arrives for the OANDA
                 instrument this agent trades).
+
+        **2026-09-14, "Logique Combinatoire"**: also runs under
+        :meth:`_lock_for` (``instrument``), same real reason as
+        :meth:`_place_order` -- this method is reachable from the same
+        two independent listeners (a price-triggered exit on the ZMQ
+        bus, a manual close on the Redis channel), and its own early
+        "nothing open" check below only protects the fully-sequential
+        case; two interleaved concurrent calls could otherwise both
+        pass it and both attempt a real close.
         """
-        position = self._positions.get(instrument)
-        if position is None or position.status == "FLAT" or position.entry_price is None or position.units_held is None:
-            return  # nothing open (e.g. a veto and a price-trigger raced; the first one already closed it)
+        async with self._lock_for(instrument):
+            position = self._positions.get(instrument)
+            if (
+                position is None
+                or position.status == "FLAT"
+                or position.entry_price is None
+                or position.units_held is None
+            ):
+                return  # nothing open (e.g. a veto and a price-trigger raced; the first one already closed it)
 
-        close_price = price if price is not None else self._last_prices.get(instrument, position.entry_price)
-        closing_units = -position.units_held
-        pnl = (close_price - position.entry_price) * position.units_held
+            close_price = price if price is not None else self._last_prices.get(instrument, position.entry_price)
+            closing_units = -position.units_held
+            pnl = (close_price - position.entry_price) * position.units_held
 
-        if position.entered_as_simulated:
-            # Closed the same way it was opened -- see PositionState.
-            # entered_as_simulated's own docstring on why this reads the
-            # position's own stored flag, never self._mock_mode/
-            # control_state directly (either can have changed since
-            # entry). self._mock_balance is updated regardless of
-            # *which* reason this position was simulated for: entry
-            # sizing already drew against it either way (see
-            # _place_order's own simulate_this_entry), so closing must
-            # settle the same fictional ledger it was opened against.
-            self._mock_balance += pnl
-            await self._check_drawdown_trigger(self._mock_balance)
-            self._log.warning(
-                "SHADOW_MODE_SIMULATED_ORDER" if position.entered_as_shadow_controlled else "MOCK_MODE_SIMULATED_ORDER",
-                agent_id=self.agent_id,
-                instrument=instrument,
-                action="CLOSE",
-                reason=reason,
-                units=closing_units,
-                entry_price=position.entry_price,
-                close_price=close_price,
-                pnl=round(pnl, 2),
-                mock_balance=round(self._mock_balance, 2),
-                detail=(
-                    "This position was entered under control_state=SHADOW: no real OANDA call was made."
-                    if position.entered_as_shadow_controlled
-                    else "MOCK_MODE=true: no real OANDA call was made."
-                ),
-            )
-            await self._log_fill(
-                instrument=instrument, action="EXIT", price=close_price, units=closing_units,
-                latency_ms=0.0, reason=reason, agent_control_shadow=position.entered_as_shadow_controlled,
-            )
-        else:
-            close_start = time.monotonic()
-            try:
-                order = await safe_financial_call(
-                    self._trading_client.create_market_order,
-                    instrument,
-                    int(closing_units),
-                    retry_on_failure=False,
+            if position.entered_as_simulated:
+                # Closed the same way it was opened -- see PositionState.
+                # entered_as_simulated's own docstring on why this reads the
+                # position's own stored flag, never self._mock_mode/
+                # control_state directly (either can have changed since
+                # entry). self._mock_balance is updated regardless of
+                # *which* reason this position was simulated for: entry
+                # sizing already drew against it either way (see
+                # _place_order's own simulate_this_entry), so closing must
+                # settle the same fictional ledger it was opened against.
+                self._mock_balance += pnl
+                await self._check_drawdown_trigger(self._mock_balance)
+                self._log.warning(
+                    "SHADOW_MODE_SIMULATED_ORDER" if position.entered_as_shadow_controlled else "MOCK_MODE_SIMULATED_ORDER",
+                    agent_id=self.agent_id,
+                    instrument=instrument,
+                    action="CLOSE",
+                    reason=reason,
+                    units=closing_units,
+                    entry_price=position.entry_price,
+                    close_price=close_price,
+                    pnl=round(pnl, 2),
+                    mock_balance=round(self._mock_balance, 2),
+                    detail=(
+                        "This position was entered under control_state=SHADOW: no real OANDA call was made."
+                        if position.entered_as_shadow_controlled
+                        else "MOCK_MODE=true: no real OANDA call was made."
+                    ),
                 )
-            except FinancialCallAbortedError:
-                self._log.error(
-                    "position_close_failed_leaving_position_open",
+                await self._log_fill(
+                    instrument=instrument, action="EXIT", price=close_price, units=closing_units,
+                    latency_ms=0.0, reason=reason, agent_control_shadow=position.entered_as_shadow_controlled,
+                )
+            else:
+                close_start = time.monotonic()
+                try:
+                    order = await safe_financial_call(
+                        self._trading_client.create_market_order,
+                        instrument,
+                        int(closing_units),
+                        retry_on_failure=False,
+                    )
+                except FinancialCallAbortedError:
+                    self._log.error(
+                        "position_close_failed_leaving_position_open",
+                        agent_id=self.agent_id,
+                        instrument=instrument,
+                        reason=reason,
+                        detail=(
+                            "MANUAL INTERVENTION MAY BE REQUIRED: the close order failed and the "
+                            "Global Kill Switch has been tripped by safe_financial_call -- this "
+                            "position is still open at OANDA."
+                        ),
+                    )
+                    return
+                close_latency_ms = (time.monotonic() - close_start) * 1000.0
+                await self._log_fill(
+                    instrument=instrument, action="EXIT", price=close_price, units=closing_units,
+                    latency_ms=close_latency_ms, reason=reason,
+                )
+                self._log.warning(
+                    "consensus_position_closed",
                     agent_id=self.agent_id,
                     instrument=instrument,
                     reason=reason,
-                    detail=(
-                        "MANUAL INTERVENTION MAY BE REQUIRED: the close order failed and the "
-                        "Global Kill Switch has been tripped by safe_financial_call -- this "
-                        "position is still open at OANDA."
-                    ),
+                    order_id=order.get("id"),
+                    units=closing_units,
+                    entry_price=position.entry_price,
+                    close_price=close_price,
+                    pnl=round(pnl, 2),
                 )
-                return
-            close_latency_ms = (time.monotonic() - close_start) * 1000.0
-            await self._log_fill(
-                instrument=instrument, action="EXIT", price=close_price, units=closing_units,
-                latency_ms=close_latency_ms, reason=reason,
-            )
-            self._log.warning(
-                "consensus_position_closed",
-                agent_id=self.agent_id,
-                instrument=instrument,
-                reason=reason,
-                order_id=order.get("id"),
-                units=closing_units,
-                entry_price=position.entry_price,
-                close_price=close_price,
-                pnl=round(pnl, 2),
-            )
-            execution = TradeExecution(
-                symbol=instrument,
-                side=TradeSide.SELL if position.status == "LONG" else TradeSide.BUY,
-                cost=abs(closing_units) * close_price,
-                order_id=str(order.get("id", "unknown")),
-            )
-            await self.publish(_TRADE_EXECUTED_TOPIC, execution.model_dump(mode="json"))
+                execution = TradeExecution(
+                    symbol=instrument,
+                    side=TradeSide.SELL if position.status == "LONG" else TradeSide.BUY,
+                    cost=abs(closing_units) * close_price,
+                    order_id=str(order.get("id", "unknown")),
+                )
+                await self.publish(_TRADE_EXECUTED_TOPIC, execution.model_dump(mode="json"))
 
-        self._current_exposure = max(0.0, self._current_exposure - abs(position.units_held) * position.entry_price)
-        self._positions[instrument] = PositionState(cooldown_until=time.time() + self._cooldown_seconds)
-        await self._publish_active_positions()
+            position.assert_valid_transition("FLAT")
+            self._current_exposure = max(0.0, self._current_exposure - abs(position.units_held) * position.entry_price)
+            self._positions[instrument] = PositionState(cooldown_until=time.time() + self._cooldown_seconds)
+            await self._publish_active_positions()
