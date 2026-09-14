@@ -74,7 +74,7 @@ import numpy as np
 import numpy.typing as npt
 import redis
 
-from core.redis_client import RedisClient
+from core.redis_client import RedisClient, RedisUnavailableError
 from core.schemas import ORDER_BOOK_TOP_N, L2_SURFACE_REDIS_KEY_PREFIX, OrderBookLevel, OrderBookSnapshot
 
 L2_SURFACE_HISTORY_MAX_LEN: Final[int] = 30
@@ -155,6 +155,33 @@ async def publish_l2_surface(
     key = f"{L2_SURFACE_REDIS_KEY_PREFIX}{snapshot.symbol}"
     await redis_client.execute("lpush", key, encoded)
     await redis_client.execute("ltrim", key, 0, max_history - 1)
+
+
+async def read_l2_surface_history_async(
+    redis_client: RedisClient, symbol: str, *, count: int = L2_SURFACE_HISTORY_MAX_LEN
+) -> list[UnpackedL2Surface]:
+    """Real async equivalent of :func:`read_l2_surface_history`, for an agent's own event loop (not the dashboard's sync client).
+
+    Added for :meth:`~src.agents.alert_agent.AlertAgent._check_liquidity_collapse_danger`,
+    which needs this same real L2 history from inside an ``async def`` tick
+    -- the sync function below blocks the event loop and is kept exactly
+    as-is for the dashboard's own sync ``redis.Redis`` client. Same
+    newest-first-storage-to-chronological-order and same "skip a bad
+    frame rather than blank the whole read" discipline as the sync
+    version.
+    """
+    key = f"{L2_SURFACE_REDIS_KEY_PREFIX}{symbol}"
+    try:
+        raw_entries = await redis_client.execute("lrange", key, 0, count - 1)
+    except RedisUnavailableError:
+        return []
+    frames: list[UnpackedL2Surface] = []
+    for raw in reversed(raw_entries):  # LPUSH stores newest-first; reverse for a real chronological time axis
+        try:
+            frames.append(unpack_snapshot(raw))
+        except (ValueError, KeyError, TypeError):
+            continue
+    return frames
 
 
 def read_l2_surface_history(r: redis.Redis[str], symbol: str, *, count: int = L2_SURFACE_HISTORY_MAX_LEN) -> list[UnpackedL2Surface]:

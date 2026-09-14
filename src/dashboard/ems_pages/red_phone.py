@@ -48,6 +48,8 @@ from core.security import STATUS_PANIC, SYSTEM_STATUS_KEY, reset_kill_switch, tr
 from src.agents.alert_agent import (
     DEBOUNCE_TTL_SECONDS,
     INFRA_MISSING_HEARTBEAT_STRIKES,
+    LIQUIDITY_COLLAPSE_THRESHOLD,
+    LIQUIDITY_COLLAPSE_THRESHOLD_OVERRIDE_REDIS_KEY,
     OBI_CATASTROPHIC_THRESHOLD,
     OBI_THRESHOLD_OVERRIDE_REDIS_KEY,
     RECIPIENTS_REDIS_KEY,
@@ -137,6 +139,27 @@ new_obi_threshold = st.slider(
 if new_obi_threshold != current_obi_threshold:
     r.set(OBI_THRESHOLD_OVERRIDE_REDIS_KEY, str(round(new_obi_threshold, 4)))
     st.toast(f"Seuil OBI mis à jour : {new_obi_threshold:.2f}", icon="✅")
+
+st.markdown("**Effondrement de profondeur du carnet (bid) -- éditable en direct**")
+st.caption(
+    "Réel, mais partiel : ce détecteur mesure la profondeur d'achat actuelle vs. sa médiane récente "
+    "(données L2 réelles). Il ne mesure PAS le levier/Open Interest -- aucun flux réel de ce type n'existe "
+    "aujourd'hui dans Nothierly pour les perpétuels crypto (voir docstring de alert_agent.py)."
+)
+raw_liq_override = safe_get(r, LIQUIDITY_COLLAPSE_THRESHOLD_OVERRIDE_REDIS_KEY)
+try:
+    current_liq_threshold = float(raw_liq_override) if raw_liq_override else LIQUIDITY_COLLAPSE_THRESHOLD
+except ValueError:
+    current_liq_threshold = LIQUIDITY_COLLAPSE_THRESHOLD
+
+new_liq_threshold = st.slider(
+    "Seuil de collapse (chute de profondeur vs. médiane récente)",
+    min_value=0.30, max_value=0.95, value=current_liq_threshold, step=0.05, format="%.0f%%",
+    help="AlertAgent lit cette valeur en direct à chaque tick (~2s) -- aucun redémarrage requis.",
+)
+if new_liq_threshold != current_liq_threshold:
+    r.set(LIQUIDITY_COLLAPSE_THRESHOLD_OVERRIDE_REDIS_KEY, str(round(new_liq_threshold, 4)))
+    st.toast(f"Seuil de collapse de liquidité mis à jour : {new_liq_threshold:.0%}", icon="✅")
 
 st.markdown("**Max Drawdown (24h) -- éditable en direct**")
 raw_drawdown_override = safe_get(r, DRAWDOWN_THRESHOLD_OVERRIDE_REDIS_KEY)

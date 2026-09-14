@@ -86,6 +86,54 @@ open position right now).
    system-wide, immediately) *and* publishes ``EMERGENCY_HALT`` (tells
    ExecutionAgent to proactively close *existing* ones) -- two real,
    distinct effects from one circuit-breaker trip, not a duplicate.
+
+2026-09-14, "Surfusion" / liquidation-cascade brief -- real corrections:
+
+7. **No live leverage/Open Interest feed exists for the numerator of the
+   brief's proposed ratio.** The brief's ``LCR_t = (OI_t * %L_t) /
+   absorption_capacity`` needs a real perpetual-futures Open Interest and
+   long/short ratio; this codebase has neither (confirmed by direct
+   search -- the only real Open Interest anywhere is
+   :mod:`~src.agents.market_data.options_chain_client`'s *options*
+   chain OI, an unrelated market/instrument, not perp futures leverage).
+   :meth:`AlertAgent._check_liquidity_collapse_danger` below therefore
+   does not compute the brief's full ratio. It builds the half that
+   *is* real: a genuine "has this book's bid-side depth quietly
+   collapsed relative to its own recent normal" detector, sourced from
+   real, live L2 order-book history
+   (:func:`~src.agents.market_data.l2_surface_packer.
+   read_l2_surface_history_async`, the same real 5-level snapshots
+   :class:`~src.agents.market_data.agent.MarketDataAgent` already
+   persists on every book update -- previously read only by the
+   dashboard's 3D depth topography, now reused here unchanged). This is
+   a real, narrower, honestly-scoped signal, not a stand-in for the
+   brief's full leverage-aware ratio.
+
+8. **The brief's own normalization is self-referential and does not
+   hold a stable "critical" threshold.** Its rolling min-max scaling
+   renormalizes the danger index against its *own* recent history --
+   a market that stays chronically fragile stretches that history to
+   reabsorb the new normal, sliding the index back toward the middle
+   of its own range even while the real underlying risk stays high.
+   Replaced with this file's own established pattern instead: a fixed,
+   live-Redis-overridable threshold on a stable, well-defined quantity
+   (current bid depth vs. the *median* of recent bid depth, not
+   min-max-rescaled), exactly mirroring :data:`OBI_CATASTROPHIC_THRESHOLD`
+   / :data:`OBI_THRESHOLD_OVERRIDE_REDIS_KEY`'s own shape.
+
+9. **The brief's bespoke ``tcp://*:5555`` ZMQ PUB socket and a raw
+   ZMQ-polling thread inside Streamlit would each duplicate a working
+   mechanism this project already has**, rather than fill a gap (unlike
+   the OI/leverage point above, where nothing real existed yet): every
+   agent, this one included, already publishes over the real
+   broker-mediated ZMQ bus at this deployment's configured
+   frontend/backend ports via :meth:`~core.base_agent.BaseAgent.publish`,
+   and the dashboard's Red Phone page already reads
+   :data:`_ALERT_HISTORY_REDIS_KEY` fresh on every rerun. This check
+   reuses both unchanged -- no new socket, no new topic, no new
+   dashboard read path -- by calling the exact same
+   :meth:`_raise_alert` (category ``MICROSTRUCTURE``) the OBI check
+   above already uses.
 """
 
 from __future__ import annotations
@@ -95,6 +143,7 @@ import json
 import time
 from typing import Any, Final, Literal
 
+import numpy as np
 from twilio.rest import Client as TwilioClient
 
 from core.base_agent import AgentControlState, BaseAgent
@@ -103,6 +152,7 @@ from core.logger import get_logger
 from core.redis_client import RedisUnavailableError
 from core.schemas import EMERGENCY_HALT_TOPIC, HEARTBEAT_REDIS_KEY_PREFIX, MARKET_METRICS_REDIS_KEY_PREFIX
 from core.security import trip_kill_switch
+from src.agents.market_data.l2_surface_packer import UnpackedL2Surface, read_l2_surface_history_async
 
 _log = get_logger(__name__)
 
@@ -125,6 +175,15 @@ OBI_CATASTROPHIC_THRESHOLD: Final[float] = 0.9  # |OBI| this close to +-1 = one 
 OBI_THRESHOLD_OVERRIDE_REDIS_KEY: Final[str] = "ALERT_OBI_THRESHOLD_OVERRIDE"
 _OBI_THRESHOLD_MIN: Final[float] = 0.5
 _OBI_THRESHOLD_MAX: Final[float] = 0.99
+
+# -- Rule 1, Danger Microstructure (bis): real bid-depth collapse, real L2 history -- see module docstring point 7-9 --
+LIQUIDITY_COLLAPSE_THRESHOLD: Final[float] = 0.70  # current bid depth this far BELOW its own recent median = danger
+LIQUIDITY_COLLAPSE_THRESHOLD_OVERRIDE_REDIS_KEY: Final[str] = "ALERT_LIQUIDITY_COLLAPSE_THRESHOLD_OVERRIDE"
+_LIQUIDITY_COLLAPSE_THRESHOLD_MIN: Final[float] = 0.30
+_LIQUIDITY_COLLAPSE_THRESHOLD_MAX: Final[float] = 0.95
+# Reference-window frames + the current frame -- below this, "recent normal" isn't measured yet (avoids a
+# false positive off a single early snapshot right after this agent or MarketDataAgent (re)starts).
+_LIQUIDITY_COLLAPSE_MIN_REFERENCE_FRAMES: Final[int] = 5
 
 # -- Rule 1, Danger Économique (real account-wide Guardian DRAWDOWN trigger -- see module docstring) --
 _GUARDIAN_ALERTS_REDIS_KEY: Final[str] = "NOTHIERLY_GUARDIAN_ALERTS"
@@ -207,6 +266,18 @@ def _build_sms_body(category: DangerCategory, detail: str) -> str:
     return f"[URGENT - EMS ALGO] {category} : {detail}"
 
 
+def _bid_depth_quote(frame: UnpackedL2Surface) -> float:
+    """Real total bid-side depth in quote-currency terms (sum of price*volume) over one real L2 frame's captured levels.
+
+    :func:`~src.agents.market_data.l2_surface_packer.pack_snapshot` pads
+    a thinner-than-``ORDER_BOOK_TOP_N`` side with explicit ``(0.0, 0.0)``
+    rows rather than shifting subsequent levels -- summing unconditionally
+    is still correct here (a zero-price zero-volume row contributes 0.0),
+    so no separate real-level filter is needed.
+    """
+    return float(np.sum(frame.bid_prices.astype(np.float64) * frame.bid_volumes.astype(np.float64)))
+
+
 class AlertAgent(BaseAgent):
     """Polls three real danger conditions every tick; on each, debounces, SMS-alerts, and trips the circuit breaker.
 
@@ -239,7 +310,12 @@ class AlertAgent(BaseAgent):
             self._log.warning("alert_agent_tick_skipped_no_redis", agent_id=self.agent_id)
             return
 
-        for check in (self._check_microstructure_danger, self._check_economic_danger, self._check_infrastructure_danger):
+        for check in (
+            self._check_microstructure_danger,
+            self._check_liquidity_collapse_danger,
+            self._check_economic_danger,
+            self._check_infrastructure_danger,
+        ):
             try:
                 await check()
             except Exception:
@@ -292,6 +368,71 @@ class AlertAgent(BaseAgent):
                     detail=(
                         f"Déséquilibre catastrophique détecté sur {symbol}. OBI à {obi:+.2f} "
                         f"(carnet quasi-vide côté {side}). Ordres Maker à risque de sélection adverse extrême."
+                    ),
+                )
+
+    # -- Rule 1: Danger Microstructure (bis) -- real bid-depth collapse -----
+
+    async def _get_dynamic_liquidity_collapse_threshold(self) -> float:
+        """Live Redis-overridable liquidity-collapse threshold -- exact same fail-safe shape as :meth:`_get_dynamic_obi_threshold`."""
+        assert self._redis_client is not None
+        try:
+            raw = await asyncio.wait_for(
+                self._redis_client.execute("get", LIQUIDITY_COLLAPSE_THRESHOLD_OVERRIDE_REDIS_KEY), timeout=2.0
+            )
+        except (RedisUnavailableError, asyncio.TimeoutError):
+            return LIQUIDITY_COLLAPSE_THRESHOLD
+
+        if raw is None:
+            return LIQUIDITY_COLLAPSE_THRESHOLD
+
+        try:
+            threshold = float(raw)
+        except (TypeError, ValueError):
+            return LIQUIDITY_COLLAPSE_THRESHOLD
+
+        return max(_LIQUIDITY_COLLAPSE_THRESHOLD_MIN, min(_LIQUIDITY_COLLAPSE_THRESHOLD_MAX, threshold))
+
+    async def _check_liquidity_collapse_danger(self) -> None:
+        """Real bid-side depth collapse, per monitored symbol -- see module docstring points 7-9 for why this, not the brief's full leverage ratio.
+
+        Reads this symbol's real, live L2 surface history (real exchange
+        book levels, not a proxy) and compares the newest frame's total
+        bid depth (sum of price*volume over the real captured levels)
+        against the *median* depth of the reference frames before it --
+        a stable, self-normalizing-but-not-self-referential measure of
+        "how depleted is the book right now, versus what's normal for
+        this book," independent of the asset's absolute price or
+        typical liquidity level (so the same fixed threshold is
+        meaningful across BTC/USDT, EUR_USD, and every other monitored
+        symbol without per-asset recalibration).
+        """
+        assert self._redis_client is not None
+        threshold = await self._get_dynamic_liquidity_collapse_threshold()
+        for symbol in _MONITORED_SYMBOLS:
+            frames = await read_l2_surface_history_async(self._redis_client, symbol)
+            if len(frames) <= _LIQUIDITY_COLLAPSE_MIN_REFERENCE_FRAMES:
+                continue  # not enough real history yet to know what "normal" depth looks like
+
+            *reference_frames, current_frame = frames
+            reference_depths = [_bid_depth_quote(frame) for frame in reference_frames]
+            current_depth = _bid_depth_quote(current_frame)
+
+            reference_median = float(np.median(reference_depths))
+            if reference_median <= 0.0:
+                continue  # the book never had real depth to begin with -- nothing to have collapsed from
+
+            collapse_fraction = 1.0 - (current_depth / reference_median)
+            if collapse_fraction >= threshold:
+                await self._raise_alert(
+                    category="MICROSTRUCTURE",
+                    detail=(
+                        f"Effondrement de la profondeur du carnet (achat) détecté sur {symbol}. "
+                        f"Profondeur actuelle : {current_depth:,.2f}, contre une médiane récente de "
+                        f"{reference_median:,.2f} ({collapse_fraction:+.0%}). Carnet fragilisé -- "
+                        "un seul ordre de vente agressif suffirait désormais à déplacer le prix "
+                        "significativement (risque de cascade en cas de levier concentré, non mesurable "
+                        "ici faute de flux d'Open Interest réel -- voir docstring du module)."
                     ),
                 )
 
