@@ -63,7 +63,31 @@ _SENSITIVE_KEY_PATTERN: Final[re.Pattern[str]] = re.compile(
 # Matching anywhere in the value still requires the same 24+-char
 # unbroken run, so it stays precise for the same reason the anchored
 # version was.
-_SENSITIVE_VALUE_PATTERN: Final[re.Pattern[str]] = re.compile(r"[A-Za-z0-9\/+=]{24,}")
+#
+# 2026-09-15, a third real false positive found live (this time hiding a
+# real diagnostic, not just an id): a 27-day production shadow run's own
+# logs redacted `error_type=type(exc).__name__` for
+# core.message_integrity.SignatureVerificationError (26 chars) and
+# core.timescale_client.TimescaleUnavailableError (25 chars) -- both
+# ordinary, benign PascalCase Python exception class names, both >= 24
+# unbroken letters, both caught by this pattern with zero regard for
+# *content*. The real, actionable failure reason was invisible in every
+# affected log line for the run's entire duration. Real secrets (AWS/
+# Stripe/GitHub/Slack tokens, hex digests, base64 blobs) are, without
+# exception in this codebase's own real fixture
+# (tests/red_team_hacker.py's `fake_secret`), a mix of letters *and*
+# digits (or base64's `+`/`=` padding) -- a run of 24+ *pure* letters, by
+# contrast, is exactly what a human-readable CamelCase identifier looks
+# like and is not a realistic secret shape. The lookahead below requires
+# at least one digit or `+`/`=` character somewhere in the run, closing
+# this false positive while leaving every real secret shape (including
+# the exact fixture above) matched unchanged. **Residual, disclosed
+# gap**: a genuine secret composed of only letters (no digit, no `+`/
+# `=`) would now slip past this fallback -- an acceptable trade-off for
+# the same reason the hyphen/underscore exclusion above already is: this
+# is defense-in-depth only, and the key-name pattern above remains the
+# precise, untouched primary defense.
+_SENSITIVE_VALUE_PATTERN: Final[re.Pattern[str]] = re.compile(r"(?=[A-Za-z0-9\/+=]*[0-9\/+=])[A-Za-z0-9\/+=]{24,}")
 _REDACTED: Final[str] = "***REDACTED***"
 
 _listener: logging.handlers.QueueListener | None = None
