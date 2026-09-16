@@ -214,3 +214,69 @@ def test_hrp_rejects_too_few_instruments() -> None:
     manager, _instruments = _instruments_and_manager()
     with pytest.raises(ValueError, match="at least 2"):
         manager.compute_hierarchical_risk_parity_weights(["BTC/USDT"])
+
+
+# =============================================================================
+# "Protocole AEGIS" (2026-09-16) -- record_price real gap detection / purge / recently_ruptured
+# =============================================================================
+
+
+def test_recently_ruptured_is_false_for_an_instrument_that_never_recorded_a_price() -> None:
+    manager = PortfolioRiskParityManager(lookback_window=10)
+    assert manager.recently_ruptured("BTC/USDT") is False
+
+
+def test_a_gap_under_the_timeout_does_not_purge_or_flag_a_rupture() -> None:
+    manager = PortfolioRiskParityManager(lookback_window=10, gap_timeout_seconds=300.0)
+    manager.record_price("BTC/USDT", 100.0, now=0.0)
+    manager.record_price("BTC/USDT", 101.0, now=299.0)  # just under the 300s gap timeout
+    assert manager.recently_ruptured("BTC/USDT") is False
+    assert manager.price_history("BTC/USDT").size == 2
+
+
+def test_a_gap_over_the_timeout_purges_history_and_flags_a_rupture() -> None:
+    manager = PortfolioRiskParityManager(lookback_window=10, gap_timeout_seconds=300.0)
+    for i in range(5):
+        manager.record_price("BTC/USDT", 100.0 + i, now=float(i))
+    assert manager.price_history("BTC/USDT").size == 5
+
+    # A real 14.7h-style gap (matches the brief's own cited incident), well past the 300s timeout.
+    manager.record_price("BTC/USDT", 200.0, now=4.0 + 14.7 * 3600)
+
+    assert manager.recently_ruptured("BTC/USDT") is True
+    # Purged means only the one fresh, post-rupture price remains -- not the pre-gap history.
+    history = manager.price_history("BTC/USDT")
+    assert history.size == 1
+    assert history[0] == pytest.approx(200.0)
+
+
+def test_a_rupture_on_one_instrument_does_not_affect_another() -> None:
+    manager = PortfolioRiskParityManager(lookback_window=10, gap_timeout_seconds=300.0)
+    manager.record_price("BTC/USDT", 100.0, now=0.0)
+    manager.record_price("ETH/USDT", 2000.0, now=0.0)
+
+    manager.record_price("BTC/USDT", 200.0, now=1000.0)  # ruptures BTC only
+
+    assert manager.recently_ruptured("BTC/USDT") is True
+    assert manager.recently_ruptured("ETH/USDT") is False
+
+
+def test_rupture_flag_clears_once_the_window_fully_refills() -> None:
+    manager = PortfolioRiskParityManager(lookback_window=5, gap_timeout_seconds=300.0)
+    manager.record_price("BTC/USDT", 100.0, now=0.0)
+    manager.record_price("BTC/USDT", 200.0, now=1000.0)  # ruptures -- purges down to 1 sample
+    assert manager.recently_ruptured("BTC/USDT") is True
+
+    # Refill with 3 more real post-rupture prices -- still short of lookback_window=5.
+    for i in range(3):
+        manager.record_price("BTC/USDT", 200.0 + i, now=1001.0 + i)
+    assert manager.recently_ruptured("BTC/USDT") is True
+
+    # One more brings it to exactly 5 -- fully refilled, flag clears.
+    manager.record_price("BTC/USDT", 210.0, now=1010.0)
+    assert manager.recently_ruptured("BTC/USDT") is False
+
+
+def test_gap_timeout_seconds_must_be_positive() -> None:
+    with pytest.raises(ValueError):
+        PortfolioRiskParityManager(gap_timeout_seconds=0.0)

@@ -521,6 +521,10 @@ _HAWKES_EXCITATION_STRENGTH: Final[float] = 2.0
 # which it never uses for Daemons 1/3.
 _HAWKES_CASCADE_THRESHOLD_MULTIPLIER: Final[float] = 5.0
 _TICK_EVENT_HISTORY_MAXLEN: Final[int] = 200
+# "Protocole AEGIS" (2026-09-16) -- same real gap-detection threshold and purge-then-block semantics
+# as PortfolioRiskParityManager's own _DEFAULT_GAP_TIMEOUT_SECONDS, applied here to the separate real
+# _tick_events (Hawkes) rolling window -- see _record_tick_event/_gate_7_stochastic_core.
+_TICK_EVENT_GAP_TIMEOUT_SECONDS: Final[float] = 300.0
 
 _JUMP_DIFFUSION_THRESHOLD_STD: Final[float] = 4.0
 _MIN_SAMPLES_FOR_STOCHASTIC_CORE: Final[int] = 5  # jump_diffusion_anomaly needs >= 4 log-returns
@@ -916,6 +920,9 @@ class ExecutionAgent(BaseAgent):
         self._tick_events: dict[str, deque[tuple[float, float]]] = {}
         self._latest_liquidity: dict[str, float] = {}
         self._last_spreads: dict[str, float] = {}
+        # "Protocole AEGIS" real gap detection over _tick_events -- see _record_tick_event.
+        self._last_tick_event_time: dict[str, float] = {}
+        self._tick_events_ruptured: dict[str, bool] = {}
 
         # Guardian AI (Chief Risk Officer) trigger state -- see
         # _check_drawdown_trigger/_record_conflict_and_maybe_alert.
@@ -1775,9 +1782,34 @@ class ExecutionAgent(BaseAgent):
         real, complementary read for an operator's intuition, not a
         second, competing blocking veto over the same inputs
         ``price_impact`` already gates on.
+
+        **"Protocole AEGIS" addition (2026-09-16)**: a *new* real blocking
+        condition, distinct from Daemons 2/4 above. If either real rolling
+        buffer this gate reads (:attr:`_tick_events` here, or
+        :meth:`~src.agents.supervisor.portfolio_risk_manager.
+        PortfolioRiskParityManager.price_history`'s own backing store) was
+        purged by a detected time-series rupture and has not yet refilled
+        (see :meth:`_record_tick_event`/:meth:`~src.agents.supervisor.
+        portfolio_risk_manager.PortfolioRiskParityManager.
+        recently_ruptured`), every telemetry line below is still computed
+        (for visibility into the real, partial recovery in progress) but
+        the gate is forced ``FAILED`` regardless -- deliberately *not* the
+        same as the pre-existing "pas assez d'historique" cold-start
+        messages above (which pass through informationally, since a
+        never-yet-traded instrument's thin buffer is not itself untrustworthy).
+        A purged-and-refilling buffer is not "no data yet", it is "this
+        specific data is known to span a real discontinuity" -- entries
+        must never silently resume as if nothing happened.
         """
         detail_parts: list[str] = []
         blocked_reason: str | None = None
+
+        if self._tick_events_ruptured.get(instrument) or self._portfolio_risk_manager.recently_ruptured(instrument):
+            blocked_reason = (
+                "Rupture de serie temporelle detectee recemment -- fenetres glissantes purgees et en "
+                "cours de re-remplissage ; Porte 7 verrouillee tant que l'historique post-rupture est "
+                "insuffisant."
+            )
 
         events = self._tick_events.get(instrument)
         if events:
@@ -1896,7 +1928,7 @@ class ExecutionAgent(BaseAgent):
             return GateResult(7, _GATE_NAMES[6], "FAILED", f"{blocked_reason} [{detail}]")
         return GateResult(7, _GATE_NAMES[6], "PASSED", detail)
 
-    def _record_tick_event(self, instrument: str, order_book_imbalance: float) -> None:
+    def _record_tick_event(self, instrument: str, order_book_imbalance: float, *, now: float | None = None) -> None:
         """Feed one real received tick into Gate 7's Hawkes event history.
 
         This system has no literal per-trade tick print (see
@@ -1908,9 +1940,50 @@ class ExecutionAgent(BaseAgent):
         (``time.time()``), matching every other rolling window in this
         module (:attr:`_balance_history`, :attr:`_conflict_history`), not
         the message's own embedded timestamp.
+
+        "Protocole AEGIS" real gap detection, same shape as
+        :meth:`~src.agents.supervisor.portfolio_risk_manager.
+        PortfolioRiskParityManager.record_price`'s own: a tick arriving
+        more than :data:`_TICK_EVENT_GAP_TIMEOUT_SECONDS` after
+        ``instrument``'s last one means every event in this window
+        predates a real, undisclosed hole in the tick stream -- a Hawkes
+        intensity computed straddling that hole would treat the silence
+        itself as evidence of *decayed* excitation, a fabricated read,
+        not a real one. Purged instead, with Gate 7 blocking new entries
+        on ``instrument`` until this refills -- see
+        :meth:`_gate_7_stochastic_core`.
+
+        Args:
+            instrument: Which instrument this tick belongs to.
+            order_book_imbalance: The tick's real, signed order-book
+                imbalance -- only its magnitude is used (see above).
+            now: Injectable wall-clock reading, for tests. Defaults to
+                ``time.time()``.
         """
+        now = now if now is not None else time.time()
+        last_time = self._last_tick_event_time.get(instrument)
+        if last_time is not None and (now - last_time) > _TICK_EVENT_GAP_TIMEOUT_SECONDS:
+            self._log.critical(
+                "time_series_rupture_detected",
+                instrument=instrument,
+                gap_seconds=now - last_time,
+                gap_timeout_seconds=_TICK_EVENT_GAP_TIMEOUT_SECONDS,
+                purged_samples=len(self._tick_events.get(instrument, ())),
+                buffer="tick_events",
+            )
+            self._tick_events.pop(instrument, None)
+            self._tick_events_ruptured[instrument] = True
+
         history = self._tick_events.setdefault(instrument, deque(maxlen=_TICK_EVENT_HISTORY_MAXLEN))
-        history.append((time.time(), abs(order_book_imbalance)))
+        history.append((now, abs(order_book_imbalance)))
+        self._last_tick_event_time[instrument] = now
+
+        if self._tick_events_ruptured.get(instrument) and len(history) >= _TICK_EVENT_HISTORY_MAXLEN:
+            self._log.info(
+                "time_series_rupture_recovered", instrument=instrument, buffer="tick_events",
+                lookback_window=_TICK_EVENT_HISTORY_MAXLEN,
+            )
+            self._tick_events_ruptured[instrument] = False
 
     @staticmethod
     def _pending_gates(from_number: int, reason: str) -> list[GateResult]:

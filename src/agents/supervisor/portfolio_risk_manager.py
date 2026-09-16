@@ -46,6 +46,18 @@ disclosed correction on what "p-adic" honestly means here (a shared
 ultrametric *structure* with p-adic numbers, not p-adic arithmetic
 itself).
 
+**2026-09-16, "Protocole AEGIS"**: :meth:`record_price` now detects a real
+time-series gap (no price recorded for an instrument in over
+:attr:`_gap_timeout_seconds`, e.g. a 14h+ process-downtime window) and
+purges that instrument's rolling history rather than silently blending a
+stale pre-gap price directly against a fresh post-gap one across the
+missing interval -- exactly the discontinuity every downstream consumer's
+log-return/covariance math (here, and in
+:class:`~src.agents.execution.agent.ExecutionAgent`'s Gate 7) implicitly
+assumes cannot happen. :meth:`recently_ruptured` exposes this state so a
+consumer can refuse to trust statistics computed on a still-refilling
+post-purge window, until it fills back up to :attr:`_lookback_window`.
+
 Pure, stateless-with-respect-to-positions in the same sense as
 :class:`~src.agents.supervisor.risk_manager.RiskManager`: this class
 tracks price history for its own correlation/covariance estimates, but
@@ -55,6 +67,7 @@ here.
 
 from __future__ import annotations
 
+import time
 from collections import deque
 
 import numpy as np
@@ -73,6 +86,9 @@ _log = get_logger(__name__)
 _DEFAULT_LOOKBACK_WINDOW = 100
 _DEFAULT_CORRELATION_THRESHOLD = 0.7
 _DEFAULT_CORRELATED_EXPOSURE_PCT = 0.15
+# "Protocole AEGIS" (2026-09-16) -- the brief's own "X minutes (ex: 5 minutes)" example. See
+# record_price/recently_ruptured.
+_DEFAULT_GAP_TIMEOUT_SECONDS = 300.0
 
 
 class InsufficientPriceHistoryError(Exception):
@@ -96,6 +112,7 @@ class PortfolioRiskParityManager:
         lookback_window: int = _DEFAULT_LOOKBACK_WINDOW,
         correlation_threshold: float = _DEFAULT_CORRELATION_THRESHOLD,
         correlated_exposure_pct: float = _DEFAULT_CORRELATED_EXPOSURE_PCT,
+        gap_timeout_seconds: float = _DEFAULT_GAP_TIMEOUT_SECONDS,
     ) -> None:
         """Configure the correlation model and the correlated-cluster ceiling.
 
@@ -111,6 +128,11 @@ class PortfolioRiskParityManager:
                 :class:`~src.agents.supervisor.risk_manager.
                 RiskManager`'s own (uncorrelated-blind) ceiling, since
                 this one targets concentration risk specifically.
+            gap_timeout_seconds: How long an instrument can go without a
+                recorded price before :meth:`record_price` treats the
+                next one as arriving after a real time-series rupture and
+                purges that instrument's history -- see this class's own
+                "Protocole AEGIS" docstring note.
 
         Raises:
             ValueError: If ``lookback_window`` is too small to ever
@@ -123,31 +145,85 @@ class PortfolioRiskParityManager:
             raise ValueError("correlation_threshold must be in (0, 1].")
         if not (0.0 < correlated_exposure_pct <= 1.0):
             raise ValueError("correlated_exposure_pct must be in (0, 1].")
+        if gap_timeout_seconds <= 0:
+            raise ValueError("gap_timeout_seconds must be positive.")
 
         self._lookback_window = lookback_window
         self._correlation_threshold = correlation_threshold
         self._correlated_exposure_pct = correlated_exposure_pct
+        self._gap_timeout_seconds = gap_timeout_seconds
         self._price_history: dict[str, deque[float]] = {}
+        self._last_price_time: dict[str, float] = {}
+        self._ruptured: dict[str, bool] = {}
 
     @property
     def correlation_threshold(self) -> float:
         """This instance's real, configured correlation threshold -- see the constructor's own docstring."""
         return self._correlation_threshold
 
-    def record_price(self, instrument: str, price: float) -> None:
+    def record_price(self, instrument: str, price: float, *, now: float | None = None) -> None:
         """Feed ``instrument``'s latest price into its rolling history.
+
+        "Protocole AEGIS" real gap detection: if more than
+        :attr:`_gap_timeout_seconds` elapsed (real monotonic clock, not
+        the exchange's own embedded timestamp -- immune to a wall-clock
+        jump) since this instrument's last recorded price, this price
+        arrives after a real time-series rupture -- every log-return/
+        covariance/OU/jump-diffusion computation downstream of this
+        history implicitly assumes consecutive entries are consecutive
+        *observations*, not observations separated by an undisclosed
+        multi-hour hole. Rather than silently compute a "return" across
+        that hole (a fabricated data point, not a real one), the stale
+        history is purged and :meth:`recently_ruptured` starts reporting
+        ``True`` for ``instrument`` until the window organically refills
+        to :attr:`_lookback_window` real, consecutive, post-rupture
+        observations.
 
         Args:
             instrument: Which instrument this price is for.
             price: Latest observed price. Must be strictly positive.
+            now: Injectable monotonic clock reading, for tests. Defaults
+                to ``time.monotonic()``.
 
         Raises:
             ValueError: If ``price`` is not positive.
         """
         if price <= 0:
             raise ValueError("price must be positive.")
+        resolved_now = now if now is not None else time.monotonic()
+
+        last_time = self._last_price_time.get(instrument)
+        if last_time is not None and (resolved_now - last_time) > self._gap_timeout_seconds:
+            gap_seconds = resolved_now - last_time
+            _log.critical(
+                "time_series_rupture_detected",
+                instrument=instrument,
+                gap_seconds=gap_seconds,
+                gap_timeout_seconds=self._gap_timeout_seconds,
+                purged_samples=len(self._price_history.get(instrument, ())),
+            )
+            self._price_history.pop(instrument, None)
+            self._ruptured[instrument] = True
+
         history = self._price_history.setdefault(instrument, deque(maxlen=self._lookback_window))
         history.append(price)
+        self._last_price_time[instrument] = resolved_now
+
+        if self._ruptured.get(instrument) and len(history) >= self._lookback_window:
+            _log.info("time_series_rupture_recovered", instrument=instrument, lookback_window=self._lookback_window)
+            self._ruptured[instrument] = False
+
+    def recently_ruptured(self, instrument: str) -> bool:
+        """``True`` while ``instrument``'s history is still refilling after a real detected gap.
+
+        ``False`` for an instrument that was never ruptured at all
+        (including one that simply has not traded yet -- a cold start is
+        not a rupture, see this class's own "Protocole AEGIS" docstring
+        note) -- callers that need to distinguish "not enough history
+        yet" from "this history is actively untrustworthy" should check
+        this, not just :meth:`has_sufficient_history`.
+        """
+        return self._ruptured.get(instrument, False)
 
     def has_sufficient_history(self, instrument: str) -> bool:
         """Whether ``instrument`` has enough recorded prices to compute a return series."""

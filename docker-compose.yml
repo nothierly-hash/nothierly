@@ -133,6 +133,15 @@ services:
   nothierly-agents:
     build: .
     container_name: nothierly-${CLIENT_ID:?Set CLIENT_ID}-agents
+    # "Protocole AEGIS" (2026-09-16) -- same real, already-proven mechanism as alpha-engine's own
+    # `autoheal: "true"` label below (see that service's own comment for the full reasoning: a
+    # healthcheck failing alone does not make plain Compose restart a container; autoheal is the
+    # real external watcher that does). Previously scoped to alpha-engine only -- extended here
+    # because the identical failure mode (a fully deadlocked event loop, still running, never
+    # exiting on its own) can happen to any one of this container's own 7 agents just as easily,
+    # and until now nothing would have force-restarted this container for it.
+    labels:
+      autoheal: "true"
     # Real, not a fabricated 3-container split: this project's actual agent
     # fleet (scripts/run_backend.py -- MarketDataAgent, MacroAgent, NlpAgent,
     # XgboostSignalAgent, RlSignalAgent, ExecutionAgent, ArchivistAgent) runs
@@ -185,9 +194,13 @@ services:
         - "python"
         - "-c"
         - "import redis,sys; r=redis.Redis(host='redis-broker',port=6379,password='${REDIS_PASSWORD}'); sys.exit(0 if r.keys('heartbeat:*') else 1)"
-      interval: 15s
+      # interval x retries = 30s worst-case time-to-unhealthy, matching the brief's own "30 secondes"
+      # example (tightened from 15s x 5 = 75-90s, now that a failing healthcheck here actually
+      # triggers a real restart via the autoheal label above -- previously only affected `docker ps`
+      # status, so the old, looser cadence carried no operational cost either way).
+      interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 3
       start_period: 30s
     restart: unless-stopped
     logging: *default-logging
@@ -287,12 +300,18 @@ services:
   # above only fires on a real process exit, which a true deadlock never produces on its own.
   # `willfarrell/autoheal` is the standard, widely-used real answer for plain Docker/Compose (no
   # Swarm/Kubernetes liveness probes here): it watches the Docker socket and force-restarts any
-  # container Docker has marked unhealthy. Scoped to only the alpha-engine container via the
-  # `autoheal: "true"` label above + AUTOHEAL_CONTAINER_LABEL below -- nothierly-agents/-dashboard
-  # are untouched, not silently opted in. **Real, disclosed limit**: unlike `on-failure:5` above,
-  # autoheal's own restarts are not bounded by that retry count -- it keeps restarting on every
-  # unhealthy status it observes, indefinitely. A genuinely broken build that never recovers would
-  # still crash-loop forever via this path even though the Python-side restart budget is capped.
+  # container Docker has marked unhealthy. Scoped via the `autoheal: "true"` label +
+  # AUTOHEAL_CONTAINER_LABEL below -- **updated 2026-09-16, "Protocole AEGIS"**: previously only
+  # alpha-engine carried this label; nothierly-agents and nothierly-political-agent now carry it too
+  # (see each service's own comment), since the same real deadlock-without-exit failure mode isn't
+  # unique to alpha-engine. nothierly-dashboard/-gateway/-p2p-api remain untouched, not silently
+  # opted in -- a stuck web server restarts on its own supervisor's terms, and this label's real
+  # cost (see below) is best kept to the processes where a silent deadlock is genuinely dangerous
+  # (running trading logic) rather than applied blanket. **Real, disclosed limit**: unlike
+  # `on-failure:5` above, autoheal's own restarts are not bounded by that retry count -- it keeps
+  # restarting on every unhealthy status it observes, indefinitely. A genuinely broken build that
+  # never recovers would still crash-loop forever via this path even though the Python-side restart
+  # budget on alpha-engine specifically is capped.
   autoheal:
     image: willfarrell/autoheal:latest
     container_name: nothierly-${CLIENT_ID:?Set CLIENT_ID}-autoheal
@@ -302,6 +321,8 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       - alpha-engine
+      - nothierly-agents
+      - nothierly-political-agent
     restart: unless-stopped
     logging: *default-logging
 
@@ -405,6 +426,12 @@ services:
   nothierly-political-agent:
     build: .
     container_name: nothierly-${CLIENT_ID:?Set CLIENT_ID}-political-agent
+    # "Protocole AEGIS" (2026-09-16) -- same real autoheal mechanism as nothierly-agents/alpha-engine
+    # above. Healthcheck cadence below is deliberately left at its own existing, slower pace (this
+    # is a background RSS-poll worker, not a latency-sensitive trading process) rather than copying
+    # the 30s trading-path threshold onto a process with a naturally longer real duty cycle.
+    labels:
+      autoheal: "true"
     command: ["python", "political_agent.py"]
     env_file:
       - ${CLIENT_ENV_FILE:-.env}

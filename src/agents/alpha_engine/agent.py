@@ -297,6 +297,7 @@ import zmq.asyncio
 
 from core.asset_universe import AssetUniverseEntry, get_asset_universe_entry, is_spread_acceptable
 from core.base_agent import AgentControlState, BaseAgent
+from core.circuit_breaker import IngestionCircuitBreaker
 from core.config import AppSettings
 from core.exception_manager import install_global_exception_handler
 from core.logger import get_logger
@@ -341,6 +342,11 @@ _ONE_DAY_SECONDS: Final[float] = 86_400.0
 # placements in seconds, the actual "buys 1000 times in 3 seconds" failure mode.
 _DEFAULT_MAX_ORDER_RATE_COUNT: Final[int] = 10
 _DEFAULT_ORDER_RATE_WINDOW_SECONDS: Final[float] = 10.0
+# "Protocole AEGIS" (2026-09-16) -- see _market_data_circuit_breaker's own docstring for the real
+# 51.5h/34k+36k-event incident this closes.
+_DEFAULT_MAX_CONSECUTIVE_MARKET_DATA_ERRORS: Final[int] = 50
+_DEFAULT_MARKET_DATA_ERROR_RATE: Final[float] = 0.05
+_DEFAULT_MARKET_DATA_ERROR_WINDOW_SECONDS: Final[float] = 60.0
 
 _TRADE_TIMESTAMPS_MAXLEN: Final[int] = 100_000  # OOM backstop -- see module docstring point 10
 _ORDER_TIMESTAMPS_MAXLEN: Final[int] = 10_000
@@ -455,6 +461,9 @@ class AlphaMarketMakerAgent(BaseAgent):
         max_market_data_age_seconds: float = _DEFAULT_MAX_MARKET_DATA_AGE_SECONDS,
         max_order_rate_count: int = _DEFAULT_MAX_ORDER_RATE_COUNT,
         max_order_rate_window_seconds: float = _DEFAULT_ORDER_RATE_WINDOW_SECONDS,
+        max_consecutive_market_data_errors: int = _DEFAULT_MAX_CONSECUTIVE_MARKET_DATA_ERRORS,
+        max_market_data_error_rate: float = _DEFAULT_MARKET_DATA_ERROR_RATE,
+        market_data_error_window_seconds: float = _DEFAULT_MARKET_DATA_ERROR_WINDOW_SECONDS,
         max_single_order_units: Decimal | None = None,
         max_daily_loss_usd: Decimal | None = None,
         order_rate_limit_per_second: float = _DEFAULT_ORDER_RATE_LIMIT_PER_SECOND,
@@ -492,6 +501,14 @@ class AlphaMarketMakerAgent(BaseAgent):
         self._max_market_data_age_seconds = max_market_data_age_seconds
         self._max_order_rate_count = max_order_rate_count
         self._max_order_rate_window_seconds = max_order_rate_window_seconds
+        # "Protocole AEGIS" (2026-09-16) -- real circuit breaker over
+        # alpha_engine_market_metrics_unparseable/alpha_engine_stale_data_detected, see
+        # _read_fresh_market_metrics/_handle_market_data_circuit_breaker_trip.
+        self._market_data_circuit_breaker = IngestionCircuitBreaker(
+            max_consecutive_failures=max_consecutive_market_data_errors,
+            max_failure_rate=max_market_data_error_rate,
+            window_seconds=market_data_error_window_seconds,
+        )
         # Fat-finger ceiling (module docstring point 9). Defaults to a real, always-on multiple of
         # the inventory cap rather than requiring the caller to remember to set it -- 2x is generous
         # for a single legitimate order (a routine quote never exceeds quote_size_units; the largest
@@ -796,6 +813,9 @@ class AlphaMarketMakerAgent(BaseAgent):
                     f"(seuil {self._max_market_data_age_seconds}s). Cotations annulées, moteur en attente.",
                     severity=AlertSeverity.WARNING, source=self.agent_id,
                 )
+            if self._market_data_circuit_breaker.tripped:
+                await self._handle_market_data_circuit_breaker_trip()
+                return
             await self._publish_telemetry(status="STALE_DATA", market_data_age_seconds=age_seconds, inventory=None)
             return
         self._stale_data_notified = False
@@ -898,11 +918,14 @@ class AlphaMarketMakerAgent(BaseAgent):
                 error=str(exc),
                 raw_value=raw_str if len(raw_str) <= 2000 else f"{raw_str[:2000]}...<truncated, {len(raw_str)} chars total>",
             )
+            self._market_data_circuit_breaker.record_failure()
             return None, None
 
         age_seconds = (datetime.now(timezone.utc) - metrics.timestamp).total_seconds()
         if age_seconds > self._max_market_data_age_seconds:
+            self._market_data_circuit_breaker.record_failure()
             return None, age_seconds
+        self._market_data_circuit_breaker.record_success()
         return metrics, age_seconds
 
     # -- Inventory / fills -------------------------------------------------
@@ -1032,6 +1055,38 @@ class AlphaMarketMakerAgent(BaseAgent):
                 "max_order_rate_count": self._max_order_rate_count,
                 "window_seconds": self._max_order_rate_window_seconds,
             },
+        )
+
+    async def _handle_market_data_circuit_breaker_trip(self) -> None:
+        """Real "Protocole AEGIS" trip handler: force OFF rather than keep absorbing corrupted/stale data.
+
+        Real gap closed (2026-09-16 post-mortem): a real 51.5h shadow-run
+        window produced 34,637 ``alpha_engine_market_metrics_unparseable``
+        warnings and 36,211 ``alpha_engine_stale_data_detected`` warnings
+        -- correctly logged, correctly fail-closed (see
+        :meth:`_read_fresh_market_metrics`, this engine never traded on
+        that data), but every one of those cycles was still individually
+        retried at the normal tick cadence forever, with nothing ever
+        escalating the *pattern* into a decision. This agent owns no
+        network connection of its own to reconnect (it reads a Redis
+        cache another process, :class:`~src.agents.market_data.agent.
+        MarketDataAgent`, writes -- see that module for the real
+        WebSocket-level circuit breaker/reconnect) -- forcing this
+        engine's own real, existing :class:`~core.base_agent.
+        AgentControlState.OFF` state is the honest equivalent action here,
+        same manual-reactivation-required posture as
+        :meth:`_handle_order_rate_limit_breach`/
+        :meth:`_handle_fat_finger_blocked` above.
+        """
+        await self._force_off(
+            "alpha_engine_market_data_circuit_breaker_tripped",
+            notify_message=(
+                f"🆘 DISJONCTEUR DE DONNÉES DÉCLENCHÉ pour {self._symbol} : flux de marché corrompu ou "
+                f"périmé de façon soutenue ({self._market_data_circuit_breaker.consecutive_failures} échecs "
+                "consécutifs / taux d'échec au-delà du seuil). Moteur arrêté avant absorption passive du "
+                "bruit -- intervention manuelle requise avant réactivation (vérifier market-data-agent en amont)."
+            ),
+            extra_log_fields={"consecutive_failures": self._market_data_circuit_breaker.consecutive_failures},
         )
 
     def _check_fat_finger(self, size: Decimal) -> bool:
