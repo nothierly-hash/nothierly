@@ -335,6 +335,72 @@ async def test_read_fresh_market_metrics_stale_is_rejected(agent: AlphaMarketMak
 
 
 @pytest.mark.asyncio
+async def test_read_fresh_market_metrics_unparseable_logs_the_real_reason_not_a_blind_preview(
+    agent: AlphaMarketMakerAgent, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """2026-09-16 fix: found live analyzing a real 51h shadow run where 34k+ of these warnings
+    carried only a 120-char raw_preview (always cut off before the field that actually failed) and
+    no exception message at all -- undiagnosable after the fact. This must now carry the real
+    Pydantic error and the full (capped) raw value."""
+    logged: list[tuple[str, dict[str, object]]] = []
+    original_warning = agent._log.warning
+
+    def _recording_warning(event: str, **kwargs: object) -> None:
+        logged.append((event, kwargs))
+        original_warning(event, **kwargs)
+
+    monkeypatch.setattr(agent._log, "warning", _recording_warning)
+
+    # order_book_imbalance out of its real [-1, 1] range -- a genuine schema violation, not
+    # malformed JSON, exercising the same `except Exception` path either shape hits.
+    await _redis(agent).execute(
+        "set", f"{MARKET_METRICS_REDIS_KEY_PREFIX}BTC/USDT",
+        json.dumps({"symbol": "BTC/USDT", "timestamp": datetime.now(timezone.utc).isoformat(), "spread": 1.0, "order_book_imbalance": 1.5, "mid_price": 65000.0}),
+    )
+
+    metrics, age = await agent._read_fresh_market_metrics()
+
+    assert metrics is None and age is None
+    warnings = [kwargs for event, kwargs in logged if event == "alpha_engine_market_metrics_unparseable"]
+    assert len(warnings) == 1
+    assert warnings[0]["error_type"] == "ValidationError"
+    assert "order_book_imbalance" in str(warnings[0]["error"])
+    assert '"order_book_imbalance": 1.5' in str(warnings[0]["raw_value"])
+
+
+@pytest.mark.asyncio
+async def test_read_fresh_market_metrics_unparseable_caps_an_oversized_raw_value(
+    agent: AlphaMarketMakerAgent, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real safety half of the same fix: logging the full raw value must stay bounded -- a
+    corrupted or adversarial value (see core/message_integrity.py's own docstring on who can write
+    this key) must never turn one warning into an unbounded log line."""
+    logged: list[tuple[str, dict[str, object]]] = []
+    original_warning = agent._log.warning
+
+    def _recording_warning(event: str, **kwargs: object) -> None:
+        logged.append((event, kwargs))
+        original_warning(event, **kwargs)
+
+    monkeypatch.setattr(agent._log, "warning", _recording_warning)
+
+    oversized_garbage = "{" + "x" * 5000
+    await _redis(agent).execute("set", f"{MARKET_METRICS_REDIS_KEY_PREFIX}BTC/USDT", oversized_garbage)
+
+    await agent._read_fresh_market_metrics()
+
+    warnings = [kwargs for event, kwargs in logged if event == "alpha_engine_market_metrics_unparseable"]
+    assert len(warnings) == 1
+    raw_value = str(warnings[0]["raw_value"])
+    # Real fakeredis quirk this codebase already documents (core/message_integrity.py's own
+    # docstring on `sign`): decode_responses=True is not always honored, so `raw` may come back as
+    # `bytes` here -- str(bytes) adds its own "b'...'" wrapper, so the exact total isn't pinned down
+    # to len(oversized_garbage); what actually matters is that it stayed capped and says so honestly.
+    assert len(raw_value) < 2100  # well below the raw 5000+-char garbage, whatever representation
+    assert "...<truncated, " in raw_value and raw_value.endswith(" chars total>")
+
+
+@pytest.mark.asyncio
 async def test_off_control_state_places_no_orders(agent: AlphaMarketMakerAgent) -> None:
     await _seed_fresh_market_metrics(agent)
     agent._control_state = AgentControlState.OFF

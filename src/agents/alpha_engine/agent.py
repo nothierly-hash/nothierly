@@ -880,9 +880,23 @@ class AlphaMarketMakerAgent(BaseAgent):
             return None, None
         try:
             metrics = MarketMetrics.model_validate_json(raw)
-        except Exception:
+        except Exception as exc:
+            # 2026-09-16 fix: this used to log only str(raw)[:120] and swallow the real exception --
+            # found live analyzing a real 51h shadow-run window with 34k+ of these warnings, where
+            # that 120-char preview always cut off before mid_price/top_of_book_liquidity even
+            # appeared, and the actual validation reason was never recorded at all. Undiagnosable
+            # after the fact, on the one event that exists specifically to diagnose this. error/
+            # error_type is the real reason (a Pydantic ValidationError says exactly which field and
+            # why); raw_value is capped, not unbounded, so a corrupted/adversarially oversized Redis
+            # value (see core/message_integrity.py's own docstring on who can write this key) can't
+            # turn one warning into a multi-megabyte log line.
+            raw_str = str(raw)
             self._log.warning(
-                "alpha_engine_market_metrics_unparseable", agent_id=self.agent_id, raw_preview=str(raw)[:120]
+                "alpha_engine_market_metrics_unparseable",
+                agent_id=self.agent_id,
+                error_type=type(exc).__name__,
+                error=str(exc),
+                raw_value=raw_str if len(raw_str) <= 2000 else f"{raw_str[:2000]}...<truncated, {len(raw_str)} chars total>",
             )
             return None, None
 
