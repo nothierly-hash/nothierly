@@ -53,9 +53,26 @@ agent.ExecutionAgent._seal_gate8_decision`, called the instant that
 agent's own 8-gate consensus pipeline resolves to an approved
 (``report.all_passed``) decision. Carries a real ``state_vector`` (see
 :class:`OrderAuditEvent`'s own docstring) instead of leaving one blank
--- every other event type above never sets it. Real, disclosed scope:
-only the *decision* is sealed here, not that agent's own downstream
-fills (a separate, real, disclosed follow-up, not silently implied).
+-- every other event type above never sets it. Every real downstream
+fill that decision produces (:meth:`ExecutionAgent._place_order`'s
+single-order path, :meth:`ExecutionAgent._execute_sliced_entry`'s
+per-slice path -- both 2026-09-16, same protocol's own follow-up) is
+also chained onto this same ledger as an ``EXECUTED`` event, reusing
+the pre-existing event type rather than adding a sixth -- sharing the
+sealed decision's own ``order_id`` (see
+:func:`~src.agents.execution.agent._gate8_order_id`) is what actually
+links a fill back to the decision that authorized it, not a new field
+on this model. A large sliced entry therefore produces one
+``GATE8_SEALED`` event followed by N ``EXECUTED`` events, all five
+(or more) sharing one ``order_id`` and each still individually
+chained by ``current_hash`` -- the same "several real events, one
+``order_id``" pattern :func:`~src.agents.macro_order_execution.agent.
+MacroOrderExecutionAgent._persist_real_fill` already uses for a
+multi-venue fill. Real, disclosed scope boundary that still holds:
+only an entry's own fills are chained here -- a later position *exit*
+(unilateral and ungated by design, see ``agent.py``'s module
+docstring) is a separate real decision with no Gate-8 seal of its own
+to chain onto, and remains a separate, disclosed follow-up.
 
 **Strict sequential processing, unlike this project's other
 ``CLIENT_ORDERS_TOPIC`` consumers**: :class:`~src.execution.

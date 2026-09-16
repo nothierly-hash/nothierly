@@ -30,6 +30,7 @@ from pydantic import SecretStr
 from core.config import AppSettings, OandaSettings, RedisSettings
 from core.redis_client import RedisClient
 from core.schemas import (
+    ORDER_AUDIT_EVENTS_TOPIC,
     ORDER_SLICING_PROGRESS_REDIS_KEY_PREFIX,
     TRADING_SIGNALS_TOPIC,
     MarketMetrics,
@@ -166,6 +167,11 @@ async def _fills_blotter_entries(redis_client: RedisClient) -> list[dict[str, An
 async def _slicing_progress(redis_client: RedisClient) -> dict[str, Any] | None:
     raw = await redis_client.execute("get", f"{ORDER_SLICING_PROGRESS_REDIS_KEY_PREFIX}{_INSTRUMENT}")
     return json.loads(raw) if raw is not None else None
+
+
+def _audit_events(agent: ExecutionAgent) -> list[dict[str, Any]]:
+    publisher: _RecordingZmqPublisher = agent._publisher  # type: ignore[assignment]
+    return [p.data for p in publisher.published if p.topic == ORDER_AUDIT_EVENTS_TOPIC]
 
 
 @pytest.mark.asyncio
@@ -334,3 +340,57 @@ async def test_small_real_entry_below_threshold_is_not_sliced(agent: ExecutionAg
     assert len(calls) == 1, f"expected exactly 1 real order (unsliced path), got {len(calls)}"
     assert calls[0] == _EXPECTED_TOTAL_UNITS
     assert await _slicing_progress(redis_client) is None  # no slicing telemetry for the unsliced path
+
+
+@pytest.mark.asyncio
+async def test_single_order_entry_chains_its_real_fill_onto_the_gate8_ledger(agent: ExecutionAgent) -> None:
+    """"Protocole Immutable Ledger" follow-up (2026-09-16): the unsliced path's own real fill must
+    land on ORDER_AUDIT_EVENTS_TOPIC as an EXECUTED event sharing the sealed decision's order_id --
+    not just the pre-existing TRADE_EXECUTED telemetry this module already published."""
+    agent._slicing_notional_threshold_usd = 1_000_000.0  # far above this fixture's ~$6,666 real notional
+    await _stub_broker_lookups(agent)
+
+    async def _fake_create_market_order(instrument: str, units: int) -> dict[str, Any]:
+        return {"id": "fake-single-order", "price": _PRICE}
+
+    agent._trading_client.create_market_order = _fake_create_market_order  # type: ignore[assignment]
+
+    await _open_via_consensus(agent)
+
+    events = _audit_events(agent)
+    sealed = [e for e in events if e["event_type"] == "GATE8_SEALED"]
+    executed = [e for e in events if e["event_type"] == "EXECUTED"]
+    assert len(sealed) == 1
+    assert len(executed) == 1
+    assert executed[0]["order_id"] == sealed[0]["order_id"]
+    assert executed[0]["execution_mode"] == "LIVE_ORDER"
+    assert "fake-single-order" in executed[0]["detail"]
+
+
+@pytest.mark.asyncio
+async def test_sliced_entry_chains_every_real_slice_fill_onto_the_gate8_ledger(agent: ExecutionAgent) -> None:
+    """"Protocole Immutable Ledger" follow-up (2026-09-16): every one of the 4 real slices must also
+    land on ORDER_AUDIT_EVENTS_TOPIC as its own EXECUTED event, all sharing the one sealed decision's
+    order_id -- an auditor can walk from GATE8_SEALED to every real fill it authorized by that id
+    alone, without a second, separate index of which fills belong to which decision."""
+    await _stub_broker_lookups(agent)
+    calls: list[int] = []
+
+    async def _fake_create_market_order(instrument: str, units: int) -> dict[str, Any]:
+        calls.append(units)
+        return {"id": f"fake-slice-{len(calls)}", "price": _PRICE}
+
+    agent._trading_client.create_market_order = _fake_create_market_order  # type: ignore[assignment]
+
+    await _open_via_consensus(agent)
+
+    events = _audit_events(agent)
+    sealed = [e for e in events if e["event_type"] == "GATE8_SEALED"]
+    executed = [e for e in events if e["event_type"] == "EXECUTED"]
+    assert len(sealed) == 1
+    assert len(executed) == 4
+    assert {e["order_id"] for e in executed} == {sealed[0]["order_id"]}
+    assert all(e["execution_mode"] == "LIVE_ORDER" for e in executed)
+    for i, event in enumerate(executed, start=1):
+        assert f"Tranche TWAP {i}/4" in event["detail"]
+        assert f"fake-slice-{i}" in event["detail"]

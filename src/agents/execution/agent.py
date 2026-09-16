@@ -181,8 +181,14 @@ the real Alpha agents' signal/confidence per agent id, and the real account-bala
 snapshot this same gate evaluation already resolved. The existing ledger's own SHA-256 chaining,
 TimescaleDB persistence, and independent Redis chain-tip anchor needed no changes at all to accept
 this -- only ``OrderAuditEvent`` gained one new ``event_type`` value and an optional ``state_vector``
-field. Real, disclosed scope boundary: only the *decision* is sealed here, not this agent's own
-downstream fills -- a separate, real follow-up, not silently implied.
+field. Real, disclosed scope boundary, narrowed on 2026-09-16's own follow-up pass: every real fill
+this decision produces (the single-order path below, and every individual TWAP slice in
+:meth:`_execute_sliced_entry`) is now also chained onto that same ledger as an ``EXECUTED`` event,
+sharing the sealed decision's own ``order_id`` (see :func:`_gate8_order_id`) -- an auditor can walk
+one ``GATE8_SEALED`` event forward through every real fill it authorized, on the same hash chain, by
+that shared id alone. What remains genuinely out of scope: a later position *exit* is a separate,
+unilateral, ungated real decision (see this module's own opening invariant) with no Gate-8 seal to
+chain a fill onto -- chaining exits too would need its own real event type, not this one's follow-up.
 """
 
 from __future__ import annotations
@@ -453,6 +459,24 @@ _GATE_NAMES: Final[tuple[str, str, str, str, str, str, str, str]] = (
 # brief's own literal example; overridable per-instance via ExecutionAgent's constructor, the same
 # "sensible default, real constructor override" pattern stop_loss_pct/cooldown_seconds already use.
 _DEFAULT_SLICING_NOTIONAL_THRESHOLD_USD: Final[float] = 10_000.0
+
+
+def _gate8_order_id(instrument: str, timestamp: float) -> str:
+    """Deterministic ``order_id`` shared by one sealed Gate-8 decision and every real fill it produces.
+
+    "Protocole Immutable Ledger" follow-up (2026-09-16): factored out of
+    :meth:`ExecutionAgent._seal_gate8_decision` so that method and every
+    real downstream-fill audit event (:meth:`ExecutionAgent._place_order`'s
+    single-order path, :meth:`ExecutionAgent._execute_sliced_entry`'s
+    per-slice path) compute the exact same literal string from the exact
+    same ``(instrument, timestamp)`` the sealed :class:`GateReport` already
+    carries -- never threaded across methods as a stored value, which
+    would risk the two silently drifting apart. A ledger reader can
+    therefore find every real fill that resulted from a given sealed
+    decision with a plain ``order_id`` match, without this module
+    maintaining a second, separate index of its own.
+    """
+    return f"gate8-{instrument.replace('/', '_')}-{int(timestamp * 1000)}"
 
 # -- 2026-09-14, "Logique Combinatoire" -- real Boolean-algebra transition guard for PositionState.status.
 #
@@ -2106,10 +2130,12 @@ class ExecutionAgent(BaseAgent):
         :func:`~src.execution.audit_ledger.compute_event_hash`), rather
         than building a second, competing hash-chain implementation for
         this agent's own consensus pipeline, which that ledger had no
-        real visibility into before this. Real, disclosed scope: only
-        the Gate-8-opening *decision* is sealed here -- this agent's own
-        downstream fills are not (yet) also chained onto this ledger, a
-        separate, real, disclosed follow-up, not silently implied.
+        real visibility into before this. This method seals only the
+        Gate-8-opening *decision* itself -- the real fills it goes on to
+        produce are chained separately, as ``EXECUTED`` events sharing
+        this same call's ``order_id`` (see :func:`_gate8_order_id`), by
+        :meth:`_place_order`'s own single-order path and by
+        :meth:`_execute_sliced_entry`'s per-slice path.
 
         Only called when the caller's ``report.all_passed`` is ``True``
         (see :meth:`_validate_execution_gates`) -- a rejected decision
@@ -2179,10 +2205,9 @@ class ExecutionAgent(BaseAgent):
                 "current_price": current_price,
             },
         }
-        order_id = f"gate8-{report.instrument.replace('/', '_')}-{int(report.timestamp * 1000)}"
         event = OrderAuditEvent(
             event_type="GATE8_SEALED",
-            order_id=order_id,
+            order_id=_gate8_order_id(report.instrument, report.timestamp),
             asset=report.instrument,
             execution_mode=report.final_action,
             detail=(
@@ -2417,6 +2442,21 @@ class ExecutionAgent(BaseAgent):
                         order_id=str(order.get("id", "unknown")),
                     )
                     await self.publish(_TRADE_EXECUTED_TOPIC, execution.model_dump(mode="json"))
+                    # "Protocole Immutable Ledger" follow-up (2026-09-16): chain this real fill onto
+                    # the same ledger as the GATE8_SEALED decision that authorized it -- same
+                    # order_id, see _gate8_order_id's own docstring for why that alone is enough to
+                    # link the two without a new field on OrderAuditEvent.
+                    fill_event = OrderAuditEvent(
+                        event_type="EXECUTED",
+                        order_id=_gate8_order_id(report.instrument, report.timestamp),
+                        asset=instrument,
+                        execution_mode=report.final_action,
+                        detail=(
+                            f"Fill reel : {units} {instrument} @ {current_price:.5f} "
+                            f"(ordre broker={order.get('id', 'unknown')})."
+                        ),
+                    )
+                    await self.publish(ORDER_AUDIT_EVENTS_TOPIC, fill_event.model_dump(mode="json"))
 
             if not should_slice:
                 position = self._position_for(instrument)
@@ -2435,12 +2475,18 @@ class ExecutionAgent(BaseAgent):
                 await self._publish_active_positions()
 
         if should_slice:
-            await self._execute_sliced_entry(sliced_instrument, sliced_direction, sliced_units, sliced_entry_price)
+            await self._execute_sliced_entry(
+                sliced_instrument,
+                sliced_direction,
+                sliced_units,
+                sliced_entry_price,
+                gate8_order_id=_gate8_order_id(report.instrument, report.timestamp),
+            )
 
     # -- Order Slicer ("Protocole Stealth Slicing", 2026-09-16) -------------
 
     async def _execute_sliced_entry(
-        self, instrument: str, direction: int, planned_units: int, current_price: float
+        self, instrument: str, direction: int, planned_units: int, current_price: float, *, gate8_order_id: str
     ) -> None:
         """Real TWAP-slice one large, already-gate-approved entry into N real market orders.
 
@@ -2472,12 +2518,26 @@ class ExecutionAgent(BaseAgent):
         :class:`~src.agents.execution.order_slicer.SlicingAbortedError`)
         -- the position ends up reflecting exactly the real slices that
         filled, never silently completed and never silently discarded.
+
+        Args:
+            gate8_order_id: The sealed :class:`~src.execution.
+                audit_ledger.OrderAuditEvent`'s own ``order_id`` for the
+                Gate-8 decision that approved this entry (see
+                :func:`_gate8_order_id`) -- every slice below chains its
+                own real fill onto that same ledger sharing this exact
+                id, "Protocole Immutable Ledger"'s 2026-09-16 follow-up.
         """
         expected_status: Literal["LONG", "SHORT"] = "LONG" if direction == 1 else "SHORT"
         opened = False
+        slice_ordinal = 0
+        # Pure/deterministic (see OrderSlicer.plan's own docstring: no randomness in sizing, only in
+        # the inter-slice sleep below) -- recomputing it here to know the real total slice count for
+        # each chained audit event's own human-readable detail costs nothing and stays byte-for-byte
+        # identical to what self._order_slicer.execute (further below) independently plans.
+        total_slices_planned = len(self._order_slicer.plan(planned_units))
 
         async def _place_slice(slice_units: int) -> None:
-            nonlocal opened
+            nonlocal opened, slice_ordinal
             async with self._lock_for(instrument):
                 if not await is_system_safe():
                     raise SlicingAbortedError("Global Kill Switch tripped mid-slicing.")
@@ -2508,6 +2568,7 @@ class ExecutionAgent(BaseAgent):
                         detail="Global Kill Switch has been tripped -- see prior log line.",
                     )
                     raise
+                slice_ordinal += 1
                 slice_latency_ms = (time.monotonic() - slice_start) * 1000.0
                 fill_price_raw = fill.get("price")
                 fill_price = float(fill_price_raw) if fill_price_raw is not None else current_price
@@ -2535,6 +2596,23 @@ class ExecutionAgent(BaseAgent):
                     order_id=str(fill.get("id", "unknown")),
                 )
                 await self.publish(_TRADE_EXECUTED_TOPIC, slice_execution.model_dump(mode="json"))
+                # "Protocole Immutable Ledger" follow-up (2026-09-16): chain this one real slice
+                # fill onto the same ledger as the GATE8_SEALED decision that authorized the whole
+                # entry -- sharing gate8_order_id with that decision and every sibling slice is what
+                # links them, not a new field (see _gate8_order_id's own docstring). execution_mode
+                # is always "LIVE_ORDER" here: the caller (_place_order) only ever reaches this
+                # method for a real, non-simulated entry -- see this method's own docstring.
+                slice_fill_event = OrderAuditEvent(
+                    event_type="EXECUTED",
+                    order_id=gate8_order_id,
+                    asset=instrument,
+                    execution_mode="LIVE_ORDER",
+                    detail=(
+                        f"Tranche TWAP {slice_ordinal}/{total_slices_planned} : {slice_units} "
+                        f"{instrument} @ {fill_price:.5f} (ordre broker={fill.get('id', 'unknown')})."
+                    ),
+                )
+                await self.publish(ORDER_AUDIT_EVENTS_TOPIC, slice_fill_event.model_dump(mode="json"))
 
                 if not opened:
                     position.assert_valid_transition(expected_status)
