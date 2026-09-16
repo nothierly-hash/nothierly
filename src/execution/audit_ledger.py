@@ -46,6 +46,17 @@ docstring for the honest, typically-short real cancellation window
 :class:`MacroOrderExecutionAgent`'s immediate, unscheduled execution
 leaves open).
 
+**``GATE8_SEALED`` (2026-09-16, "Protocole Immutable Ledger")**: a fifth
+real event type, from a completely different real order path this
+ledger had no visibility into before -- :meth:`~src.agents.execution.
+agent.ExecutionAgent._seal_gate8_decision`, called the instant that
+agent's own 8-gate consensus pipeline resolves to an approved
+(``report.all_passed``) decision. Carries a real ``state_vector`` (see
+:class:`OrderAuditEvent`'s own docstring) instead of leaving one blank
+-- every other event type above never sets it. Real, disclosed scope:
+only the *decision* is sealed here, not that agent's own downstream
+fills (a separate, real, disclosed follow-up, not silently implied).
+
 **Strict sequential processing, unlike this project's other
 ``CLIENT_ORDERS_TOPIC`` consumers**: :class:`~src.execution.
 shadow_crossing_engine.ShadowCrossingEngine` and
@@ -143,17 +154,31 @@ _CREATE_ASSET_INDEX_SQL: Final[str] = (
 
 
 class OrderAuditEvent(BaseModel):
-    """One real order-lifecycle event, as published onto :data:`~core.schemas.ORDER_AUDIT_EVENTS_TOPIC`."""
+    """One real order-lifecycle event, as published onto :data:`~core.schemas.ORDER_AUDIT_EVENTS_TOPIC`.
+
+    ``state_vector`` (2026-09-16, "Protocole Immutable Ledger"): ``None``
+    for every pre-existing event type (``SUBMITTED``/``EXECUTED``/
+    ``REJECTED``/``CANCELLED``) -- only ``GATE8_SEALED`` populates it,
+    with the real gate-verdicts/alpha-predictions/risk-snapshot
+    :meth:`~src.agents.execution.agent.ExecutionAgent._seal_gate8_decision`
+    already had in hand at the exact instant its own 8-gate pipeline
+    opened. A plain ``dict`` (not a dedicated nested model), deliberately:
+    this event's own hash-chaining never inspects its structure, only
+    hashes ``model_dump_json()`` verbatim (see :func:`compute_event_hash`)
+    -- an over-typed nested schema here would buy no real safety this
+    payload-agnostic hash chain needs.
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    event_type: Literal["SUBMITTED", "EXECUTED", "REJECTED", "CANCELLED"]
+    event_type: Literal["SUBMITTED", "EXECUTED", "REJECTED", "CANCELLED", "GATE8_SEALED"]
     order_id: str = Field(min_length=1)
     client_id: str | None = None
     asset: str | None = None
     execution_mode: str | None = None
     detail: str = Field(min_length=1, description="Real, human-readable reason/context -- never blank.")
     occurred_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    state_vector: dict[str, Any] | None = None
 
 
 class AuditTrailRow(BaseModel):
@@ -397,6 +422,18 @@ class CryptographicAuditLedger(BaseAgent):
             # subsequent events would otherwise chain from.
             self._last_hash = current_hash
             await self._write_chain_tip_anchor(current_hash)
+            if event.event_type == "GATE8_SEALED":
+                # The brief's own literal log line, for this one real event type --
+                # only ever emitted once the hash above is durably in TimescaleDB,
+                # never before (a hash logged before the write succeeded would be a
+                # real lie about what is actually "enregistre dans le Ledger").
+                self._log.info(
+                    "audit_gate8_decision_sealed",
+                    agent_id=self.agent_id,
+                    order_id=event.order_id,
+                    current_hash=current_hash,
+                    detail=f"[AUDIT] Decision validee. Empreinte SHA-256 : {current_hash[:8]}... Enregistre dans le Ledger.",
+                )
         else:
             await self._deadletter(event)
 

@@ -11,7 +11,7 @@ own LLM integration (already covered elsewhere).
 from __future__ import annotations
 
 import json
-from typing import Any, Generator
+from typing import Any, Generator, Iterator
 
 import fakeredis.aioredis
 import pytest
@@ -39,14 +39,21 @@ def redis_client() -> Generator[RedisClient, None, None]:
 
 
 @pytest.fixture
-def agent(redis_client: RedisClient) -> ExecutionAgent:
+def agent(redis_client: RedisClient) -> Iterator[ExecutionAgent]:
+    """Real cleanup, not optional -- see tests/test_execution_agent_instrument_lock.py's identical
+    fixture docstring: BaseAgent.__init__ opens real ZMQ PUB/SUB sockets synchronously (even under
+    MOCK_MODE, which only affects the broker call, not this), and leaving them open hangs/risks
+    hanging the pytest process at teardown."""
     instance = ExecutionAgent(
         {_INSTRUMENT}, capital=10_000.0,
         settings=AppSettings(mock_mode=True, guardian=GuardianSettings(llm_provider="none")),
         manage_own_signals=False, manage_own_redis=False,
     )
     instance._redis_client = redis_client
-    return instance
+    yield instance
+    instance._publisher.close()
+    instance._subscriber.close()
+    instance._zmq_context.term()
 
 
 async def _guardian_alerts(redis_client: RedisClient) -> list[dict[str, Any]]:

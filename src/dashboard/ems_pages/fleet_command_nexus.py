@@ -43,10 +43,14 @@ fabriquer un chiffre) :
 - **Module 7 (Courbe d'Impact d'Exécution Optimale, ajouté 2026-09-13, "Le Prompt Architecte")** :
   télémétrie réelle de ``ExecutionAgent.compute_optimal_trajectory`` (Almgren-Chriss) -- trace la
   vraie courbe d'impact temporaire versus impact permanent du dernier plan d'exécution calculé pour
-  chaque instrument, lue depuis Redis (``optimal_execution_schedule:{instrument}``). Note honnête :
-  ce module affiche un **plan calculé**, pas un ordre réellement tranché et exécuté -- voir le
-  docstring de ``compute_optimal_trajectory`` sur la frontière de portée disclosée (le découpage réel
-  d'un ordre dans le temps n'est pas encore câblé dans le chemin d'exécution réel de cet agent).
+  chaque instrument, lue depuis Redis (``optimal_execution_schedule:{instrument}``). Note honnête,
+  mise à jour le 2026-09-16 ("Protocole Stealth Slicing", voir Module 10 ci-dessous) : ce module
+  continue d'afficher un **plan Almgren-Chriss calculé, jamais exécuté** -- cette frontière de
+  portée reste exactement celle disclosée dans ``compute_optimal_trajectory``. Ce qui a changé
+  entre-temps est ailleurs : un mécanisme *différent et plus simple* (TWAP + bruit réel, Module 10)
+  est désormais réellement câblé dans le chemin d'exécution réel de cet agent -- les deux
+  coexistent, l'un reste un aperçu jamais tranché, l'autre est maintenant réellement tranché et
+  exécuté.
 - **Module 8 (Greeks de Portefeuille & Couverture Multi-Instruments, ajouté 2026-09-13, "Options &
   Multi-Instrument Hedging")** : télémétrie réelle de ``ExecutionAgent.compute_portfolio_greeks``
   (``core.schemas.PORTFOLIO_GREEKS_REDIS_KEY``, une seule clé Redis niveau-portefeuille, sans
@@ -82,6 +86,25 @@ fabriquer un chiffre) :
   détient pas aujourd'hui -- l'ajouter à la Porte 7 par tick exigerait une vraie décision
   d'architecture (faire tenir ces connexions à ``ExecutionAgent``), pas une simple ligne de
   télémétrie ; non fait ici, disclosé plutôt que bricolé.
+- **Module 10 (Order Slicer -- "Protocole Stealth Slicing", ajouté 2026-09-16)** : le brief demandait
+  un vrai découpage institutionnel (TWAP/Iceberg) pour qu'un gros ordre ne traverse jamais le carnet
+  d'un seul coup. Télémétrie réelle de ``ExecutionAgent._execute_sliced_entry`` -- lue depuis Redis
+  (``order_slicing_progress:{instrument}``), jamais depuis ZMQ (même règle que partout ailleurs sur
+  cette page). Contrairement au Module 7 (un plan Almgren-Chriss jamais exécuté), chaque ligne ici
+  correspond à des ordres **réellement passés** : dès qu'une entrée réellement approuvée par les 8
+  portes dépasse un seuil de discrétion réel (10 000$ par défaut), elle n'est plus envoyée comme un
+  seul ordre au marché -- elle est découpée en N tranches réelles, espacées dans le temps avec un
+  vrai bruit aléatoire entre chaque tranche pour éviter une cadence de tir détectable. Affiche donc
+  honnêtement soit "Exécution TWAP en cours : 34% (17/50 tranches tirées)" pendant l'exécution, soit
+  l'état final réel (terminée ou interrompue -- voir la note de sécurité ci-dessous). Jamais déclenché
+  pour une entrée simulée (``MOCK_MODE``/``SHADOW``) : il n'y a aucun impact de marché réel à
+  protéger quand aucun ordre réel n'est jamais envoyé. Note de sécurité réelle, trouvée et corrigée
+  avant tout câblage : une exécution de plusieurs minutes ne doit jamais bloquer une sortie
+  stop-loss/take-profit concurrente sur le même instrument -- voir le docstring de
+  ``_execute_sliced_entry`` pour le mécanisme réel (verrou par instrument relâché entre les tranches,
+  re-vérification réelle du Kill Switch/de l'état de contrôle/de la position à chaque tranche,
+  interruption honnête -- position partiellement remplie, jamais silencieusement complétée ou
+  silencieusement perdue -- si l'une de ces conditions change en cours de route).
 - **Module 6 (Portes d'Exécution, ajouté 2026-09-13, "Protocole 7-Gates Convergence" puis étendu le
   même jour par "Protocole Stochastic Core")** : distinct de tout ce qui précède -- Modules 1-4 sont le
   swarm mathématique **simulé** ``core_daemons.py``/DeFi Ghost Daemons ; Module 6 est la **vraie**
@@ -138,6 +161,7 @@ from core.base_agent import AgentControlState
 from core.schemas import (
     AGENT_CONTROL_STATE_REDIS_KEY_PREFIX,
     HEARTBEAT_REDIS_KEY_PREFIX,
+    ORDER_SLICING_PROGRESS_REDIS_KEY_PREFIX,
     PORTFOLIO_GREEKS_REDIS_KEY,
     SOR_ROUTING_LOG_REDIS_KEY,
 )
@@ -874,6 +898,74 @@ def _render_smart_order_router_history() -> None:
     st.markdown("</div>", unsafe_allow_html=True)
 
 
+# =============================================================================
+# Module 10 -- Order Slicer : progression réelle du découpage TWAP ("Protocole Stealth Slicing")
+# =============================================================================
+
+_SLICING_STATUS_BADGE: Final[dict[str, str]] = {
+    "IN_PROGRESS": "🟡 en cours",
+    "COMPLETED": "🟢 terminée",
+    "ABORTED": "🔴 interrompue",
+}
+_SLICING_DIRECTION_LABEL: Final[dict[int, str]] = {1: "ACHAT", -1: "VENTE"}
+
+
+@st.fragment(run_every="1s")
+def _render_order_slicing_progress() -> None:
+    """Lit la vraie progression des exécutions TWAP réelles de ``ExecutionAgent._execute_sliced_entry``
+    -- lecture seule, voir le docstring de ce module (section Module 10) pour la note de sécurité
+    réelle (verrou par instrument relâché entre les tranches, interruption honnête possible)."""
+    r = get_redis_client()
+    st.markdown('<div class="fcn-glass fcn-glass-steel">', unsafe_allow_html=True)
+    st.markdown(
+        "##### 🥷 Module 10 · Order Slicer — Progression Réelle du Découpage TWAP "
+        '&nbsp;<span class="fcn-badge-real">🔒 RÉEL — PRODUCTION</span>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        '<div class="fcn-disclosure" style="border-left-color:#eef2ff;background:rgba(255,255,255,0.04);color:#dfe3ee;">'
+        "🔗 Télémétrie réelle de <code>ExecutionAgent._execute_sliced_entry</code> -- chaque tranche "
+        "comptée ici a réellement été envoyée au courtier (jamais un aperçu, voir Module 7 pour la "
+        "distinction). Déclenché uniquement pour une entrée réelle (jamais simulée) dont le notionnel "
+        "dépasse le seuil de discrétion réel configuré.</div>",
+        unsafe_allow_html=True,
+    )
+
+    progress_keys = safe_keys(r, f"{ORDER_SLICING_PROGRESS_REDIS_KEY_PREFIX}*")
+    if not progress_keys:
+        st.info(
+            "Aucun découpage TWAP réel pour l'instant -- ce panneau s'allume dès la première entrée "
+            "réelle dont le notionnel dépasse le seuil de discrétion (voir le docstring de "
+            "_execute_sliced_entry)."
+        )
+        st.markdown("</div>", unsafe_allow_html=True)
+        return
+
+    for key in sorted(progress_keys):
+        record = safe_get_json(r, key)
+        if record is None:
+            continue
+        instrument = record.get("instrument", key.removeprefix(ORDER_SLICING_PROGRESS_REDIS_KEY_PREFIX))
+        slices_completed = record.get("slices_completed", 0)
+        slices_planned = record.get("slices_planned", 0) or 1
+        percent_complete = record.get("percent_complete", 0.0)
+        status = record.get("status", "IN_PROGRESS")
+        direction_label = _SLICING_DIRECTION_LABEL.get(record.get("direction", 1), "?")
+        age_s = max(0.0, time.time() - record.get("timestamp", time.time()))
+
+        st.markdown(
+            f"**{instrument}** -- {direction_label} &nbsp;·&nbsp; {_SLICING_STATUS_BADGE.get(status, status)} "
+            f"&nbsp;·&nbsp; il y a {age_s:.1f}s"
+        )
+        st.progress(min(1.0, slices_completed / slices_planned))
+        st.caption(
+            f"Exécution TWAP {'en cours' if status == 'IN_PROGRESS' else ('terminée' if status == 'COMPLETED' else 'interrompue')} : "
+            f"{percent_complete:.0f}% ({slices_completed}/{slices_planned} tranches tirées)"
+        )
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
 _render_daemon_matrix()
 st.markdown("")
 _render_infra_channel()
@@ -891,3 +983,5 @@ st.markdown("")
 _render_portfolio_greeks()
 st.markdown("")
 _render_smart_order_router_history()
+st.markdown("")
+_render_order_slicing_progress()

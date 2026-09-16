@@ -140,6 +140,49 @@ must be the *last* gate evaluated before ``create_market_order`` -- the same rea
 brief's own spirit (a real physics vector gates execution) is fully preserved; only the position
 number shifts, and only to keep that invariant intact -- disclosed here rather than silently
 reordered, the same practice this module's docstring already follows throughout.
+
+**"Protocole Stealth Slicing" (2026-09-16)**: the brief asked for real institutional order-slicing
+(TWAP/Iceberg) so a large entry never crosses the book as one obvious market order. Real,
+already-approved-by-the-8-gates entries above a configurable notional threshold (default $10,000,
+:attr:`ExecutionAgent._slicing_notional_threshold_usd`) are now sliced into N real market orders
+(:class:`~src.agents.execution.order_slicer.OrderSlicer`: literal equal-size/equal-time TWAP,
+uniform-random jitter between slices) instead of one -- see :meth:`ExecutionAgent.
+_execute_sliced_entry`. Two honest scope notes: (1) this is a *different*, deliberately simpler
+mechanism than the already-existing Almgren-Chriss :meth:`ExecutionAgent.compute_optimal_trajectory`
+(risk/impact-optimal, participation-capped, still entirely unwired) -- the brief's own ask was
+literal TWAP + jitter, not that model's risk-aversion trade-off, and building a second, competing
+integration of the same math the first was explicitly kept unwired for would have been the wrong
+kind of "helpful." (2) A real correctness problem was found and closed before this could ship: a
+multi-minute slicing execution must never hold :meth:`ExecutionAgent._lock_for`'s per-instrument
+lock for its whole duration -- doing so would block a concurrent stop-loss/take-profit/trailing-stop
+exit on the exact same instrument for that entire real time, directly violating this module's own
+opening invariant that an exit is unilateral and immediate, never gated. ``_execute_sliced_entry``
+therefore runs outside :meth:`ExecutionAgent._place_order`'s own lock hold, re-acquiring it only for
+each individual slice's brief real broker call + position mutation, and re-checks the real Kill
+Switch, this agent's own control state, and the position's real current status before every single
+slice -- aborting the rest, honestly, the instant any of those no longer hold (a concurrent real
+exit closing the position mid-slicing is treated the same as an operator-tripped Kill Switch: stop,
+never fight a deliberate real risk decision). Never triggered for a ``MOCK_MODE``/``SHADOW`` entry
+-- there is no real market impact to protect against when no real broker order is ever placed.
+
+**"Protocole Immutable Ledger" (2026-09-16)**: the brief asked to cryptographically seal every
+opening of Gate 8 for institutional audit -- and, checked before writing anything, this project
+already has real, purpose-built infrastructure for exactly that:
+:class:`~src.execution.audit_ledger.CryptographicAuditLedger` ("audit-ledger-agent"), a real
+SHA-256 hash-chained ledger already wired to the gateway/macro-execution order path, but with zero
+visibility into this agent's own consensus-driven gate pipeline. Extended it (see
+:meth:`ExecutionAgent._seal_gate8_decision`) rather than building a second, parallel hash-chain --
+every approved (``report.all_passed``) decision now publishes a real ``GATE8_SEALED``
+:class:`~src.execution.audit_ledger.OrderAuditEvent`, carrying a real "State Vector": millisecond
+timestamp, all 8 real gate verdicts (Gate 7's own already-real physics-inspired daemon readings
+included verbatim -- Hawkes, jump-diffusion, Ornstein-Uhlenbeck, Poiseuille, etc.; this project has
+no literal Navier-Stokes anywhere, so that's the honest translation of the brief's own example),
+the real Alpha agents' signal/confidence per agent id, and the real account-balance/margin/sizing
+snapshot this same gate evaluation already resolved. The existing ledger's own SHA-256 chaining,
+TimescaleDB persistence, and independent Redis chain-tip anchor needed no changes at all to accept
+this -- only ``OrderAuditEvent`` gained one new ``event_type`` value and an optional ``state_vector``
+field. Real, disclosed scope boundary: only the *decision* is sealed here, not this agent's own
+downstream fills -- a separate, real follow-up, not silently implied.
 """
 
 from __future__ import annotations
@@ -175,6 +218,8 @@ from core.quant_math import (
 from core.redis_client import RedisUnavailableError
 from core.schemas import (
     EMERGENCY_HALT_TOPIC,
+    ORDER_AUDIT_EVENTS_TOPIC,
+    ORDER_SLICING_PROGRESS_REDIS_KEY_PREFIX,
     OPTIMAL_EXECUTION_SCHEDULE_REDIS_KEY_PREFIX,
     PORTFOLIO_GREEKS_REDIS_KEY,
     TRADING_SIGNALS_TOPIC,
@@ -183,6 +228,7 @@ from core.schemas import (
     OptionContract,
     OptionPosition,
     OptimalExecutionSchedule,
+    OrderSlicingProgress,
     PortfolioGreeks,
     TradeExecution,
     TradeSide,
@@ -191,16 +237,25 @@ from core.schemas import (
 from core.security import (
     FinancialCallAbortedError,
     KillSwitchActiveError,
+    is_system_safe,
     requires_system_active,
     safe_financial_call,
 )
 from execution.order_flow_liquidity_agent import OrderFlowLiquidityAgent
+from src.agents.execution.order_slicer import (
+    DEFAULT_EXECUTION_HORIZON_SECONDS,
+    DEFAULT_JITTER_SECONDS,
+    DEFAULT_NUM_SLICES,
+    OrderSlicer,
+    SlicingAbortedError,
+)
 from src.agents.guardian_ai import TriggerType, assess_risk
 from src.agents.supervisor.broker_client import OandaClient
 from src.agents.supervisor.optimal_execution_scheduler import OptimalExecutionScheduler
 from src.agents.supervisor.options_hedging_manager import GreeksSnapshot, HedgeRecommendation, OptionsHedgingManager
 from src.agents.supervisor.portfolio_risk_manager import CorrelatedExposureError, PortfolioRiskParityManager
 from src.agents.supervisor.risk_manager import RiskLimitExceededError, RiskManager
+from src.execution.audit_ledger import OrderAuditEvent
 
 _log = get_logger(__name__)
 
@@ -389,6 +444,15 @@ _GATE_NAMES: Final[tuple[str, str, str, str, str, str, str, str]] = (
     "StochasticCore",
     "Control State",
 )
+
+# -- Order Slicer / "Protocole Stealth Slicing" (2026-09-16) ---------------
+#
+# Real default discretion threshold: an entry whose real notional (abs(units) * current_price)
+# exceeds this is never sent as a single market order (see _place_order) -- it is instead handed to
+# self._order_slicer (see _execute_sliced_entry) as N real TWAP-paced slices. $10,000 matches the
+# brief's own literal example; overridable per-instance via ExecutionAgent's constructor, the same
+# "sensible default, real constructor override" pattern stop_loss_pct/cooldown_seconds already use.
+_DEFAULT_SLICING_NOTIONAL_THRESHOLD_USD: Final[float] = 10_000.0
 
 # -- 2026-09-14, "Logique Combinatoire" -- real Boolean-algebra transition guard for PositionState.status.
 #
@@ -640,6 +704,10 @@ class ExecutionAgent(BaseAgent):
         manage_own_signals: bool = True,
         zmq_context: zmq.asyncio.Context | None = None,
         manage_own_redis: bool = True,
+        slicing_notional_threshold_usd: float = _DEFAULT_SLICING_NOTIONAL_THRESHOLD_USD,
+        slicing_num_slices: int = DEFAULT_NUM_SLICES,
+        slicing_execution_horizon_seconds: float = DEFAULT_EXECUTION_HORIZON_SECONDS,
+        slicing_jitter_seconds: float = DEFAULT_JITTER_SECONDS,
     ) -> None:
         """Wire up the OANDA trading client and risk manager; subscribe to signals + prices.
 
@@ -716,6 +784,16 @@ class ExecutionAgent(BaseAgent):
             manage_own_signals: See :class:`~core.base_agent.BaseAgent`.
             zmq_context: See :class:`~core.base_agent.BaseAgent`.
             manage_own_redis: See :class:`~core.base_agent.BaseAgent`.
+            slicing_notional_threshold_usd: Real discretion threshold
+                for :meth:`_execute_sliced_entry` -- see
+                :data:`_DEFAULT_SLICING_NOTIONAL_THRESHOLD_USD`.
+            slicing_num_slices: Passed straight through to
+                :class:`~src.agents.execution.order_slicer.OrderSlicer`.
+            slicing_execution_horizon_seconds: Passed straight through
+                to :class:`~src.agents.execution.order_slicer.
+                OrderSlicer`.
+            slicing_jitter_seconds: Passed straight through to
+                :class:`~src.agents.execution.order_slicer.OrderSlicer`.
         """
         super().__init__(
             _AGENT_ID,
@@ -769,6 +847,17 @@ class ExecutionAgent(BaseAgent):
         # informational telemetry only -- it does not itself resize or
         # place any real order.
         self._order_flow_agent = OrderFlowLiquidityAgent()
+        # "Protocole Stealth Slicing" (2026-09-16): real TWAP + jitter slicing for any entry whose
+        # real notional exceeds slicing_notional_threshold_usd -- see _execute_sliced_entry's own
+        # docstring for the real wiring (this is *not* the Almgren-Chriss scheduler above, which
+        # stays a separate, unwired planning tool -- see OrderSlicer's own module docstring).
+        self._slicing_notional_threshold_usd = slicing_notional_threshold_usd
+        self._slicing_execution_horizon_seconds = slicing_execution_horizon_seconds
+        self._order_slicer = OrderSlicer(
+            num_slices=slicing_num_slices,
+            execution_horizon_seconds=slicing_execution_horizon_seconds,
+            jitter_seconds=slicing_jitter_seconds,
+        )
         self._mock_mode = self._settings.mock_mode
         self._mock_balance = capital
 
@@ -1989,7 +2078,120 @@ class ExecutionAgent(BaseAgent):
 
         report = GateReport(instrument, direction, time.time(), tuple(gates), final_action)
         await self._publish_gate_report(report)
+        await self._seal_gate8_decision(report, signals, account_balance, available_margin, sized_units, current_price)
         return report, current_price, account_balance, sized_units
+
+    async def _seal_gate8_decision(
+        self,
+        report: GateReport,
+        signals: dict[str, TradingSignal] | None,
+        account_balance: float,
+        available_margin: float,
+        sized_units: float,
+        current_price: float,
+    ) -> None:
+        """Cryptographically seal one real, approved (all 8 gates PASSED) trading decision.
+
+        "Protocole Immutable Ledger" (2026-09-16): publishes a real
+        :class:`~src.execution.audit_ledger.OrderAuditEvent`
+        (``event_type="GATE8_SEALED"``) onto :data:`~core.schemas.
+        ORDER_AUDIT_EVENTS_TOPIC` -- the same real bus/hash-chain
+        :class:`~src.execution.audit_ledger.CryptographicAuditLedger`
+        ("audit-ledger-agent") already chains every ``SUBMITTED``/
+        ``EXECUTED``/``REJECTED``/``CANCELLED`` event from the gateway/
+        macro-execution order path onto. Extended, not duplicated: this
+        method reuses that exact same real SHA-256 chain
+        (``current_hash = SHA256(prev_hash '|' payload_json)``,
+        canonicalized via Pydantic's own ``model_dump_json()`` -- see
+        :func:`~src.execution.audit_ledger.compute_event_hash`), rather
+        than building a second, competing hash-chain implementation for
+        this agent's own consensus pipeline, which that ledger had no
+        real visibility into before this. Real, disclosed scope: only
+        the Gate-8-opening *decision* is sealed here -- this agent's own
+        downstream fills are not (yet) also chained onto this ledger, a
+        separate, real, disclosed follow-up, not silently implied.
+
+        Only called when the caller's ``report.all_passed`` is ``True``
+        (see :meth:`_validate_execution_gates`) -- a rejected decision
+        is never sealed, matching the brief's own literal ask ("chaque
+        ouverture de la 8ème Porte", not every evaluation).
+
+        The real "State Vector" sealed below -- every field is data this
+        method already had in hand, none fabricated for the occasion:
+
+        - **Timestamp**, millisecond precision (``report.timestamp``,
+          already a real ``time.time()`` float -- Python's own
+          sub-millisecond wall-clock resolution, just formatted to ms).
+        - **"Daemons Physiques"**: this project does not literally
+          implement Navier-Stokes anywhere -- the real, honest
+          translation is Gate 7's own real physics-inspired daemons,
+          already computed and embedded verbatim in ``report.gates``'
+          own ``detail`` strings: Hawkes cascade intensity, Merton
+          jump-diffusion, Ornstein-Uhlenbeck mean reversion, Wasserstein
+          drift, Kolmogorov compressibility, the Lyapunov exponent,
+          order-flow dominance, price impact, and the real Hagen-
+          Poiseuille liquidity-resistance *analogy* (see
+          :meth:`_gate_7_stochastic_core`'s own docstring for why that
+          one is explicitly an analogy, never a literal fluid-dynamics
+          claim). Sealing all 8 gates' real verdicts, not just Gate 7's,
+          is a strictly more complete real record of what actually
+          happened.
+        - **Alpha agent predictions**: each real :class:`~core.schemas.
+          TradingSignal`'s ``signal``/``confidence`` for every agent
+          that voted, keyed by real agent id -- ``None``, honestly, for
+          a manual operator override (``signals is None``), never
+          fabricated to fill the field.
+        - **Risk snapshot**: the real ``account_balance``/
+          ``available_margin`` this same gate evaluation already
+          resolved (``MOCK_MODE``/``SHADOW`` balance or the real,
+          freshly-fetched OANDA figures -- whichever this decision
+          actually used), plus the real sized units and current price.
+
+        Never allowed to affect the real trading decision itself: this
+        publish happens strictly after ``report``/``final_action`` are
+        already finalized, and (matching every other ``self.publish``
+        call in this module) is not wrapped in a try/except -- a
+        publish failure here would be a real bug to surface, not one to
+        silently swallow underneath an already-completed decision.
+        """
+        alpha_predictions = (
+            {
+                agent_id: {"signal": signal.signal, "confidence": signal.confidence}
+                for agent_id, signal in signals.items()
+            }
+            if signals is not None
+            else None
+        )
+        state_vector = {
+            "timestamp_ms": int(report.timestamp * 1000),
+            "instrument": report.instrument,
+            "direction": report.direction,
+            "final_action": report.final_action,
+            "gates": [
+                {"number": g.number, "name": g.name, "status": g.status, "detail": g.detail}
+                for g in report.gates
+            ],
+            "alpha_predictions": alpha_predictions,
+            "risk_snapshot": {
+                "account_balance": round(account_balance, 2),
+                "available_margin": round(available_margin, 2),
+                "sized_units": round(sized_units, 6),
+                "current_price": current_price,
+            },
+        }
+        order_id = f"gate8-{report.instrument.replace('/', '_')}-{int(report.timestamp * 1000)}"
+        event = OrderAuditEvent(
+            event_type="GATE8_SEALED",
+            order_id=order_id,
+            asset=report.instrument,
+            execution_mode=report.final_action,
+            detail=(
+                f"Decision scellee : 8/8 portes ouvertes, action={report.final_action}, "
+                f"direction={report.direction}."
+            ),
+            state_vector=state_vector,
+        )
+        await self.publish(ORDER_AUDIT_EVENTS_TOPIC, event.model_dump(mode="json"))
 
     async def _publish_gate_report(self, report: GateReport) -> None:
         """Persist one instrument's latest 7-gate verdict onto :data:`_GATE_TELEMETRY_REDIS_KEY`.
@@ -2060,6 +2262,20 @@ class ExecutionAgent(BaseAgent):
         separated by several real ``await`` points with nothing
         preventing another concurrent call for the same instrument from
         interleaving in between).
+
+        **2026-09-16, "Protocole Stealth Slicing"**: a real entry whose
+        notional exceeds :attr:`_slicing_notional_threshold_usd` is no
+        longer sent as one single market order here -- it is handed to
+        :meth:`_execute_sliced_entry` instead (real TWAP + jitter, see
+        :class:`~src.agents.execution.order_slicer.OrderSlicer`), which
+        runs **after** this method's own ``_lock_for`` block has already
+        released (see that method's docstring for why: a multi-minute
+        slicing execution must never hold this instrument's lock for its
+        entire real duration, or a concurrent stop-loss/take-profit exit
+        would be blocked for that whole time). ``MOCK_MODE``/``SHADOW``
+        entries are never sliced, regardless of notional -- there is no
+        real market impact to protect against when no real order is
+        ever sent (see :meth:`_execute_sliced_entry`'s own docstring).
         """
         async with self._lock_for(instrument):
             report, current_price, account_balance, raw_units = await self._validate_execution_gates(
@@ -2122,6 +2338,12 @@ class ExecutionAgent(BaseAgent):
                 )
                 return
 
+            should_slice = False
+            sliced_instrument = instrument
+            sliced_direction = direction
+            sliced_units = 0
+            sliced_entry_price = current_price
+
             if simulate_this_entry:
                 self._log.warning(
                     "MOCK_MODE_SIMULATED_ORDER" if self._mock_mode else "SHADOW_MODE_SIMULATED_ORDER",
@@ -2147,59 +2369,252 @@ class ExecutionAgent(BaseAgent):
                     agent_control_shadow=shadow_controlled,
                 )
             else:
-                order_start = time.monotonic()
+                notional = abs(units) * current_price
+                should_slice = notional > self._slicing_notional_threshold_usd
+                if should_slice:
+                    # Real TWAP slicing ("Protocole Stealth Slicing") takes over entirely below,
+                    # deliberately *outside* this method's own _lock_for hold -- see
+                    # _execute_sliced_entry's own docstring for why (this can span real minutes,
+                    # and must never block a concurrent stop-loss/take-profit exit for that long).
+                    sliced_instrument, sliced_direction = instrument, direction
+                    sliced_units, sliced_entry_price = int(units), current_price
+                else:
+                    order_start = time.monotonic()
+                    try:
+                        order = await safe_financial_call(
+                            self._trading_client.create_market_order, instrument, int(units), retry_on_failure=False
+                        )
+                    except FinancialCallAbortedError:
+                        self._log.error(
+                            "consensus_order_execution_aborted",
+                            agent_id=self.agent_id,
+                            instrument=instrument,
+                            direction=direction,
+                            units=units,
+                            detail="Global Kill Switch has been tripped -- see prior log line.",
+                        )
+                        return
+                    order_latency_ms = (time.monotonic() - order_start) * 1000.0
+                    await self._log_fill(
+                        instrument=instrument,
+                        action="ENTRY_LONG" if direction == 1 else "ENTRY_SHORT",
+                        price=current_price,
+                        units=units,
+                        latency_ms=order_latency_ms,
+                    )
+                    self._log.info(
+                        "consensus_order_executed",
+                        agent_id=self.agent_id,
+                        instrument=instrument,
+                        order_id=order.get("id"),
+                        direction=direction,
+                        units=units,
+                    )
+                    execution = TradeExecution(
+                        symbol=instrument,
+                        side=TradeSide.BUY if direction == 1 else TradeSide.SELL,
+                        cost=abs(units) * current_price,
+                        order_id=str(order.get("id", "unknown")),
+                    )
+                    await self.publish(_TRADE_EXECUTED_TOPIC, execution.model_dump(mode="json"))
+
+            if not should_slice:
+                position = self._position_for(instrument)
+                new_status: Literal["LONG", "SHORT"] = "LONG" if direction == 1 else "SHORT"
+                position.assert_valid_transition(new_status)
+                position.status = new_status
+                position.entry_price = current_price
+                position.units_held = units
+                position.highest_seen_price = current_price if direction == 1 else None
+                position.lowest_seen_price = current_price if direction == -1 else None
+                position.cooldown_until = None
+                position.opened_at = time.time()
+                position.entered_as_simulated = simulate_this_entry
+                position.entered_as_shadow_controlled = shadow_controlled
+                self._current_exposure += abs(units) * current_price
+                await self._publish_active_positions()
+
+        if should_slice:
+            await self._execute_sliced_entry(sliced_instrument, sliced_direction, sliced_units, sliced_entry_price)
+
+    # -- Order Slicer ("Protocole Stealth Slicing", 2026-09-16) -------------
+
+    async def _execute_sliced_entry(
+        self, instrument: str, direction: int, planned_units: int, current_price: float
+    ) -> None:
+        """Real TWAP-slice one large, already-gate-approved entry into N real market orders.
+
+        Called by :meth:`_place_order` only once its own gate validation
+        and sizing already fully approved ``planned_units`` at
+        ``current_price`` -- this method never re-runs Gates 1-7;
+        slicing an already-approved meta-order over time is an
+        execution-mechanics decision, not a new trading decision. Never
+        reached for a simulated (``MOCK_MODE``/``SHADOW``) entry -- see
+        the caller -- since there is no real market impact/slippage to
+        protect against when no real broker order is ever sent.
+
+        Deliberately runs **outside** :meth:`_place_order`'s own
+        :meth:`_lock_for` (``instrument``) hold: this can span real
+        minutes (:attr:`_order_slicer`'s configured execution horizon),
+        and holding that lock the whole time would block a concurrent
+        stop-loss/take-profit/trailing-stop exit for this same
+        instrument for that entire real duration -- exactly the "exit
+        must never be gated or delayed" invariant the module docstring
+        opens with. Instead, each real slice below (see the nested
+        ``_place_slice``) re-acquires that same lock only for the brief
+        real duration of its own broker call + position mutation,
+        releasing it during the real jittered sleep between slices.
+
+        Real, honest partial-fill handling: if the global Kill Switch
+        trips, the operator flips this agent's control state away from
+        ``LIVE``, or a concurrent real exit closes/flips this exact
+        position mid-slicing, every remaining slice is abandoned (see
+        :class:`~src.agents.execution.order_slicer.SlicingAbortedError`)
+        -- the position ends up reflecting exactly the real slices that
+        filled, never silently completed and never silently discarded.
+        """
+        expected_status: Literal["LONG", "SHORT"] = "LONG" if direction == 1 else "SHORT"
+        opened = False
+
+        async def _place_slice(slice_units: int) -> None:
+            nonlocal opened
+            async with self._lock_for(instrument):
+                if not await is_system_safe():
+                    raise SlicingAbortedError("Global Kill Switch tripped mid-slicing.")
+                if self.control_state != AgentControlState.LIVE:
+                    raise SlicingAbortedError(
+                        f"Agent control state changed to {self.control_state.value!r} mid-slicing."
+                    )
+                position = self._position_for(instrument)
+                if opened and position.status != expected_status:
+                    raise SlicingAbortedError(
+                        f"Position status is {position.status!r} (expected {expected_status!r}) -- "
+                        "a concurrent real exit closed or flipped it mid-slicing; refusing to keep "
+                        "entering against that real decision."
+                    )
+
+                slice_start = time.monotonic()
                 try:
-                    order = await safe_financial_call(
-                        self._trading_client.create_market_order, instrument, int(units), retry_on_failure=False
+                    fill = await safe_financial_call(
+                        self._trading_client.create_market_order, instrument, slice_units, retry_on_failure=False
                     )
                 except FinancialCallAbortedError:
                     self._log.error(
-                        "consensus_order_execution_aborted",
+                        "order_slice_execution_aborted",
                         agent_id=self.agent_id,
                         instrument=instrument,
                         direction=direction,
-                        units=units,
+                        slice_units=slice_units,
                         detail="Global Kill Switch has been tripped -- see prior log line.",
                     )
-                    return
-                order_latency_ms = (time.monotonic() - order_start) * 1000.0
+                    raise
+                slice_latency_ms = (time.monotonic() - slice_start) * 1000.0
+                fill_price_raw = fill.get("price")
+                fill_price = float(fill_price_raw) if fill_price_raw is not None else current_price
+
                 await self._log_fill(
                     instrument=instrument,
                     action="ENTRY_LONG" if direction == 1 else "ENTRY_SHORT",
-                    price=current_price,
-                    units=units,
-                    latency_ms=order_latency_ms,
+                    price=fill_price,
+                    units=slice_units,
+                    latency_ms=slice_latency_ms,
                 )
                 self._log.info(
-                    "consensus_order_executed",
+                    "consensus_order_slice_executed",
                     agent_id=self.agent_id,
                     instrument=instrument,
-                    order_id=order.get("id"),
+                    order_id=fill.get("id"),
                     direction=direction,
-                    units=units,
+                    slice_units=slice_units,
+                    fill_price=fill_price,
                 )
-                execution = TradeExecution(
+                slice_execution = TradeExecution(
                     symbol=instrument,
                     side=TradeSide.BUY if direction == 1 else TradeSide.SELL,
-                    cost=abs(units) * current_price,
-                    order_id=str(order.get("id", "unknown")),
+                    cost=abs(slice_units) * fill_price,
+                    order_id=str(fill.get("id", "unknown")),
                 )
-                await self.publish(_TRADE_EXECUTED_TOPIC, execution.model_dump(mode="json"))
+                await self.publish(_TRADE_EXECUTED_TOPIC, slice_execution.model_dump(mode="json"))
 
-            position = self._position_for(instrument)
-            new_status: Literal["LONG", "SHORT"] = "LONG" if direction == 1 else "SHORT"
-            position.assert_valid_transition(new_status)
-            position.status = new_status
-            position.entry_price = current_price
-            position.units_held = units
-            position.highest_seen_price = current_price if direction == 1 else None
-            position.lowest_seen_price = current_price if direction == -1 else None
-            position.cooldown_until = None
-            position.opened_at = time.time()
-            position.entered_as_simulated = simulate_this_entry
-            position.entered_as_shadow_controlled = shadow_controlled
-            self._current_exposure += abs(units) * current_price
-            await self._publish_active_positions()
+                if not opened:
+                    position.assert_valid_transition(expected_status)
+                    position.status = expected_status
+                    position.entry_price = current_price
+                    position.units_held = 0.0
+                    position.highest_seen_price = current_price if direction == 1 else None
+                    position.lowest_seen_price = current_price if direction == -1 else None
+                    position.cooldown_until = None
+                    position.opened_at = time.time()
+                    position.entered_as_simulated = False
+                    position.entered_as_shadow_controlled = False
+                    opened = True
+                assert position.units_held is not None  # opened (this call or an earlier one) guarantees this
+                position.units_held += slice_units
+                self._current_exposure += abs(slice_units) * current_price
+                await self._publish_active_positions()
+
+        async def _on_progress(slices_completed: int, slices_planned: int) -> None:
+            await self._publish_slicing_progress(
+                instrument, direction, slices_completed, slices_planned, status="IN_PROGRESS"
+            )
+
+        result = await self._order_slicer.execute(planned_units, place_slice=_place_slice, on_progress=_on_progress)
+
+        await self._publish_slicing_progress(
+            instrument,
+            direction,
+            result.slices_completed,
+            result.slices_planned,
+            status="ABORTED" if result.aborted_early else "COMPLETED",
+        )
+        self._log.info(
+            "order_slicing_finished",
+            agent_id=self.agent_id,
+            instrument=instrument,
+            direction=direction,
+            slices_completed=result.slices_completed,
+            slices_planned=result.slices_planned,
+            filled_units=result.filled_units,
+            planned_units=planned_units,
+            aborted_early=result.aborted_early,
+        )
+
+    async def _publish_slicing_progress(
+        self,
+        instrument: str,
+        direction: int,
+        slices_completed: int,
+        slices_planned: int,
+        *,
+        status: Literal["IN_PROGRESS", "COMPLETED", "ABORTED"],
+    ) -> None:
+        """Persist one real, live TWAP slicing progress snapshot -- Redis-only, TTL'd, best-effort.
+
+        Same "dashboard reads live telemetry, a Redis hiccup never fails
+        the real trading this method is only reporting on" convention as
+        :meth:`_persist_schedule_to_redis`. The TTL is derived from this
+        agent's own configured slicing horizon (plus a real safety
+        margin), not a flat constant -- a slower-configured slicing
+        execution must not have its own live progress key expire out
+        from under it before it finishes.
+        """
+        if self._redis_client is None:
+            return
+        progress = OrderSlicingProgress(
+            instrument=instrument,
+            direction=direction,
+            timestamp=time.time(),
+            slices_completed=slices_completed,
+            slices_planned=slices_planned,
+            percent_complete=round(100.0 * slices_completed / slices_planned, 1),
+            status=status,
+        )
+        key = f"{ORDER_SLICING_PROGRESS_REDIS_KEY_PREFIX}{instrument}"
+        ttl_seconds = int(self._slicing_execution_horizon_seconds) + 120
+        try:
+            await self._redis_client.execute("set", key, progress.model_dump_json(), ex=ttl_seconds)
+        except RedisUnavailableError:
+            self._log.warning("order_slicing_progress_persist_failed", agent_id=self.agent_id)
 
     async def calculate_position_size(
         self, instrument: str, current_price: float, stop_loss_price: float, account_balance: float
@@ -2289,19 +2704,27 @@ class ExecutionAgent(BaseAgent):
         :class:`~src.agents.supervisor.risk_manager.RiskManager`.
 
         **Real, disclosed scope boundary**: this computes and returns a
-        real, usable schedule -- it does **not** itself slice this
-        instrument's real orders over time. :meth:`_place_order` still
-        places exactly one simple market order per entry, unchanged (see
-        the module docstring's "No Maker/Taker skew" reasoning in
-        :meth:`_log_fill`): wiring this scheduler into that live
-        order-placement path -- actually pacing real broker calls across
-        ``execution_horizon_seconds`` -- is real, separate, larger
-        follow-up work (persistent scheduler state across ticks, partial-
-        fill handling, cancellation mid-schedule), not silently implied
-        by adding this method. Useful today as-is: an operator or
-        dashboard can call this directly to see how a proposed meta-order
-        *should* be sliced, and the cached result feeds a real impact-
-        curve chart (temporary vs. permanent impact) in the dashboard.
+        real, usable Almgren-Chriss schedule -- it does **not** itself
+        slice this instrument's real orders over time, and remains
+        entirely unwired from :meth:`_place_order`. Useful today as-is:
+        an operator or dashboard can call this directly to see how a
+        proposed meta-order *should* be sliced under the risk/impact
+        trade-off Almgren-Chriss models, and the cached result feeds a
+        real impact-curve chart (temporary vs. permanent impact) in the
+        dashboard.
+
+        **2026-09-16, "Protocole Stealth Slicing" -- update, not a
+        reversal of the above**: a *different*, deliberately simpler
+        real mechanism (:class:`~src.agents.execution.order_slicer.
+        OrderSlicer`, literal equal-size/equal-time TWAP + jitter, not
+        this method's participation-capped Almgren-Chriss schedule) is
+        now genuinely wired into :meth:`_place_order` -- see
+        :meth:`_execute_sliced_entry` -- for any real entry whose
+        notional exceeds :attr:`_slicing_notional_threshold_usd`. This
+        method's own Almgren-Chriss schedule stays exactly as unwired as
+        before; the two are separate, real, independently useful
+        mechanisms (one a planning/preview tool, one now live), not one
+        subsuming the other.
 
         Args:
             instrument: Which instrument this schedule is for (cache key

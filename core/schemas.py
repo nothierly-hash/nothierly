@@ -680,6 +680,13 @@ OPTIMAL_EXECUTION_SCHEDULE_REDIS_KEY_PREFIX: Final[str] = "optimal_execution_sch
 # Redis-only, same reasoning as OPTIMAL_EXECUTION_SCHEDULE_REDIS_KEY_PREFIX above.
 PORTFOLIO_GREEKS_REDIS_KEY: Final[str] = "nothierly_portfolio_greeks"
 
+# Redis STRING key prefix (+ instrument), TTL'd, ExecutionAgent._execute_sliced_entry persists its
+# latest real OrderSlicingProgress under -- "Protocole Stealth Slicing" (2026-09-16): unlike
+# OPTIMAL_EXECUTION_SCHEDULE_REDIS_KEY_PREFIX above (a computed plan, never actually executed over
+# time), this key tracks a real, in-flight or completed TWAP slicing execution -- real broker calls
+# already placed, not a preview. Read by src/dashboard/ems_pages/fleet_command_nexus.py's Module 10.
+ORDER_SLICING_PROGRESS_REDIS_KEY_PREFIX: Final[str] = "order_slicing_progress:"
+
 # Redis key prefix (+ agent_id) core.base_agent.BaseAgent.run's tick loop
 # writes a fresh timestamp under, with a short TTL, every tick -- a
 # missing/expired key means that agent process is down or stalled, not
@@ -1119,6 +1126,60 @@ class OptimalExecutionSchedule(BaseModel):
     permanent_impact: list[float] = Field(min_length=1)
     was_participation_capped: bool
     total_estimated_temporary_cost: float = Field(ge=0)
+
+
+class OrderSlicingProgress(BaseModel):
+    """Real, live (or final) progress of one in-flight TWAP slicing execution -- an actual execution, not a plan.
+
+    Cached under :data:`ORDER_SLICING_PROGRESS_REDIS_KEY_PREFIX` by
+    :meth:`~src.agents.execution.agent.ExecutionAgent._execute_sliced_entry`
+    -- see that method's own docstring for the real "Protocole Stealth
+    Slicing" mechanism this reports on (real TWAP + jitter, wired into
+    the live order-placement path for any entry whose notional exceeds
+    the configured discretion threshold). Distinct from
+    :class:`OptimalExecutionSchedule`: that one is a computed
+    recommendation nothing has actually executed; every slice this
+    model counts already placed a real (or, before Gate 8 resolved to a
+    live order, this path is never reached at all) broker order.
+
+    Attributes:
+        instrument: Which instrument this slicing execution is for.
+        direction: ``1`` (BUY/long) or ``-1`` (SELL/short) -- matches
+            :meth:`~src.agents.execution.agent.ExecutionAgent.
+            _place_order`'s own ``direction`` convention.
+        timestamp: Unix epoch seconds this progress snapshot was
+            written at.
+        slices_completed: How many real slices have placed a real
+            order so far.
+        slices_planned: Total real slices this execution was planned
+            for.
+        percent_complete: ``100 * slices_completed / slices_planned``,
+            precomputed for direct display (e.g. "34% (17/50 tranches
+            tirées)").
+        status: ``"IN_PROGRESS"`` while slices are still being placed;
+            ``"COMPLETED"`` once every planned slice filled;
+            ``"ABORTED"`` if it stopped early (Kill Switch, operator
+            control-state change, or a concurrent real exit -- see
+            :class:`~src.agents.execution.order_slicer.
+            SlicingAbortedError`) before every planned slice filled.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    instrument: str = Field(min_length=1)
+    direction: int = Field(ge=-1, le=1)
+    timestamp: float = Field(gt=0)
+    slices_completed: int = Field(ge=0)
+    slices_planned: int = Field(gt=0)
+    percent_complete: float = Field(ge=0, le=100)
+    status: Literal["IN_PROGRESS", "COMPLETED", "ABORTED"]
+
+    @field_validator("direction")
+    @classmethod
+    def _validate_direction_nonzero(cls, value: int) -> int:
+        if value == 0:
+            raise ValueError("direction must be -1 or 1, never 0 (neutral has no real order to slice).")
+        return value
 
 
 class OptionContract(BaseModel):

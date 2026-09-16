@@ -6,7 +6,7 @@ discipline as ``tests/test_execution_agent_drawdown.py``.
 
 from __future__ import annotations
 
-from typing import Generator
+from typing import Generator, Iterator
 
 import fakeredis.aioredis
 import pytest
@@ -26,14 +26,20 @@ def redis_client() -> Generator[RedisClient, None, None]:
 
 
 @pytest.fixture
-def agent(redis_client: RedisClient) -> ExecutionAgent:
+def agent(redis_client: RedisClient) -> Iterator[ExecutionAgent]:
+    """Real cleanup, not optional -- see tests/test_execution_agent_instrument_lock.py's identical
+    fixture docstring: BaseAgent.__init__ opens real ZMQ PUB/SUB sockets synchronously, and leaving
+    them open risks hanging the pytest process at teardown."""
     instance = ExecutionAgent(
         {_INSTRUMENT}, capital=10_000.0,
         settings=AppSettings(mock_mode=True, guardian=GuardianSettings(llm_provider="none")),
         manage_own_signals=False, manage_own_redis=False,
     )
     instance._redis_client = redis_client
-    return instance
+    yield instance
+    instance._publisher.close()
+    instance._subscriber.close()
+    instance._zmq_context.term()
 
 
 # -- _get_dynamic_max_position_units --------------------------------
