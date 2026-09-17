@@ -1,0 +1,34 @@
+# Retail Gateway -- its OWN dependency set, deliberately not merged into the repo root's
+# requirements.txt. That file installs into the shared image every trading-core service uses
+# (torch, ccxt, ib_async, xgboost, ...); this service has no trading logic and should never pull
+# any of that in, or grow the trading core's image for a dependency only this microservice needs.
+# See retail_gateway/Dockerfile for the separate image this builds.
+
+fastapi>=0.115.0,<0.116.0
+uvicorn[standard]>=0.30.0,<1.0.0
+pydantic>=2.7.0,<3.0.0
+pydantic-settings>=2.3.0,<3.0.0
+# EmailStr validation on SignupRequest/LoginRequest (pydantic's own optional extra).
+email-validator>=2.0.0,<3.0.0
+python-dotenv>=1.0.0,<2.0.0
+
+# Postgres, no ORM -- same real reasoning as core/timescale_client.py's own docstring: every
+# query here is a straightforward single-row lookup/insert, not a fit for an ORM's translation
+# layer.
+asyncpg>=0.29.0,<1.0.0
+
+# Argon2id password hashing -- same verified choice as core/iam.py (see security.py's own
+# docstring for why this isn't re-litigated to bcrypt).
+argon2-cffi>=23.1.0,<24.0.0
+
+# JWT access tokens.
+pyjwt>=2.8.0,<3.0.0
+
+# Rate-limiter state + the Celery broker/result backend (own, air-gapped Redis instance).
+redis>=5.0.0,<6.0.0
+celery>=5.4.0,<6.0.0
+
+structlog>=24.1.0,<25.0.0
+
+# --- Type stubs (for strict MyPy, matching this project's root pyproject.toml convention) ------
+types-redis>=4.6.0

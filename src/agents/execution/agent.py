@@ -209,6 +209,7 @@ from core.base_agent import AgentControlState, BaseAgent
 from core.config import AppSettings
 from core.logger import get_logger
 from core.quant_math import (
+    denoise_correlation_matrix_mp,
     estimate_lyapunov_exponent,
     giant_cluster_fraction,
     hawkes_intensity,
@@ -1668,14 +1669,30 @@ class ExecutionAgent(BaseAgent):
     def _describe_giant_cluster_fraction(self) -> str | None:
         """Real percolation-style systemic concentration across every sufficiently-tracked instrument.
 
+        **"Protocole Marchenko-Pastur" addition (2026-09-17), informational
+        only**: alongside the raw giant-cluster reading, also reports how
+        much of this exact same correlation matrix survives real
+        Marchenko-Pastur spectral cleaning (:func:`core.quant_math.
+        denoise_correlation_matrix_mp` -- the same, already-tested function
+        :meth:`~src.agents.supervisor.portfolio_risk_manager.
+        PortfolioRiskParityManager.compute_risk_parity_weights` already
+        applies by default, reused here rather than reimplemented) --
+        a real, honest "how much of what this correlation matrix says is
+        statistically indistinguishable from pure sampling noise" reading,
+        never a fabricated number. Gracefully omitted (not an error) under
+        the exact same ``n_samples >= n_assets`` condition that function's
+        own docstring already documents.
+
         Returns:
-            A real, human-readable ``"GiantCluster=X.XX (N/M instruments)"``
-            string, or ``None`` if fewer than 2 tracked instruments
-            currently have enough real price history to compute a
-            correlation matrix from (see :meth:`~src.agents.supervisor.
-            portfolio_risk_manager.PortfolioRiskParityManager.
-            has_sufficient_history`) -- an honest "not enough data yet",
-            never a fabricated number.
+            A real, human-readable ``"GiantCluster=X.XX (N/M instruments)
+            RMT: correlation moyenne brute=X.XX -> nettoyee=Y.YY
+            (n_echantillons=Z)"`` string (the RMT clause omitted when there
+            isn't enough shared history for the bound to apply), or
+            ``None`` if fewer than 2 tracked instruments currently have
+            enough real price history to compute a correlation matrix from
+            (see :meth:`~src.agents.supervisor.portfolio_risk_manager.
+            PortfolioRiskParityManager.has_sufficient_history`) -- an
+            honest "not enough data yet", never a fabricated number.
         """
         ready_instruments = [
             instr for instr in sorted(self._instruments)
@@ -1686,7 +1703,10 @@ class ExecutionAgent(BaseAgent):
 
         n = len(ready_instruments)
         correlation_matrix = np.eye(n, dtype=np.float64)
+        min_samples: int | None = None
         for i in range(n):
+            n_returns = int(self._portfolio_risk_manager.price_history(ready_instruments[i]).size) - 1
+            min_samples = n_returns if min_samples is None else min(min_samples, n_returns)
             for j in range(i + 1, n):
                 correlation = self._portfolio_risk_manager.compute_correlation(
                     ready_instruments[i], ready_instruments[j]
@@ -1695,7 +1715,22 @@ class ExecutionAgent(BaseAgent):
                 correlation_matrix[j, i] = correlation
 
         fraction = giant_cluster_fraction(correlation_matrix, self._portfolio_risk_manager.correlation_threshold)
-        return f"GiantCluster={fraction:.2f} ({n}/{len(self._instruments)} instruments)"
+        detail = f"GiantCluster={fraction:.2f} ({n}/{len(self._instruments)} instruments)"
+
+        try:
+            cleaned_matrix = denoise_correlation_matrix_mp(correlation_matrix, min_samples or 0)
+        except ValueError:
+            # Same real, honest degrade as PortfolioRiskParityManager.compute_risk_parity_weights's
+            # own default -- too few shared samples for the Marchenko-Pastur bound to apply yet.
+            return detail
+
+        off_diagonal = ~np.eye(n, dtype=bool)
+        raw_mean_abs_corr = float(np.mean(np.abs(correlation_matrix[off_diagonal])))
+        cleaned_mean_abs_corr = float(np.mean(np.abs(cleaned_matrix[off_diagonal])))
+        return (
+            f"{detail} RMT: correlation moyenne brute={raw_mean_abs_corr:.2f} "
+            f"-> nettoyee={cleaned_mean_abs_corr:.2f} (n_echantillons={min_samples})"
+        )
 
     def _gate_7_stochastic_core(self, instrument: str, sized_units: float, current_price: float) -> GateResult:
         r"""Gate 7: the real "Global Physics Vector" -- 4 stochastic-process models, 2 of them blocking.

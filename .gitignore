@@ -92,6 +92,11 @@ desktop.ini
 # --- Jupyter ---------------------------------------------------------------
 .ipynb_checkpoints/
 
+# --- Retail Frontend (retail_frontend/) -- Node/Next.js -------------------
+node_modules/
+.next/
+next-env.d.ts.bak
+
 # --- Packaging / misc ------------------------------------------------------
 *.manifest
 *.spec

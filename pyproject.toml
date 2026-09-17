@@ -193,6 +193,18 @@ disallow_untyped_decorators = false
 module = "tests.test_grpc_service"
 disallow_untyped_calls = false
 
+# Retail Gateway (retail_gateway/) -- the air-gapped B2C signup microservice's own Celery task
+# queue. celery ships no py.typed marker/stubs (same gap class as ccxt/v20/simplefix above), and
+# its own @celery_app.task decorator is consequently untyped -- same real, scoped fix as
+# src.graphql_api.schema's strawberry decorators above, not a project-wide relaxation.
+[[tool.mypy.overrides]]
+module = "celery.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "retail_gateway.tasks"
+disallow_untyped_decorators = false
+
 [tool.pydantic-mypy]
 init_forbid_extra = true
 init_typed = true
