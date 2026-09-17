@@ -936,6 +936,107 @@ class TimescaleSettings(BaseSettings):
         return f"postgresql://{self.user}{password_part}@{self.host}:{self.port}/{self.database}"
 
 
+class Web3Settings(BaseSettings):
+    """On-chain (Ethereum-compatible) configuration -- "Protocole Fort Knox" (2026-09-17).
+
+    Populated from environment variables prefixed with ``WEB3_``.
+    Optional, following the same fail-soft rationale as
+    :class:`MacroApiSettings`/:class:`NewsApiSettings`/
+    :class:`GuardianSettings`: this project has no real on-chain/DEX
+    trading path today (:class:`~src.agents.execution.agent.
+    ExecutionAgent` trades CEX/OANDA/IBKR only -- confirmed by direct
+    search, no prior ``web3``/Uniswap/Flashbots import existed anywhere
+    in this codebase before this chapter). Every real, new on-chain
+    module this settings group backs --
+    :mod:`execution.mev_shield` (private-relay transaction submission)
+    and :class:`~src.agents.whale_forensics.agent.WhaleForensicsDaemon`
+    (live Transfer-event listening) -- is real, tested code that works
+    against a real chain the moment these are configured, but neither
+    is wired into any live trading decision by default; see each
+    module's own docstring for its exact, disclosed scope.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="WEB3_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    http_provider_url: str | None = Field(
+        default=None,
+        description=(
+            "HTTPS JSON-RPC endpoint (e.g. an Alchemy/Infura URL) shared by both real, new "
+            "on-chain modules this settings group backs: execution.mev_shield's read calls "
+            "(nonce/receipt lookups) and WhaleForensicsDaemon's real eth_getLogs polling. "
+            "None (the default, and this deployment's actual state -- no real provider is "
+            "configured here) makes WhaleForensicsDaemon tick as a real, logged no-op "
+            "instead of failing to start, and makes mev_shield raise at call time, not at "
+            "settings-load time -- same 'fails at the real call site, not silently at "
+            "import' discipline as src.agents.market_data.options_chain_client."
+        ),
+    )
+    private_relay_rpc_url: str = Field(
+        default="https://rpc.flashbots.net",
+        description=(
+            "Real, public Flashbots Protect submission endpoint -- private-mempool "
+            "transaction relay, the default execution.mev_shield.submit_via_private_relay "
+            "targets instead of a public node's own eth_sendRawTransaction. Overridable "
+            "(e.g. to MEV-Blocker's own https://rpc.mevblocker.io) since both are real, "
+            "documented, interchangeable private-relay endpoints as of this writing."
+        ),
+    )
+    signer_private_key: SecretStr | None = Field(
+        default=None,
+        description=(
+            "Hex-encoded private key execution.mev_shield uses to locally sign a "
+            "transaction before relaying it -- never sent anywhere itself (only the "
+            "signed raw transaction is). None (the default) leaves signing unusable, "
+            "same fail-soft shape as every other optional credential in this file."
+        ),
+    )
+    mev_cancel_after_blocks: int = Field(
+        default=5,
+        gt=0,
+        description=(
+            "How many real blocks execution.mev_shield.submit_via_private_relay waits for "
+            "inclusion before it stops waiting and attempts the real, documented "
+            "cancellation (a same-nonce, higher-fee, zero-value self-transaction) -- see "
+            "that function's own docstring for why this can reduce, not eliminate, exposure."
+        ),
+    )
+    whale_alert_threshold_usd: float = Field(
+        default=50_000_000.0,
+        gt=0,
+        description=(
+            "Notional USD value (WhaleForensicsDaemon's own real, converted estimate -- "
+            "see that module's docstring) an ERC-20 Transfer must clear to publish a real "
+            "ONCHAIN_TSUNAMI_WARNING. The brief's own illustrative figure ($50M), kept as "
+            "the default but fully operator-tunable."
+        ),
+    )
+    watched_token_contracts: str = Field(
+        default="",
+        description=(
+            "Comma-separated 'SYMBOL:0xaddress' pairs WhaleForensicsDaemon subscribes to "
+            "Transfer events on. Empty (the default) makes the daemon a real, logged no-op "
+            "-- see WEB3_WEBSOCKET_PROVIDER_URL above for the same disclosed-empty pattern."
+        ),
+    )
+    watched_institutional_addresses: str = Field(
+        default="",
+        description=(
+            "Comma-separated 'LABEL:0xaddress' pairs of institutional wallets/bridges "
+            "WhaleForensicsDaemon flags a Transfer as newsworthy when either side matches. "
+            "Empty (the default) -- no address list ships pre-populated in this settings "
+            "class itself; see WhaleForensicsDaemon's own module docstring for the small, "
+            "explicitly-labeled, non-exhaustive illustrative default it falls back to when "
+            "this is left unset, and why that list must not be trusted as current without "
+            "independent verification before any real deployment."
+        ),
+    )
+
+
 class AppSettings(BaseSettings):
     """Top-level application settings, aggregating every settings group.
 
@@ -945,9 +1046,9 @@ class AppSettings(BaseSettings):
     :class:`VastAiSettings`, :class:`MacroApiSettings`,
     :class:`NewsApiSettings`, :class:`TimescaleSettings`,
     :class:`GuardianSettings`, :class:`DashboardSettings`,
-    :class:`R2Settings`, :class:`ApiMiddlewareSettings`, and
-    :class:`TelegramSettings` groups, each of which independently reads
-    its own prefixed environment variables.
+    :class:`R2Settings`, :class:`ApiMiddlewareSettings`,
+    :class:`TelegramSettings`, and :class:`Web3Settings` groups, each of
+    which independently reads its own prefixed environment variables.
     """
 
     model_config = SettingsConfigDict(
@@ -999,6 +1100,7 @@ class AppSettings(BaseSettings):
     vault: VaultSettings = Field(default_factory=VaultSettings)
     email: EmailSettings = Field(default_factory=EmailSettings)
     telegram: TelegramSettings = Field(default_factory=TelegramSettings)
+    web3: Web3Settings = Field(default_factory=Web3Settings)
 
     @field_validator("log_level")
     @classmethod

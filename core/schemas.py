@@ -952,6 +952,68 @@ P2P_PREMIUMS_PUBSUB_CHANNEL: Final[str] = "p2p:premiums:updates"
 # specifically needs a real O(1) read here rather than triggering (or waiting on) a fresh scan.
 P2P_LATEST_SNAPSHOT_REDIS_KEY: Final[str] = "p2p:premiums:latest_snapshot"
 
+# Published by src.agents.whale_forensics.agent.WhaleForensicsDaemon (Protocole Fort Knox, 2026-09-17)
+# the instant a real, live-observed ERC-20 Transfer event (decoded from a real Web3 event log, not
+# simulated) moves more than WHALE_ALERT_THRESHOLD_USD notional into a watched address -- see that
+# module's own docstring for the real, disclosed scope (a curated watchlist of known exchange/bridge
+# addresses, not exhaustive chain-wide coverage). Consumed by src.agents.execution.agent.ExecutionAgent's
+# Gate 8 (see ONCHAIN_TSUNAMI_LOCK_REDIS_KEY below) and rendered on fleet_command_nexus.py.
+ONCHAIN_TSUNAMI_WARNING_TOPIC: Final[str] = "ONCHAIN_TSUNAMI_WARNING"
+
+# Real Redis STRING key, short-TTL (see WhaleForensicsDaemon's own _LOCK_TTL_SECONDS), written
+# alongside every real ONCHAIN_TSUNAMI_WARNING_TOPIC publish -- a bounded "anticipation window", not
+# a second, independent kill switch (see core.security's own SYSTEM_STATUS, which this deliberately
+# does NOT touch: a single large on-chain transfer is real signal, not the same category of
+# already-confirmed danger AlertAgent's three conditions represent, and this project's own kill
+# switch is human-reset-only by design -- auto-tripping it from an unattended on-chain listener would
+# be a real, disproportionate operational risk). ExecutionAgent.Gate 8 checks this key's mere
+# presence (EXISTS, not its value) the same way it already checks AgentControlState.OFF -- see that
+# method's own docstring for the exact wiring.
+ONCHAIN_TSUNAMI_LOCK_REDIS_KEY: Final[str] = "onchain_tsunami_lock"
+ONCHAIN_TSUNAMI_LOCK_TTL_SECONDS: Final[int] = 600
+
+
+class WhaleTransferAlert(BaseModel):
+    """One real, decoded, over-threshold ERC-20 Transfer -- the payload of :data:`ONCHAIN_TSUNAMI_WARNING_TOPIC`.
+
+    Attributes:
+        timestamp: Timezone-aware UTC time this transfer was observed
+            (real wall-clock at detection, not the block's own
+            timestamp -- see WhaleForensicsDaemon's own docstring on why).
+        chain: Which real chain this was observed on (e.g. ``"ethereum"``).
+        token_symbol: The real, configured symbol for the token contract
+            this event was decoded from (e.g. ``"WETH"``, ``"USDC"``) --
+            never a token this daemon wasn't explicitly configured to
+            watch (see its own watchlist-driven design).
+        from_address: Real sender address (lowercased, EIP-55 not
+            enforced -- comparison-only, never displayed as a checksum).
+        to_address: Real recipient address.
+        amount_usd: Real notional value, converted from the event's raw
+            token amount using either a stablecoin's disclosed 1:1 USD
+            assumption or a real, live mid-price already published by
+            this project's own MarketDataAgent (see that conversion's
+            own docstring for exactly which).
+        tx_hash: Real transaction hash the event was emitted in.
+        block_number: Real block number the transaction was mined in.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    chain: str = Field(min_length=1)
+    token_symbol: str = Field(min_length=1)
+    from_address: str = Field(min_length=1)
+    to_address: str = Field(min_length=1)
+    amount_usd: float = Field(gt=0)
+    tx_hash: str = Field(min_length=1)
+    block_number: int = Field(ge=0)
+
+    @field_validator("timestamp")
+    @classmethod
+    def _validate_timestamp(cls, value: datetime) -> datetime:
+        return _require_timezone_aware(value)
+
+
 # Real port for src/grpc_service/grpc_server.py's TradeExecutor service -- the internal,
 # binary-protocol EaaS layer (see that module's own docstring for its real, disclosed scope:
 # a latency demonstration of the transport, not a second real execution engine).

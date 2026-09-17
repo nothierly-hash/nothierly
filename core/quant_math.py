@@ -413,6 +413,72 @@ def sharpe_ratio(
     return float(np.mean(excess_returns) / volatility * np.sqrt(periods_per_year))
 
 
+def sortino_ratio(
+    returns: npt.NDArray[np.float64],
+    *,
+    target_return: float = 0.0,
+    periods_per_year: int = 252,
+) -> float:
+    r"""Annualized Sortino ratio of a periodic return series.
+
+    Formula:
+        .. math:: \text{Sortino} = \frac{\bar{r} - t}{\sigma_d} \sqrt{N}
+
+    where :math:`\bar{r}` is the mean periodic return, :math:`t` is
+    ``target_return`` (the minimum acceptable return, per period), and
+    :math:`\sigma_d` is the *downside deviation* -- the root-mean-square
+    of only the shortfalls below ``t``:
+
+        .. math:: \sigma_d = \sqrt{\frac{1}{n}\sum_i \min(r_i - t, 0)^2}
+
+    **The real, load-bearing difference from** :func:`sharpe_ratio`:
+    Sharpe penalizes *any* variance, upside included, which is exactly
+    why a return series with a long, uneventful drift and a few very
+    good months (this project's own asymmetric-payoff strategies --
+    e.g. :mod:`execution.order_flow_liquidity_agent`'s directional
+    tilts) can show a mediocre Sharpe despite being a strategy investors
+    would consider genuinely low-risk. Sortino only counts variance on
+    the side an investor actually cares about (falling short of ``t``),
+    which is why it is the real, standard companion metric next to
+    Sharpe on an investor-facing risk report, not a redundant restating
+    of the same number.
+
+    Args:
+        returns: 1D array of periodic returns. Must have at least 2
+            elements.
+        target_return: The minimum acceptable per-period return (the
+            "MAR" -- minimum acceptable return -- in the standard
+            literature). Defaults to ``0.0`` (any loss counts as
+            downside), the common convention when no explicit hurdle
+            rate is specified.
+        periods_per_year: Number of return periods in one year, same
+            meaning as :func:`sharpe_ratio`'s own parameter. Must be
+            positive.
+
+    Returns:
+        The annualized Sortino ratio. ``0.0`` if no period in
+        ``returns`` falls below ``target_return`` (zero downside
+        deviation) -- same discipline as :func:`sharpe_ratio` returning
+        ``0.0`` on zero variance: a ratio with nothing real to divide by
+        is reported as "no ratio," never a fabricated ``inf``/``nan``.
+
+    Raises:
+        ValueError: If ``returns`` has fewer than 2 elements, or
+            ``periods_per_year`` is not positive.
+    """
+    if returns.size < 2:
+        raise ValueError("returns must have at least 2 elements to estimate Sortino ratio.")
+    if periods_per_year <= 0:
+        raise ValueError("periods_per_year must be positive.")
+
+    shortfalls = np.minimum(returns - target_return, 0.0)
+    downside_deviation = float(np.sqrt(np.mean(np.square(shortfalls))))
+    if downside_deviation == 0.0:
+        return 0.0
+    mean_excess_return = float(np.mean(returns) - target_return)
+    return mean_excess_return / downside_deviation * float(np.sqrt(periods_per_year))
+
+
 def max_drawdown(equity_curve: npt.NDArray[np.float64]) -> float:
     r"""Maximum peak-to-trough decline of an equity curve, as a fraction.
 

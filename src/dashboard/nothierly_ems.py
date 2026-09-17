@@ -120,6 +120,9 @@ pages = {
     "🛰️ Fleet Command Nexus": [
         st.Page(str(_PAGES_DIR / "fleet_command_nexus.py"), title="Fleet Command Nexus", icon="🛰️", default=True),
     ],
+    "🏛️ Investor Relations": [
+        st.Page(str(_PAGES_DIR / "investor_portal.py"), title="Investor Portal", icon="🏛️"),
+    ],
     "🔴 Autonomous Trading": [
         st.Page(str(_PAGES_DIR / "autonomous_command_center.py"), title="Autonomous Command Center", icon="🔴"),
         st.Page(str(_PAGES_DIR / "bilan.py"), title="Bilan", icon="💰"),

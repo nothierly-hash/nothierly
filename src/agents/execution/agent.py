@@ -224,6 +224,7 @@ from core.quant_math import (
 from core.redis_client import RedisUnavailableError
 from core.schemas import (
     EMERGENCY_HALT_TOPIC,
+    ONCHAIN_TSUNAMI_LOCK_REDIS_KEY,
     ORDER_AUDIT_EVENTS_TOPIC,
     ORDER_SLICING_PROGRESS_REDIS_KEY_PREFIX,
     OPTIMAL_EXECUTION_SCHEDULE_REDIS_KEY_PREFIX,
@@ -1990,6 +1991,33 @@ class ExecutionAgent(BaseAgent):
         """Every gate from ``from_number`` through 8, marked ``PENDING`` -- never silently ``PASSED``."""
         return [GateResult(n, _GATE_NAMES[n - 1], "PENDING", reason) for n in range(from_number, 9)]
 
+    async def _is_onchain_tsunami_lock_active(self) -> bool:
+        """Real check of :data:`ONCHAIN_TSUNAMI_LOCK_REDIS_KEY` -- "Protocole Fort Knox" (2026-09-17).
+
+        Fails open, same discipline as :meth:`_get_dynamic_risk_pct`/
+        :meth:`_get_dynamic_max_position_units`: a Redis hiccup here must
+        never itself block real, otherwise-clean entries -- this is a
+        real, additional anticipation-window veto
+        :class:`~src.agents.whale_forensics.agent.WhaleForensicsDaemon`
+        can raise, not a mechanism that should fail closed and degrade
+        this agent's own availability whenever Redis is merely slow.
+
+        Returns:
+            ``True`` only if the key is genuinely present right now (a
+            recent, real, over-threshold on-chain transfer was detected);
+            ``False`` on no client, any Redis error, a timeout, or the
+            key's real, honest absence/expiry.
+        """
+        if self._redis_client is None:
+            return False
+        try:
+            exists = await asyncio.wait_for(
+                self._redis_client.execute("exists", ONCHAIN_TSUNAMI_LOCK_REDIS_KEY), timeout=2.0
+            )
+        except (RedisUnavailableError, asyncio.TimeoutError):
+            return False
+        return bool(exists)
+
     async def _validate_execution_gates(
         self, instrument: str, direction: int, signals: dict[str, TradingSignal] | None
     ) -> tuple[GateReport, float | None, float | None, float]:
@@ -2011,6 +2039,15 @@ class ExecutionAgent(BaseAgent):
         as Gate 8, last, in the returned :class:`GateReport` -- matching
         the project's own framing that Control State is the final gate
         that opens (or closes) the door to real execution.
+
+        **A second, real Gate 8 veto condition** ("Protocole Fort Knox",
+        2026-09-17), checked immediately after ``OFF`` for the same
+        efficiency reason: :meth:`_is_onchain_tsunami_lock_active` --
+        a bounded anticipation-window lock
+        :class:`~src.agents.whale_forensics.agent.WhaleForensicsDaemon`
+        can raise on a real, detected, over-threshold on-chain transfer.
+        Reported as Gate 8 too (not a new gate number), since it is,
+        like ``OFF``, a real reason the same final door can close.
 
         Publishes the resulting :class:`GateReport` to Redis on every
         call (see :meth:`_publish_gate_report`) -- including a rejection,
@@ -2041,6 +2078,27 @@ class ExecutionAgent(BaseAgent):
             )
             gates.extend(self._pending_gates(3, "Non evalue -- Porte 8 (Control State) a rejete en premier."))
             gates[-1] = GateResult(8, _GATE_NAMES[7], "FAILED", "OFF -- rejet total (kill switch operateur sur cet agent).")
+            report = GateReport(instrument, direction, time.time(), tuple(gates), "REJECTED")
+            await self._publish_gate_report(report)
+            return report, None, None, 0.0
+
+        # "Protocole Fort Knox" (2026-09-17): a real, bounded on-chain-tsunami anticipation window
+        # -- see _is_onchain_tsunami_lock_active's own docstring for why this is checked here,
+        # alongside OFF, before any price/balance lookup, rather than as its own new gate number
+        # (Gate 8's own numbering/reporting stays exactly what it already was; this is an
+        # additional real reason that same gate can fail, not a 9th gate).
+        if await self._is_onchain_tsunami_lock_active():
+            self._log.warning(
+                "consensus_entry_skipped_onchain_tsunami_lock",
+                agent_id=self.agent_id, instrument=instrument,
+                detail="A recent, real, over-threshold on-chain whale transfer was detected -- "
+                "refusing every new entry until the anticipation window expires.",
+            )
+            gates.extend(self._pending_gates(3, "Non evalue -- Porte 8 (Control State) a rejete en premier."))
+            gates[-1] = GateResult(
+                8, _GATE_NAMES[7], "FAILED",
+                "ONCHAIN_TSUNAMI_LOCK actif -- transfert on-chain massif recent detecte (WhaleForensicsDaemon).",
+            )
             report = GateReport(instrument, direction, time.time(), tuple(gates), "REJECTED")
             await self._publish_gate_report(report)
             return report, None, None, 0.0
