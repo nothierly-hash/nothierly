@@ -111,5 +111,66 @@ async def enforce_rate_limit(
         )
 
 
+async def enforce_rate_limit_with_backoff(
+    redis_client: Redis[str],
+    *,
+    key_prefix: str,
+    bucket_id: str,
+    limit: int,
+    window_seconds: int,
+    backoff_base_seconds: int,
+    backoff_max_seconds: int,
+) -> None:
+    """Same fixed-window check as :func:`enforce_rate_limit`, plus an escalating lockout on repeat offenders.
+
+    The real toll-fraud/SMS-pumping shield (mission Directive 3): a plain fixed window resets
+    every ``window_seconds`` no matter how many times it was already exceeded, which lets a bot
+    just wait out one window and retry at the same rate forever. Each *violation* here instead
+    doubles a separate lockout TTL (``backoff_base_seconds * 2**violations``, capped at
+    ``backoff_max_seconds``) -- a bucket that keeps re-offending is locked out for longer and
+    longer, until a human clears it or the violation streak itself expires
+    (``backoff_max_seconds`` after the last violation, via the same key's own TTL).
+
+    Raises:
+        HTTPException: 429, with a ``Retry-After`` header, either because a lockout from a
+            previous violation is still active or because this call is the violation that just
+            triggered a new one. Fail-closed on Redis downtime, same as :func:`enforce_rate_limit`.
+    """
+    lockout_key = f"{key_prefix}lockout:{bucket_id}"
+    violations_key = f"{key_prefix}violations:{bucket_id}"
+
+    try:
+        lockout_ttl = await redis_client.ttl(lockout_key)
+    except Exception:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Rate limiter temporarily unavailable -- request rejected, not silently allowed through.")
+
+    if lockout_ttl and lockout_ttl > 0:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Locked out after repeated violations. Retry in {lockout_ttl}s.",
+            headers={"Retry-After": str(lockout_ttl)},
+        )
+
+    current_window = int(time.time()) // window_seconds
+    redis_key = f"{key_prefix}{bucket_id}:{current_window}"
+    try:
+        current_count = await redis_client.incr(redis_key)
+        if current_count == 1:
+            await redis_client.expire(redis_key, window_seconds * 2)
+    except Exception:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Rate limiter temporarily unavailable -- request rejected, not silently allowed through.")
+
+    if current_count > limit:
+        violations = await redis_client.incr(violations_key)
+        await redis_client.expire(violations_key, backoff_max_seconds)
+        lockout_seconds = min(backoff_base_seconds * (2 ** (violations - 1)), backoff_max_seconds)
+        await redis_client.set(lockout_key, "1", ex=lockout_seconds)
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Rate limit exceeded: {limit} requests per {window_seconds}s. Locked out for {lockout_seconds}s.",
+            headers={"Retry-After": str(lockout_seconds)},
+        )
+
+
 def client_ip(request: Request) -> str:
     return request.client.host if request.client is not None else "unknown"

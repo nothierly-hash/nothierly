@@ -35,13 +35,21 @@ _REQUEST_TIMEOUT_SECONDS = 10
 
 class EmailProvider(Protocol):
     def send_welcome_email(self, *, to_address: str) -> None: ...
+    def send_otp_email(self, *, to_address: str, otp_code: str) -> None: ...
 
 
 class ConsoleEmailProvider:
-    """Dev/unconfigured fallback -- logs instead of sending. Never raises."""
+    """Dev/unconfigured fallback -- logs instead of sending. Never raises. Never logs the real
+    code at a level a real deployment would ship to a shared log aggregator by accident.
+    """
 
     def send_welcome_email(self, *, to_address: str) -> None:
         _log.info("welcome_email_logged_not_sent", to=to_address, reason="RETAIL_EMAIL_PROVIDER=console")
+
+    def send_otp_email(self, *, to_address: str, otp_code: str) -> None:
+        # otp_code deliberately not logged -- logging_config.py's own module docstring states
+        # this package never logs a secret anywhere; an OTP is one, even in the console fallback.
+        _log.info("otp_email_logged_not_sent", to=to_address, reason="RETAIL_EMAIL_PROVIDER=console")
 
 
 class ResendEmailProvider:
@@ -50,25 +58,26 @@ class ResendEmailProvider:
         self._from_address = from_address
 
     def send_welcome_email(self, *, to_address: str) -> None:
-        body = json.dumps(
-            {
-                "from": self._from_address,
-                "to": [to_address],
-                "subject": "Bienvenue chez Nothierly",
-                "html": (
-                    "<p>Bienvenue -- votre compte a bien été créé.</p>"
-                    "<p>Ceci est un email transactionnel automatique.</p>"
-                ),
-            }
-        ).encode("utf-8")
+        self._post_email(
+            to_address=to_address,
+            subject="Bienvenue chez Nothierly",
+            html="<p>Bienvenue -- votre compte a bien été créé.</p><p>Ceci est un email transactionnel automatique.</p>",
+        )
+
+    def send_otp_email(self, *, to_address: str, otp_code: str) -> None:
+        self._post_email(
+            to_address=to_address,
+            subject="Votre code de vérification Nothierly",
+            html=f"<p>Votre code de vérification est : <strong>{otp_code}</strong></p><p>Il expire dans 5 minutes.</p>",
+        )
+
+    def _post_email(self, *, to_address: str, subject: str, html: str) -> None:
+        body = json.dumps({"from": self._from_address, "to": [to_address], "subject": subject, "html": html}).encode("utf-8")
         request = urllib.request.Request(
             _RESEND_API_URL,
             data=body,
             method="POST",
-            headers={
-                "Authorization": f"Bearer {self._api_key}",
-                "Content-Type": "application/json",
-            },
+            headers={"Authorization": f"Bearer {self._api_key}", "Content-Type": "application/json"},
         )
         try:
             with urllib.request.urlopen(request, timeout=_REQUEST_TIMEOUT_SECONDS) as response:

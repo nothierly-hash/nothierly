@@ -5,17 +5,34 @@
 
 CREATE TABLE IF NOT EXISTS users (
     id UUID PRIMARY KEY,
-    email TEXT NOT NULL,
+    email TEXT,
     -- Case-insensitive uniqueness: "User@x.com" and "user@x.com" are the same real account.
     -- Enforced on this normalized column, not on `email` itself, so the user's original
-    -- capitalization is still preserved for display/the welcome email.
-    email_normalized TEXT NOT NULL UNIQUE,
-    password_hash TEXT NOT NULL,
+    -- capitalization is still preserved for display/the welcome email. Nullable (a phone-only
+    -- OTP account has no email at all) -- the UNIQUE constraint on a nullable column still
+    -- correctly allows any number of NULLs while still forbidding two rows with the same
+    -- non-NULL value, exactly the semantics wanted here.
+    email_normalized TEXT UNIQUE,
+    phone_number TEXT UNIQUE,
+    -- Nullable: a passwordless account created via OTP verification (see repository.py's
+    -- get_or_create_by_identifier) genuinely has no password to hash. A row must still have at
+    -- least one of email/phone/password -- enforced by the CHECK below, not just by convention.
+    password_hash TEXT,
     is_active BOOLEAN NOT NULL DEFAULT TRUE,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT users_has_an_identity CHECK (email_normalized IS NOT NULL OR phone_number IS NOT NULL)
 );
 
+-- Real, idempotent schema evolution for a table that may already exist from before the Identity
+-- Gateway mission (email_normalized/password_hash used to be NOT NULL) -- see this file's own
+-- top comment on why ALTER here, not a migrations/ framework, at this project's current stage.
+-- Postgres accepts DROP NOT NULL / ADD COLUMN IF NOT EXISTS as safe no-ops when already applied.
+ALTER TABLE users ALTER COLUMN email DROP NOT NULL;
+ALTER TABLE users ALTER COLUMN password_hash DROP NOT NULL;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS phone_number TEXT UNIQUE;
+
 CREATE INDEX IF NOT EXISTS idx_users_email_normalized ON users (email_normalized);
+CREATE INDEX IF NOT EXISTS idx_users_phone_number ON users (phone_number);
 
 -- Read-only public performance cache -- the ONLY table the B2C dashboard's public endpoint
 -- reads from. Populated exclusively by a one-way export job that runs on the trading-core

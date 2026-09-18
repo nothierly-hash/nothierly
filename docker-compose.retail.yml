@@ -97,6 +97,11 @@ services:
     logging: *retail-logging
 
   retail-email-worker:
+    # Name unchanged (still keyed off the original welcome-email task) even though this same
+    # worker process now also consumes the Identity Gateway's send_otp_email/send_otp_sms tasks
+    # -- one Celery app (retail_gateway.tasks), one worker service; the OTP tasks need no
+    # separate queue/service of their own. Set RETAIL_SMS_* in .env.retail for real Twilio
+    # delivery -- unset, this worker logs OTP SMS instead of sending it (see sms_provider.py).
     build:
       context: .
       dockerfile: retail_gateway/Dockerfile

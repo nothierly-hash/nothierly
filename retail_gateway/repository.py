@@ -8,6 +8,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Literal
 
 import asyncpg
 
@@ -19,25 +20,28 @@ class EmailAlreadyRegisteredError(Exception):
 @dataclass
 class UserRecord:
     id: uuid.UUID
-    email: str
-    password_hash: str
+    email: str | None
+    password_hash: str | None
     is_active: bool
     created_at: datetime
+    phone_number: str | None = None
 
 
 class UserRepository:
     def __init__(self, pool: asyncpg.Pool) -> None:
         self._pool = pool
 
+    _SELECT_COLUMNS = "id, email, phone_number, password_hash, is_active, created_at"
+
     async def create_user(self, *, email: str, password_hash: str) -> UserRecord:
         user_id = uuid.uuid4()
         normalized = email.strip().lower()
         try:
             row = await self._pool.fetchrow(
-                """
+                f"""
                 INSERT INTO users (id, email, email_normalized, password_hash)
                 VALUES ($1, $2, $3, $4)
-                RETURNING id, email, password_hash, is_active, created_at
+                RETURNING {self._SELECT_COLUMNS}
                 """,
                 user_id,
                 email.strip(),
@@ -52,25 +56,61 @@ class UserRepository:
     async def get_by_email(self, email: str) -> UserRecord | None:
         normalized = email.strip().lower()
         row = await self._pool.fetchrow(
-            """
-            SELECT id, email, password_hash, is_active, created_at
-            FROM users
-            WHERE email_normalized = $1
-            """,
+            f"SELECT {self._SELECT_COLUMNS} FROM users WHERE email_normalized = $1",
             normalized,
+        )
+        return UserRecord(**dict(row)) if row is not None else None
+
+    async def get_by_phone(self, phone_number: str) -> UserRecord | None:
+        row = await self._pool.fetchrow(
+            f"SELECT {self._SELECT_COLUMNS} FROM users WHERE phone_number = $1",
+            phone_number,
         )
         return UserRecord(**dict(row)) if row is not None else None
 
     async def get_by_id(self, user_id: uuid.UUID) -> UserRecord | None:
         row = await self._pool.fetchrow(
-            """
-            SELECT id, email, password_hash, is_active, created_at
-            FROM users
-            WHERE id = $1
-            """,
+            f"SELECT {self._SELECT_COLUMNS} FROM users WHERE id = $1",
             user_id,
         )
         return UserRecord(**dict(row)) if row is not None else None
+
+    async def get_or_create_by_identifier(self, *, channel: Literal["email", "sms"], identifier: str) -> UserRecord:
+        """The real account-provisioning step behind a successful OTP verification.
+
+        A first-ever OTP verify for a given email/phone *is* signup here -- there is no separate
+        "create account" step in the passwordless flow the brief describes (unlike the existing
+        password-based ``POST /api/v1/signup``, which stays a distinct, explicit endpoint). No
+        password is set (``password_hash`` stays NULL -- see ``schema.sql``'s own
+        ``users_has_an_identity`` check for why that is safe: the row still has a real email or
+        phone identity). A race between two concurrent first-verifies for the same identifier is
+        resolved by ``ON CONFLICT DO UPDATE ... RETURNING``, a single atomic round-trip rather
+        than a real check-then-insert race.
+        """
+        user_id = uuid.uuid4()
+        if channel == "email":
+            normalized = identifier.strip().lower()
+            row = await self._pool.fetchrow(
+                f"""
+                INSERT INTO users (id, email, email_normalized)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (email_normalized) DO UPDATE SET email_normalized = EXCLUDED.email_normalized
+                RETURNING {self._SELECT_COLUMNS}
+                """,
+                user_id, identifier.strip(), normalized,
+            )
+        else:
+            row = await self._pool.fetchrow(
+                f"""
+                INSERT INTO users (id, phone_number)
+                VALUES ($1, $2)
+                ON CONFLICT (phone_number) DO UPDATE SET phone_number = EXCLUDED.phone_number
+                RETURNING {self._SELECT_COLUMNS}
+                """,
+                user_id, identifier,
+            )
+        assert row is not None
+        return UserRecord(**dict(row))
 
     async def list_recent_performance_metrics(self, *, limit: int = 50) -> list[asyncpg.Record]:
         """Read-only feed for the public dashboard -- see ``schema.sql``'s own comment on the
