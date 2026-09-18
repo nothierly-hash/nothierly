@@ -1,0 +1,26 @@
+# --- Test-only dependencies -----------------------------------------------
+# Real gap this file closes: pytest, pytest-asyncio, pytest-timeout and
+# fakeredis were installed ad hoc into the local dev .venv (verified via
+# site-packages) but never declared anywhere in the repo -- a clone that
+# only ran `pip install -r requirements.txt` had no way to run the test
+# suite at all. This is the exact "dérive d'environnement" the CI mandate
+# exists to kill. Never installed into the production image (see Dockerfile's
+# `test` stage vs its final stage).
+#
+# Versions below are exact (`==`), not ranges: pinned to what is verified
+# installed and passing locally right now, not floated like requirements.txt's
+# production ranges (those are range-pinned on purpose, for prebuilt-wheel
+# coverage across Python versions -- see requirements.txt's own comments;
+# converting them to `==` here was considered and rejected, it would silently
+# undo that documented reasoning for no real gain in a test-only file).
+pytest==9.1.1
+pytest-asyncio==1.4.0
+pytest-timeout==2.4.0
+fakeredis==2.37.1
+
+# Coverage gate (CI mandate: fail the build if coverage drops). Not installed
+# in the local dev venv today -- version pinned to the latest stable at
+# authoring time but NOT verified against this exact stack (no local Docker,
+# see Dockerfile's own disclosed constraint). First real CI run should treat
+# this as unverified until it goes green once.
+pytest-cov==5.0.0

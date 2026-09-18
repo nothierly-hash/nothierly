@@ -36,7 +36,59 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --user -r requirements.txt
 
 
-FROM python:3.12-slim
+# --- Test stage -------------------------------------------------------------
+# Built only by CI (`docker build --target test`) -- never the base of the
+# final stage below, so pytest/fakeredis/pytest-cov never ship in production.
+# Runs against the exact same base image and the exact same production
+# `pip install -r requirements.txt` layer as the real thing (via `FROM
+# builder`), not a separately-drifting GitHub Actions Python install --
+# that drift is the real failure this whole pipeline exists to close.
+FROM builder AS test
+
+COPY requirements-dev.txt .
+RUN pip install --no-cache-dir --user -r requirements-dev.txt
+
+COPY core/ ./core/
+COPY src/ ./src/
+COPY scripts/ ./scripts/
+COPY api_middleware/ ./api_middleware/
+COPY risk/ ./risk/
+COPY network/ ./network/
+COPY pricing/ ./pricing/
+COPY execution/ ./execution/
+COPY research/alpha_features.py ./research/alpha_features.py
+COPY simulation/ ./simulation/
+COPY p2p_api.py sandbox.py nemdi.py p2p_oracle.py p2p_websocket.py \
+     political_agent.py scout_agent.py analyst_agent.py risk_gate_agent.py \
+     pyproject.toml ./
+COPY tests/ ./tests/
+
+# tests/test_digital_twin.py's real historical-replay test and
+# tests/test_regime_detector.py's real load_real_bar_closes("BTCUSDT") both
+# read plain, decompressed .csv paths hardcoded in simulation/digital_twin.py
+# and risk/regime_detector.py -- neither reads .gz directly. Git tracks only
+# the .gz originals (30MB + 3MB); the 504MB/15MB decompressed .csv files this
+# needs have never been committed and were only ever present because a dev
+# machine happened to have decompressed them by hand at some point -- a real,
+# pre-existing environment-drift bug this makes reproducible instead of
+# silently depending on. ETHUSDT's pair is not decompressed: verified no test
+# reads it (grep across tests/ for "ETHUSDT" + "sample_data" together turns up
+# nothing), so paying its ~415MB decompression cost here would be pure waste.
+COPY research/sample_data/btcusdt_book_snapshot_2020-01-01.csv.gz research/sample_data/btcusdt_trades_2020-01-01.csv.gz ./research/sample_data/
+RUN python -c "import gzip, pathlib, shutil; \
+d = pathlib.Path('research/sample_data'); \
+[shutil.copyfileobj(gzip.open(f, 'rb'), open(d / f.stem, 'wb')) for f in d.glob('*.csv.gz')]"
+
+ENV PATH=/root/.local/bin:$PATH
+# --cov-fail-under is an unverified starting floor, not a measured baseline --
+# no Docker on the machine that authored this file, so the real coverage %
+# has never actually been produced. Raise it to the real number the first
+# time this goes green in CI; this only guards against coverage falling
+# through the floor, not against it already being higher than 30%.
+CMD ["pytest", "tests/", "-q", "--cov=core", "--cov=src", "--cov-report=term-missing", "--cov-fail-under=30"]
+
+
+FROM python:3.12-slim AS nothierly-runtime
 
 WORKDIR /app
 
@@ -125,6 +177,23 @@ COPY scout_agent.py .
 COPY analyst_agent.py .
 COPY risk_gate_agent.py .
 COPY pyproject.toml .
+
+# Non-root runtime user. Verified safe against this repo's own
+# docker-compose.yml/docker-compose.prod.yml: neither bind-mounts a host path
+# under /app for any of these services (only named volumes, for
+# timescaledb/redis-broker's own data dirs, unrelated to this image) and
+# every agent logs to stdout via structlog, not to a file under /app -- so
+# there is no writable-path assumption this chown breaks. Real bug caught
+# writing this: chowning /root/.local alone is not enough -- /root itself is
+# mode 700 owned by root, so a non-root user gets EACCES just walking the
+# path to .local regardless of that directory's own ownership. `chmod o+x
+# /root` grants only traversal (no read/write) into a path the non-root user
+# already needs by name, not a real widening of what root's home exposes.
+RUN groupadd --system nothierly \
+    && useradd --system --gid nothierly --home-dir /app --no-create-home --shell /usr/sbin/nologin nothierly \
+    && chown -R nothierly:nothierly /app /root/.local \
+    && chmod o+x /root
+USER nothierly
 
 # Overridden per service in docker-compose.yml/docker-compose.prod.yml -- this is just a sane
 # default for `docker run` without an explicit command.
