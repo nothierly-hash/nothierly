@@ -101,7 +101,18 @@ def main() -> int:
                 if proc.baseline_rss_bytes is None:
                     proc.baseline_rss_bytes = rss
                 proc.samples.append((now, rss))
-            time.sleep(args.sample_interval_seconds)
+            # min(..., remaining-until-deadline), not a flat sleep: sleeping the full
+            # interval regardless of the deadline means a short validation run (e.g. 90s
+            # duration, the default 300s interval) oversleeps its own watch window --
+            # found via a real Chaos Shadow Run (2026-09-18), where the orchestrator's
+            # own SIGTERM (a hard, non-graceful `TerminateProcess` on Windows, which never
+            # runs this function's own post-loop report-writing code) killed this process
+            # while still asleep, silently losing Directive 4 (memory drift) entirely
+            # instead of reporting on the one baseline sample actually collected.
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(args.sample_interval_seconds, remaining))
     except KeyboardInterrupt:
         print("\n[chaos_memory_watch] Stopped early by user -- reporting on samples collected so far.")
 

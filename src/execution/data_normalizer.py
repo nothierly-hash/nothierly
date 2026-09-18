@@ -78,8 +78,16 @@ def normalize_l2_update(raw_order_book: dict[str, Any], *, symbol: str) -> Norma
             valid snapshot (e.g. an empty side, or a crossed book).
     """
     top_n = ORDER_BOOK_TOP_N
-    bids = [OrderBookLevel(price=price, volume=volume) for price, volume, *_ in raw_order_book["bids"][:top_n]]
-    asks = [OrderBookLevel(price=price, volume=volume) for price, volume, *_ in raw_order_book["asks"][:top_n]]
+    # ``.get(..., [])``, not ``[...]``: a structurally-broken payload missing "bids"/"asks"
+    # entirely (real chaos-injected corruption downstream of ccxt's own parser -- see
+    # core/chaos/binance_fault_injector.py's own docstring) must surface as the documented
+    # ``pydantic.ValidationError`` below (empty list fails OrderBookSnapshot's own
+    # ``min_length=1``), not a raw ``KeyError`` -- found via a real Chaos Shadow Run
+    # (2026-09-18): the KeyError escaped MarketDataAgent._handle_order_book_update's
+    # ``except ValidationError`` and surfaced as an "unexpected failure" instead of being
+    # absorbed by the circuit breaker like every other corrupted-payload case.
+    bids = [OrderBookLevel(price=price, volume=volume) for price, volume, *_ in raw_order_book.get("bids", [])[:top_n]]
+    asks = [OrderBookLevel(price=price, volume=volume) for price, volume, *_ in raw_order_book.get("asks", [])[:top_n]]
 
     raw_timestamp_ms = raw_order_book.get("timestamp")
     timestamp = (

@@ -48,11 +48,22 @@ from core.security import requires_system_active
 # error like TypeError/AttributeError/KeyError) is the correct, library-agnostic net to catch this
 # under, without importing aiohttp's own exception types into a module that otherwise only speaks
 # ccxt's vocabulary.
+#
+# **Second real bug found live, via a Chaos Shadow Run (2026-09-18)**: `connect()`'s
+# `load_markets()` call -- made from a *fresh* client during
+# `MarketDataAgent._reconnect_after_circuit_breaker_trip`'s AEGIS reconnect -- hit a corrupted/
+# oversized HTTP response from the exchange; `aiohttp.ClientResponse.text()`'s own body-decode
+# raised a raw `MemoryError`, uncaught here, which propagated all the way out of `agent.run()` and
+# killed the whole process (see `logs/chaos_shadow_run_20260918_000250/market_data_chaos.log`'s own
+# traceback). Same shape as the `OSError` case above: a transport-level failure decoding one bad
+# response, not a genuine sustained OOM from this process's own state -- retrying with backoff
+# (which discards the failed buffer first) is the correct response, not a process crash.
 _RECOVERABLE_CCXT_ERRORS: Final[tuple[type[Exception], ...]] = (
     NetworkError,
     ExchangeError,
     RequestTimeout,
     OSError,
+    MemoryError,
 )
 # AuthenticationError is a subclass of ExchangeError above, but a real bug
 # found via live testing (Chapter 13, Étape 5.6): retrying it "forever with
@@ -73,7 +84,9 @@ class AsyncExchangeClient:
     ccxt.pro's own internal websocket keepalive task without being
     translated into ``ccxt.NetworkError`` first, found via a real
     multi-hour shadow run -- see :data:`_RECOVERABLE_CCXT_ERRORS`'s own
-    comment) -- the failure is logged via structlog and retried after a
+    comment) -- or a transport-level ``MemoryError`` decoding one bad
+    HTTP response body (found via a real Chaos Shadow Run, same comment)
+    -- the failure is logged via structlog and retried after a
     capped exponential backoff (with jitter), forever, rather than
     propagating the error to the caller. Genuine programming errors
     (``TypeError``, ``AttributeError``, ``KeyError``, ...) and
