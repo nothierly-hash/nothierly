@@ -55,7 +55,10 @@ Safety layers, in the order a would-be *entry* actually passes through
 3. **Risk-based position sizing** (:meth:`calculate_position_size`):
    fixed-fractional risk (``account_balance * dynamic risk %``, read
    live from Redis, hard-capped) divided by the stop-loss distance --
-   never a blind fraction-of-capital notional.
+   never a blind fraction-of-capital notional. Scaled by a real
+   meta-label confidence multiplier (:func:`~risk.meta_labeling.
+   size_multiplier_from_confidence`, see the "Meta-Labeling" addendum
+   below) -- including a real veto at the low end.
 4. **Margin/leverage cap** (this module): the sized order is never
    allowed to exceed available margin.
 5. **Flat portfolio exposure ceiling** (:class:`~src.agents.supervisor.
@@ -189,6 +192,30 @@ one ``GATE8_SEALED`` event forward through every real fill it authorized, on the
 that shared id alone. What remains genuinely out of scope: a later position *exit* is a separate,
 unilateral, ungated real decision (see this module's own opening invariant) with no Gate-8 seal to
 chain a fill onto -- chaining exits too would need its own real event type, not this one's follow-up.
+
+**"Meta-Labeling" (2026-09-19)**: a real due-diligence audit's finding #3, verified directly in this
+module before writing anything, and more precise than first stated -- this agent's consensus
+mechanism (both required agents agreeing) is real, live ensemble logic, not absent. What actually
+was missing: :meth:`_act_on_consensus` already computed ``confidence = min(signal.confidence for
+signal in signals.values())`` and threaded it all the way into :meth:`_place_order` -- where it was
+used for exactly one thing, a log line, and nowhere near Gate 3's real sizing math. Two consensus
+events at confidence 0.99 and 0.51 were sized identically. :mod:`risk.meta_labeling` (see that
+module's own docstring for the real López de Prado grounding and the real, load-bearing "untrained
+skeleton must not change today's sizing" correctness property) is now consulted inside
+:meth:`_gate_3_sizing` -- **not a new, 9th gate number**, the same "an additional real reason the
+same gate's job can turn out differently" precedent Gate 8 (Control State) already set for
+``OFF``/``ONCHAIN_TSUNAMI_LOCK`` above: Gate 3's real job has always been "decide the real size," and
+a real secondary confidence check is part of that job, not a separate one. A manual
+operator override (``signals=None``, see Gate 1) has no real per-agent confidence to build a
+meta-label from -- gets a neutral ``1.0`` multiplier, never a fabricated one. Real, disclosed feature
+scope: only what Gate 3 already has for free (the two agents' own confidences, this instrument's
+latest tracked spread, and :attr:`_conflict_history`'s own existing count) -- VPIN and Gate 7's
+Hawkes intensity are computed *later* in this same pipeline than Gate 3 runs, so pulling them forward
+would either duplicate that computation or reorder the gate pipeline; not done here unasked. No real
+trained model exists yet (this project has no live trade-outcome history long enough to fit one) --
+:attr:`_meta_label_model` defaults to :mod:`risk.meta_labeling`'s own untrained skeleton, which this
+module's own tests confirm round-trips to an exact ``1.0`` multiplier: wiring this in changes nothing
+about today's real sizing until a real model is trained and loaded via ``--meta-label-model-path``.
 """
 
 from __future__ import annotations
@@ -199,6 +226,7 @@ import math
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Final, Iterable, Literal
 
 import numpy as np
@@ -250,6 +278,7 @@ from core.security import (
     safe_financial_call,
 )
 from execution.order_flow_liquidity_agent import OrderFlowLiquidityAgent
+from risk.meta_labeling import MetaLabelModel, size_multiplier_from_confidence
 from src.agents.execution.order_slicer import (
     DEFAULT_EXECUTION_HORIZON_SECONDS,
     DEFAULT_JITTER_SECONDS,
@@ -738,6 +767,8 @@ class ExecutionAgent(BaseAgent):
         slicing_num_slices: int = DEFAULT_NUM_SLICES,
         slicing_execution_horizon_seconds: float = DEFAULT_EXECUTION_HORIZON_SECONDS,
         slicing_jitter_seconds: float = DEFAULT_JITTER_SECONDS,
+        meta_label_model_path: str | Path | None = None,
+        meta_label_scaler_path: str | Path | None = None,
     ) -> None:
         """Wire up the OANDA trading client and risk manager; subscribe to signals + prices.
 
@@ -824,6 +855,14 @@ class ExecutionAgent(BaseAgent):
                 OrderSlicer`.
             slicing_jitter_seconds: Passed straight through to
                 :class:`~src.agents.execution.order_slicer.OrderSlicer`.
+            meta_label_model_path: Passed straight through to
+                :class:`~risk.meta_labeling.MetaLabelModel`. ``None``
+                (the default) uses that class's own untrained skeleton
+                -- see the module docstring's "Meta-Labeling" addendum
+                for why that is a real, deliberate, behavior-preserving
+                default, not a placeholder to fix later.
+            meta_label_scaler_path: Passed straight through to
+                :class:`~risk.meta_labeling.MetaLabelModel`.
         """
         super().__init__(
             _AGENT_ID,
@@ -877,6 +916,12 @@ class ExecutionAgent(BaseAgent):
         # informational telemetry only -- it does not itself resize or
         # place any real order.
         self._order_flow_agent = OrderFlowLiquidityAgent()
+        # "Meta-Labeling" (2026-09-19): a real secondary confidence model over an already-reached
+        # consensus -- see module docstring's own addendum and risk/meta_labeling.py's docstring for
+        # the real gap this closes (confidence was computed, threaded through, and only ever logged).
+        # Defaults to that module's own untrained skeleton, which always multiplies sizing by exactly
+        # 1.0 -- no behavior change until a real model is trained and loaded here.
+        self._meta_label_model = MetaLabelModel(meta_label_model_path, meta_label_scaler_path)
         # "Protocole Stealth Slicing" (2026-09-16): real TWAP + jitter slicing for any entry whose
         # real notional exceeds slicing_notional_threshold_usd -- see _execute_sliced_entry's own
         # docstring for the real wiring (this is *not* the Almgren-Chriss scheduler above, which
@@ -1578,16 +1623,65 @@ class ExecutionAgent(BaseAgent):
         return GateResult(2, _GATE_NAMES[1], "PASSED", "Aucun doublon, delai de re-entree respecte.")
 
     async def _gate_3_sizing(
-        self, instrument: str, current_price: float, stop_loss_price: float, account_balance: float
+        self,
+        instrument: str,
+        current_price: float,
+        stop_loss_price: float,
+        account_balance: float,
+        signals: dict[str, TradingSignal] | None,
     ) -> tuple[GateResult, float]:
-        """Gate 3: fixed-fractional risk sizing -- see :meth:`calculate_position_size`."""
+        """Gate 3: fixed-fractional risk sizing, scaled by a real meta-label confidence multiplier.
+
+        See :meth:`calculate_position_size` for the base fixed-
+        fractional sizing, and the module docstring's "Meta-Labeling"
+        addendum for why the confidence scaling below lives inside this
+        gate rather than as a separate, new gate number.
+        """
         raw_units = await self.calculate_position_size(instrument, current_price, stop_loss_price, account_balance)
         if raw_units <= 0:
             return (
                 GateResult(3, _GATE_NAMES[2], "FAILED", "Taille calculee nulle (distance Stop-Loss nulle ou plafond configure a 0)."),
                 0.0,
             )
-        return GateResult(3, _GATE_NAMES[2], "PASSED", f"{raw_units:.4f} unites (risque / distance SL)."), raw_units
+
+        multiplier, meta_confidence = self._meta_label_size_multiplier(instrument, signals)
+        if multiplier <= 0.0:
+            return (
+                GateResult(
+                    3, _GATE_NAMES[2], "FAILED",
+                    f"Veto meta-label : confiance {meta_confidence:.3f} sous le seuil de rejet -- ordre non dimensionne.",
+                ),
+                0.0,
+            )
+        sized_units = raw_units * multiplier
+        detail = (
+            f"{sized_units:.4f} unites (risque / distance SL = {raw_units:.4f}, "
+            f"x confiance meta-label {meta_confidence:.3f} = x{multiplier:.2f})."
+        )
+        return GateResult(3, _GATE_NAMES[2], "PASSED", detail), sized_units
+
+    def _meta_label_size_multiplier(
+        self, instrument: str, signals: dict[str, TradingSignal] | None,
+    ) -> tuple[float, float]:
+        """Real ``(size_multiplier, meta_confidence)`` for this consensus event -- see module docstring addendum.
+
+        ``signals is None`` (a manual operator override, see Gate 1) has
+        no real per-agent confidence to build a meta-label from --
+        returns a neutral ``(1.0, 0.5)``, the skeleton model's own
+        uninformative midpoint, never a fabricated confidence for a
+        signal source that does not exist on this path.
+        """
+        if signals is None:
+            return 1.0, 0.5
+        confidences = [signal.confidence for signal in signals.values()]
+        features = MetaLabelModel.build_feature_vector(
+            min_confidence=min(confidences),
+            confidence_spread=max(confidences) - min(confidences),
+            spread=self._last_spreads.get(instrument, 0.0),
+            recent_conflict_count=len(self._conflict_history.get(instrument, [])),
+        )
+        meta_confidence = self._meta_label_model.predict_confidence(features)
+        return size_multiplier_from_confidence(meta_confidence), meta_confidence
 
     def _gate_4_margin(
         self, instrument: str, raw_units: float, current_price: float, available_margin: float
@@ -2194,7 +2288,7 @@ class ExecutionAgent(BaseAgent):
             else current_price * (1 + self._stop_loss_pct)
         )
 
-        gate3, raw_units = await self._gate_3_sizing(instrument, current_price, stop_loss_price, account_balance)
+        gate3, raw_units = await self._gate_3_sizing(instrument, current_price, stop_loss_price, account_balance, signals)
         gates.append(gate3)
         if gate3.status == "FAILED":
             gates.extend(self._pending_gates(4, "Non evalue -- Porte 3 (Sizing) a rejete en premier."))
