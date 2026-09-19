@@ -14,9 +14,13 @@ from __future__ import annotations
 
 from typing import Any
 
+import numpy as np
 import pytest
 
-from src.agents.market_data.microstructure_features import compute_live_microstructure_reading
+from src.agents.market_data.microstructure_features import (
+    compute_historical_liquidity_void_pressure,
+    compute_live_microstructure_reading,
+)
 
 _SYMBOL = "BTC/USDT"
 
@@ -81,3 +85,20 @@ def test_trades_outside_the_short_window_do_not_count_toward_it() -> None:
 
     assert reading.tfi_by_window["1s"] == pytest.approx(0.4)  # only the buy counts
     assert reading.tfi_by_window["5s"] == pytest.approx(-0.6)  # both trades count: 0.4 - 1.0
+
+
+# =============================================================================
+# compute_historical_liquidity_void_pressure (2026-09-19)
+# =============================================================================
+
+
+def test_real_historical_void_pressure_is_bounded_and_finite() -> None:
+    pressures = compute_historical_liquidity_void_pressure("BTCUSDT", limit_rows=2000)
+    assert len(pressures) > 0
+    assert np.all(np.isfinite(pressures))
+    assert np.all(np.abs(pressures) <= 1.0)
+
+
+def test_raises_on_unknown_symbol() -> None:
+    with pytest.raises(FileNotFoundError):
+        compute_historical_liquidity_void_pressure("DOGEUSDT")

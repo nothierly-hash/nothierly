@@ -26,6 +26,18 @@ optional piece of live options market data this project *can* actually
 reach (a public Deribit option chain, via ``ccxt`` -- already a project
 dependency), used for real strikes/expiries/mark prices, never for
 placing a real order.
+
+**"Discrete Hedge Replication Error" (2026-09-19)**: a real due-diligence "dead code" finding --
+:func:`core.quant_math.simulate_discrete_delta_hedge` existed with zero real callers anywhere in
+this project, despite this module's own paper-filled positions being the one place in this codebase
+that could actually use it. :meth:`OptionsHedgingManager.estimate_discrete_hedge_replication_error`
+is that real wiring: given a real historical price path for a tracked position's underlying (e.g.
+:meth:`~src.agents.supervisor.portfolio_risk_manager.PortfolioRiskParityManager.price_history`,
+already fed from every real ``MARKET_DATA_L2`` tick :class:`~src.agents.execution.agent.
+ExecutionAgent` receives), it retrospectively measures the real, nonzero replication error this
+project's own discrete rebalancing would have left -- honest, quantified evidence for this module's
+own "paper-filled, priced by real Black-Scholes math, never risk-free" framing above, not just an
+assertion of it.
 """
 
 from __future__ import annotations
@@ -46,6 +58,7 @@ from core.quant_math import (
     black_scholes_theta,
     black_scholes_vega,
     check_hedge_completeness,
+    simulate_discrete_delta_hedge,
     solve_hedge_ratios,
 )
 from core.schemas import OptionContract, OptionPosition
@@ -354,3 +367,54 @@ class OptionsHedgingManager:
             hedge_sizes=dict(zip(instrument_names, (float(x) for x in hedge_sizes))),
             residual_exposure=dict(zip(target_greeks, (float(x) for x in residual))),
         )
+
+    def estimate_discrete_hedge_replication_error(
+        self,
+        position: OptionPosition,
+        underlying_price_path: npt.NDArray[np.float64],
+        *,
+        time_step: float,
+        volatility: float,
+    ) -> float:
+        r"""Real, retrospective discrete-hedge replication error for one real (paper-filled) position. See module docstring addendum.
+
+        Args:
+            position: The real (paper-filled) position to evaluate.
+            underlying_price_path: A real, chronologically-ordered price
+                path for ``position.contract.underlying``, evenly spaced
+                ``time_step`` apart, ending at (or before) the
+                contract's real expiry -- e.g. a trailing slice of
+                :meth:`~src.agents.supervisor.portfolio_risk_manager.
+                PortfolioRiskParityManager.price_history`. See
+                :func:`~core.quant_math.simulate_discrete_delta_hedge`'s
+                own docstring for the full real precondition (at least 2
+                elements, strictly positive).
+            time_step: Real time between consecutive
+                ``underlying_price_path`` observations, in years.
+            volatility: Real annualized volatility assumed for the
+                hedge -- this simulation's own real, disclosed
+                assumption (see
+                :func:`~core.quant_math.simulate_discrete_delta_hedge`'s
+                own docstring on hedging-vs-realized-volatility error).
+
+        Returns:
+            The real, signed, size-scaled replication error in this
+            position's own quote currency -- ``position.quantity *
+            position.contract.contract_size`` times
+            :func:`~core.quant_math.simulate_discrete_delta_hedge`'s own
+            per-unit ``replication_error``, the same real scaling
+            :meth:`compute_position_greeks` already applies to its own
+            per-unit Greeks.
+
+        Raises:
+            ValueError: Propagated from
+                :func:`~core.quant_math.simulate_discrete_delta_hedge`
+                (e.g. too short or non-positive a price path).
+        """
+        contract = position.contract
+        scale = position.quantity * contract.contract_size
+        _replicating_path, per_unit_replication_error = simulate_discrete_delta_hedge(
+            underlying_price_path, time_step, contract.strike, self._risk_free_rate, volatility,
+            option_type=contract.option_type,
+        )
+        return per_unit_replication_error * scale

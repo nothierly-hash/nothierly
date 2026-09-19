@@ -28,6 +28,7 @@ from risk.regime_detector import (
     label_regimes,
     load_real_bar_closes,
     load_real_order_flow_series,
+    regime_deviation,
 )
 
 
@@ -111,6 +112,41 @@ def test_label_regimes_assigns_panic_to_the_highest_variance_state() -> None:
     labels = label_regimes(hmm)
     panic_state = next(k for k, v in labels.items() if v == MarketRegime.PANIC)
     assert panic_state == int(np.argmax(hmm.variances.sum(axis=1)))
+
+
+# =============================================================================
+# regime_deviation
+# =============================================================================
+
+
+def test_deviation_is_zero_at_the_states_own_mean() -> None:
+    hmm = GaussianHMM(num_states=2, num_features=2, seed=0)
+    hmm.means = np.array([[1.0, 2.0], [5.0, 5.0]])
+    hmm.variances = np.array([[1.0, 1.0], [2.0, 2.0]])
+    assert regime_deviation(hmm, 0, np.array([1.0, 2.0])) == pytest.approx(0.0)
+
+
+def test_deviation_matches_hand_computed_mahalanobis_distance() -> None:
+    hmm = GaussianHMM(num_states=1, num_features=1, seed=0)
+    hmm.means = np.array([[0.0]])
+    hmm.variances = np.array([[4.0]])  # std = 2
+    # 6 std away from a mean of 0 with variance 4 -> |12 - 0| / sqrt(4) = 6
+    assert regime_deviation(hmm, 0, np.array([12.0])) == pytest.approx(6.0)
+
+
+def test_deviation_grows_with_distance_from_the_states_mean() -> None:
+    hmm = GaussianHMM(num_states=1, num_features=2, seed=0)
+    hmm.means = np.array([[0.0, 0.0]])
+    hmm.variances = np.array([[1.0, 1.0]])
+    near = regime_deviation(hmm, 0, np.array([1.0, 1.0]))
+    far = regime_deviation(hmm, 0, np.array([10.0, 10.0]))
+    assert far > near
+
+
+def test_rejects_out_of_range_state() -> None:
+    hmm = GaussianHMM(num_states=2, num_features=2, seed=0)
+    with pytest.raises(ValueError, match="state must be in"):
+        regime_deviation(hmm, 5, np.array([0.0, 0.0]))
 
 
 # =============================================================================

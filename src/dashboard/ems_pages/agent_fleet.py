@@ -260,6 +260,7 @@ with col_hmm:
                 label_regimes,
                 load_real_bar_closes,
                 load_real_order_flow_series,
+                regime_deviation,
             )
 
             # "Order-Flow-Fused Regime Detection" (2026-09-19): a 3rd real feature (rolling TFI,
@@ -273,14 +274,23 @@ with col_hmm:
             hmm.fit(features, num_iterations=100)
             labels = label_regimes(hmm)
             posterior = hmm.predict_proba(features)
-            current_regime = labels[int(posterior[-1].argmax())]
+            current_state = int(posterior[-1].argmax())
+            current_regime = labels[current_state]
+            # "Regime Deviation" (2026-09-19): how many real standard deviations the live reading
+            # sits from what the winning state's own fitted mean/covariance looks like -- a real
+            # second reading alongside posterior confidence, not a replacement for it.
+            deviation = regime_deviation(hmm, current_state, features[-1])
             st.session_state["hmm_last_result"] = {
-                "regime": current_regime.value, "confidence": float(posterior[-1].max()), "n_bars": len(closes),
+                "regime": current_regime.value, "confidence": float(posterior[-1].max()),
+                "deviation": deviation, "n_bars": len(closes),
             }
     if "hmm_last_result" in st.session_state:
         result = st.session_state["hmm_last_result"]
         st.metric("Régime détecté (réel)", result["regime"])
-        st.caption(f"Confiance : {result['confidence']:.1%} -- {result['n_bars']} barres réelles BTCUSDT (research/sample_data).")
+        st.caption(
+            f"Confiance : {result['confidence']:.1%} -- écart de Mahalanobis au centre du régime : "
+            f"{result['deviation']:.2f} -- {result['n_bars']} barres réelles BTCUSDT (research/sample_data)."
+        )
 
 with col_snn:
     st.markdown("**Neuromorphic Tick Processor**")
@@ -336,4 +346,27 @@ with col_causal:
         st.caption(
             f"Sur données synthétiques à vérité terrain connue (effet réel/unité = {result['true_effect_per_unit']:.3f}) -- "
             "voir docstring du module pour la validation complète."
+        )
+
+col_void, _col_void_spacer_1, _col_void_spacer_2 = st.columns(3)
+
+with col_void:
+    st.markdown("**Liquidity Void Pressure**")
+    st.caption("Résistance asymétrique du carnet -- core/quant_math.py::liquidity_void_pressure")
+    st.markdown(status_badge("PENDING", "RECHERCHE / SUR DEMANDE"), unsafe_allow_html=True)
+    if st.button("▶️ Lancer une analyse réelle", key="run_void_pressure"):
+        with st.spinner("Calcul réel sur les snapshots L2 BTCUSDT réels..."):
+            from src.agents.market_data.microstructure_features import compute_historical_liquidity_void_pressure
+
+            pressures = compute_historical_liquidity_void_pressure("BTCUSDT")
+            st.session_state["void_pressure_last_result"] = {
+                "mean": float(pressures.mean()), "last": float(pressures[-1]), "n_snapshots": len(pressures),
+            }
+    if "void_pressure_last_result" in st.session_state:
+        result = st.session_state["void_pressure_last_result"]
+        side = "ASK (prix tiré vers le haut)" if result["last"] > 0 else "BID (prix tiré vers le bas)"
+        st.metric("Pression de vide (réelle, dernier snapshot)", f"{result['last']:+.3f}")
+        st.caption(
+            f"Côté le plus mince : {side} -- moyenne réelle sur {result['n_snapshots']} snapshots réels BTCUSDT "
+            "(research/sample_data)."
         )

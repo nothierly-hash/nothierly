@@ -81,6 +81,13 @@ agent, none exists yet -- see this module's own "on-demand dashboard detector" s
 would instead pass the real, live VPIN/TFI reading :mod:`src.agents.market_data.
 microstructure_features` already publishes; this module stays data-source-agnostic (the same
 established discipline :mod:`core.quant_math`'s own module docstring states for itself).
+
+**"Regime Deviation" (2026-09-19)**: a real due-diligence "dead code" finding --
+:func:`~core.quant_math.mahalanobis_fisher_rao_distance` existed with zero real callers anywhere in
+this project. :func:`regime_deviation` is its real, exact use here (not an approximation reaching
+for a use case): each :class:`GaussianHMM` state already fits its own diagonal covariance, so
+comparing a live observation to that same state's mean in that same state's own covariance satisfies
+the function's "one shared covariance" precondition exactly, by construction, not by assumption.
 """
 
 from __future__ import annotations
@@ -97,6 +104,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from scipy.special import logsumexp
 
 from core.logger import get_logger
+from core.quant_math import mahalanobis_fisher_rao_distance
 
 _log = get_logger(__name__)
 _SAMPLE_DATA_DIR: Final[Path] = Path(__file__).resolve().parent.parent / "research" / "sample_data"
@@ -229,6 +237,46 @@ class GaussianHMM:
         for t in range(t_steps - 2, -1, -1):
             path[t] = backpointer[t + 1, path[t + 1]]
         return path
+
+
+def regime_deviation(hmm: GaussianHMM, state: int, observation: npt.NDArray[np.float64]) -> float:
+    r"""Real Mahalanobis/Fisher-Rao distance from ``observation`` to ``state``'s own fitted mean, in that state's own metric.
+
+    Complements :meth:`GaussianHMM.predict_proba`'s posterior
+    probability with a real, interpretable second reading: "how many
+    real standard deviations away is this observation from what
+    ``state`` typically looks like" -- a state the posterior favors
+    strongly but whose own :func:`regime_deviation` is large is a real,
+    worth-investigating disagreement between the two, not something
+    posterior probability alone surfaces. A real, exact application of
+    :func:`~core.quant_math.mahalanobis_fisher_rao_distance` (not an
+    approximation): that function's own precondition -- both points
+    scored against one *shared* covariance -- is satisfied exactly by
+    construction here, since :class:`GaussianHMM` already fits a
+    diagonal covariance per state (see its own docstring) and both
+    ``observation`` and ``state``'s mean are being compared in that same
+    state's own covariance.
+
+    Args:
+        hmm: A fitted (or fitting) :class:`GaussianHMM`.
+        state: Which state's mean/covariance to measure against. Must
+            be in ``[0, hmm.num_states)``.
+        observation: One real feature vector (see
+            :func:`build_regime_features`'s own row shape), length
+            ``hmm.num_features``.
+
+    Returns:
+        The real, non-negative Mahalanobis distance.
+
+    Raises:
+        ValueError: If ``state`` is out of range, or propagated from
+            :func:`~core.quant_math.mahalanobis_fisher_rao_distance`
+            (e.g. a degenerate, exactly-zero fitted variance).
+    """
+    if not 0 <= state < hmm.num_states:
+        raise ValueError(f"state must be in [0, {hmm.num_states}), got {state}.")
+    shared_covariance = np.diag(hmm.variances[state])
+    return mahalanobis_fisher_rao_distance(observation, hmm.means[state], shared_covariance)
 
 
 def label_regimes(hmm: GaussianHMM) -> dict[int, MarketRegime]:
