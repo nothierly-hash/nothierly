@@ -83,6 +83,15 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--vpin-cautious-spread-multiplier", type=Decimal, default=Decimal("2"),
+        help=(
+            "Real half-spread widening multiplier while AdverseFlowDefenseAgent's posture reads "
+            "CAUTIOUS (elevated real VPIN on the live trade tape) -- default: 2 (double the "
+            "half-spread), a starting, disclosed default, not a backtested constant. See "
+            "AlphaMarketMakerAgent's module docstring, 2026-09-19 VPIN addendum."
+        ),
+    )
+    parser.add_argument(
         "--order-rate-limit-per-second", type=float, default=3.0,
         help=(
             "Real, proactive rate-limit-ban protection (network.resilience_mesh.RateLimitMesh) -- "
@@ -106,6 +115,7 @@ async def main() -> None:
         max_order_rate_window_seconds=args.max_order_rate_window_seconds,
         max_single_order_units=args.max_single_order_units,
         max_daily_loss_usd=args.max_daily_loss_usd,
+        vpin_cautious_spread_multiplier=args.vpin_cautious_spread_multiplier,
         order_rate_limit_per_second=args.order_rate_limit_per_second,
     )
     _log.info(

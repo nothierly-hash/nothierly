@@ -38,10 +38,12 @@ from core.schemas import (
     MARKET_METRICS_REDIS_KEY_PREFIX,
 )
 from core.security import requires_system_active, trip_kill_switch
+from execution.predator_honeypot import DefensiveExecutionMode
 from src.agents.alpha_engine.agent import (
     AlphaMarketMakerAgent,
     _apply_fill,
     _clamp_quote_sizes,
+    _defensive_half_spread_bps,
     _skewed_quote_prices,
 )
 from network.resilience_mesh import RateLimitMesh
@@ -102,6 +104,31 @@ def test_clamp_quote_sizes_sell_side_closes_at_negative_cap() -> None:
     buy, sell = _clamp_quote_sizes(base_size=Decimal("0.01"), inventory=Decimal("-0.5"), max_inventory=Decimal("0.5"))
     assert buy == Decimal("0.01")
     assert sell == Decimal(0)
+
+
+# =============================================================================
+# _defensive_half_spread_bps
+# =============================================================================
+
+
+def test_defensive_half_spread_normal_mode_unchanged() -> None:
+    assert _defensive_half_spread_bps(
+        Decimal("5"), mode=DefensiveExecutionMode.NORMAL, cautious_multiplier=Decimal("2"),
+    ) == Decimal("5")
+
+
+def test_defensive_half_spread_cautious_mode_widened_by_multiplier() -> None:
+    assert _defensive_half_spread_bps(
+        Decimal("5"), mode=DefensiveExecutionMode.CAUTIOUS, cautious_multiplier=Decimal("2"),
+    ) == Decimal("10")
+
+
+def test_defensive_half_spread_post_only_mode_also_widened() -> None:
+    """Not reachable via this engine's own wiring today (see module docstring), but the function
+    itself states one total rule rather than a NORMAL-vs-CAUTIOUS-only special case."""
+    assert _defensive_half_spread_bps(
+        Decimal("5"), mode=DefensiveExecutionMode.POST_ONLY_ONLY, cautious_multiplier=Decimal("3"),
+    ) == Decimal("15")
 
 
 # =============================================================================
@@ -418,6 +445,92 @@ async def test_live_cycle_places_two_sided_quote_when_flat(agent: AlphaMarketMak
     assert len(fake.limit_orders) == 2
     sides = {order[1] for order in fake.limit_orders}
     assert sides == {"buy", "sell"}
+
+
+# =============================================================================
+# VPIN-driven adverse-selection defense -- see module docstring's 2026-09-19 addendum
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_live_cycle_widens_spread_and_shrinks_size_under_cautious_vpin(
+    agent: AlphaMarketMakerAgent, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Real regression coverage for the fix: a toxic tape must not get the same spread/size as a calm one."""
+    await _seed_fresh_market_metrics(agent)
+
+    async def _fake_high_vpin() -> float:
+        return 0.9  # >= AdverseFlowDefenseAgent's external_toxicity_threshold (0.7) -> CAUTIOUS
+
+    monkeypatch.setattr(agent, "_fetch_current_vpin", _fake_high_vpin)
+
+    await agent._run_cycle()
+
+    fake = _broker(agent)
+    assert len(fake.limit_orders) == 2
+    for _symbol, _side, quantity, _price in fake.limit_orders:
+        assert quantity == pytest.approx(0.003)  # 0.01 base size * 0.3 CAUTIOUS multiplier
+    prices = sorted(price for *_rest, price in fake.limit_orders)
+    # Widened half-spread (10 bps = 2x the 5 bps default) around a flat 65000 mid, zero skew (flat inventory).
+    assert prices == pytest.approx([64935.0, 65065.0])
+
+
+@pytest.mark.asyncio
+async def test_live_cycle_normal_spread_when_vpin_below_threshold(
+    agent: AlphaMarketMakerAgent, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _seed_fresh_market_metrics(agent)
+
+    async def _fake_low_vpin() -> float:
+        return 0.1
+
+    monkeypatch.setattr(agent, "_fetch_current_vpin", _fake_low_vpin)
+
+    await agent._run_cycle()
+
+    fake = _broker(agent)
+    assert len(fake.limit_orders) == 2
+    for _symbol, _side, quantity, _price in fake.limit_orders:
+        assert quantity == pytest.approx(0.01)  # unchanged -- posture stayed NORMAL
+
+
+@pytest.mark.asyncio
+async def test_telemetry_publishes_current_vpin_and_defensive_mode(
+    agent: AlphaMarketMakerAgent, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _seed_fresh_market_metrics(agent)
+
+    async def _fake_high_vpin() -> float:
+        return 0.85
+
+    monkeypatch.setattr(agent, "_fetch_current_vpin", _fake_high_vpin)
+    await agent._run_cycle()
+
+    raw = await _redis(agent).execute("get", f"{ALPHA_ENGINE_TELEMETRY_REDIS_KEY_PREFIX}{agent.agent_id}")
+    payload = json.loads(raw)
+    assert payload["vpin"] == pytest.approx(0.85)
+    assert payload["defensive_mode"] == "CAUTIOUS"
+
+
+@pytest.mark.asyncio
+async def test_missing_vpin_reading_keeps_last_known_score_not_a_reset_to_normal(
+    agent: AlphaMarketMakerAgent, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same disclosed conservative-by-omission behavior as MacroOrderExecutionAgent's own
+    _fetch_current_vpin: a missing reading this cycle must not silently revert posture to NORMAL."""
+    readings = iter([0.9, None])
+
+    async def _fake_vpin() -> float | None:
+        return next(readings)
+
+    monkeypatch.setattr(agent, "_fetch_current_vpin", _fake_vpin)
+
+    first = await agent._current_defensive_posture()
+    second = await agent._current_defensive_posture()
+
+    assert first.mode == DefensiveExecutionMode.CAUTIOUS
+    assert second.mode == DefensiveExecutionMode.CAUTIOUS  # stale VPIN retained, not reset
+    assert agent._last_vpin == pytest.approx(0.9)  # last known real value, not overwritten by None
 
 
 @pytest.mark.asyncio

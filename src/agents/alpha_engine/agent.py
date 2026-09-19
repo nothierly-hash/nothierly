@@ -252,6 +252,54 @@ entirely and fires an immediate real market order to flatten the excess
     not also touch -- a larger, separate integration, not silently
     assumed done here.
 
+**VPIN-driven adverse-selection defense (2026-09-19 Quant Due Diligence
+audit finding).** A real, confirmed gap before this change: this engine
+skewed its quotes on inventory alone, blind to order-flow toxicity, even
+though :mod:`~src.agents.market_data.microstructure_features` has
+published a real, live VPIN reading from the real trade tape since
+:class:`~src.agents.macro_order_execution.agent.MacroOrderExecutionAgent`
+wired it in for ``TOXICITY_AVOIDANCE`` orders -- a whale actively
+dumping and a calm tape got the exact same spread and size. Reuses that
+same real, already-tested machinery unchanged
+(:class:`~execution.predator_honeypot.AdverseFlowDefenseAgent`/
+:class:`~execution.predator_honeypot.SpoofingPatternDetector`), not a
+second, parallel toxicity heuristic invented for this engine alone --
+same real VPIN bucket/rolling-window sizing as that agent's own, for one
+consistent real reading of "current VPIN" project-wide (see
+:data:`_VPIN_BUCKET_VOLUME`/:data:`_VPIN_ROLLING_BUCKETS`). This
+engine's own :class:`~execution.predator_honeypot.
+SpoofingPatternDetector` primary signal stays honestly unfed, exactly
+like that agent's: no per-order-ID exchange event feed exists anywhere
+in this project. Only :attr:`~execution.predator_honeypot.
+DefensiveExecutionMode.CAUTIOUS` is therefore reachable here (via the
+real external VPIN score alone) -- never ``TOXIC``, which needs the
+primary ADD/CANCEL detector this engine has no data source for. Under
+``CAUTIOUS``, :meth:`_current_defensive_posture` (called from
+:meth:`_requote` and :meth:`_run_simulated_cycle`, before either computes
+a price) widens the effective half-spread by
+:attr:`_vpin_cautious_spread_multiplier` (the classic VPIN-literature
+response -- Easley/O'Hara: a market maker facing informed/toxic flow
+widens rather than quoting the same price into it) and scales
+:attr:`_quote_size_units` down by the posture's own
+``max_order_size_multiplier`` -- the same real multiplier
+``MacroOrderExecutionAgent`` already applies to order quantity, applied
+here to resting quote size instead. **A real, disclosed scope limit,
+not a silent omission**: :attr:`~execution.predator_honeypot.
+DefensivePosture.require_post_only` is surfaced on this engine's
+telemetry but not enforced at the broker layer this pass --
+:meth:`~src.execution.broker_gateway.BaseBroker.place_limit_order` has
+no post-only parameter on any adapter today, and adding one is a
+separate, larger change to shared infrastructure every other real order-
+placing agent also calls (the same "do not casually touch the shared
+layer for one caller's need" principle as point 13 above), not done
+here unasked. A missing/stale VPIN reading (empty trade tape, Redis
+unavailable) leaves the last known score in place rather than reverting
+to ``NORMAL`` -- the same conservative-by-omission behavior
+``MacroOrderExecutionAgent._fetch_current_vpin`` already has, reused
+here rather than a second, differently-tuned staleness policy; the
+failure direction (quoting slightly too defensively on stale data) is
+the safe one.
+
 **Kill-switch interaction**: every *routine* real order this engine
 places (a resting quote, the automatic inventory-limit hedge in
 :meth:`_hedge_excess_inventory`) goes through
@@ -320,7 +368,9 @@ from core.schemas import (
 from core.security import FinancialCallAbortedError, KillSwitchActiveError, safe_financial_call
 from core.session_manager import MarketSessionManager
 from core.watchdog import SystemWatchdog
+from execution.predator_honeypot import AdverseFlowDefenseAgent, DefensiveExecutionMode, DefensivePosture, SpoofingPatternDetector
 from network.resilience_mesh import RateLimitMesh
+from src.agents.market_data.microstructure_features import compute_live_microstructure_reading, fetch_real_trade_tape
 from src.execution.audit_ledger import OrderAuditEvent
 from src.execution.broker_gateway import BaseBroker, BrokerFactory
 
@@ -347,6 +397,18 @@ _DEFAULT_ORDER_RATE_WINDOW_SECONDS: Final[float] = 10.0
 _DEFAULT_MAX_CONSECUTIVE_MARKET_DATA_ERRORS: Final[int] = 50
 _DEFAULT_MARKET_DATA_ERROR_RATE: Final[float] = 0.05
 _DEFAULT_MARKET_DATA_ERROR_WINDOW_SECONDS: Final[float] = 60.0
+
+# VPIN-driven adverse-selection defense -- see module docstring's 2026-09-19 addendum. Same real
+# values src/agents/macro_order_execution/agent.py's own _TOXICITY_VPIN_BUCKET_VOLUME/
+# _TOXICITY_VPIN_ROLLING_BUCKETS already use, for one consistent real reading of "current VPIN"
+# across this project rather than a second, differently-tuned one.
+_VPIN_BUCKET_VOLUME: Final[float] = 1.0
+_VPIN_ROLLING_BUCKETS: Final[int] = 10
+# Real half-spread multiplier applied while AdverseFlowDefenseAgent.posture_for reads CAUTIOUS
+# (elevated external VPIN) -- widens the quote instead of just shrinking it, the classic
+# VPIN-literature market-maker response. 2x is a starting, disclosed default, not a backtested
+# constant -- tune via --vpin-cautious-spread-multiplier (scripts/run_alpha_engine.py).
+_DEFAULT_VPIN_CAUTIOUS_SPREAD_MULTIPLIER: Final[Decimal] = Decimal("2")
 
 _TRADE_TIMESTAMPS_MAXLEN: Final[int] = 100_000  # OOM backstop -- see module docstring point 10
 _ORDER_TIMESTAMPS_MAXLEN: Final[int] = 10_000
@@ -392,6 +454,26 @@ def _skewed_quote_prices(
     bid_price = mid_price * (Decimal(1) - half_spread - skew)
     ask_price = mid_price * (Decimal(1) + half_spread - skew)
     return bid_price, ask_price
+
+
+def _defensive_half_spread_bps(
+    base_half_spread_bps: Decimal, *, mode: DefensiveExecutionMode, cautious_multiplier: Decimal,
+) -> Decimal:
+    """Real half-spread widening under detected adverse-selection risk. See module docstring's VPIN addendum.
+
+    ``NORMAL`` -- unchanged. ``CAUTIOUS``/``POST_ONLY_ONLY`` -- widened
+    by ``cautious_multiplier``. ``POST_ONLY_ONLY`` is not reachable from
+    this engine's own :class:`~execution.predator_honeypot.
+    AdverseFlowDefenseAgent` wiring today (its size multiplier is
+    already ``0.0``, suppressing the quote entirely before this widened
+    spread would ever be quoted) -- handled the same as ``CAUTIOUS``
+    anyway so this function states one total rule instead of a
+    ``NORMAL``-vs-everything-else special case that would silently stop
+    being correct the day the primary detector is ever fed real data.
+    """
+    if mode == DefensiveExecutionMode.NORMAL:
+        return base_half_spread_bps
+    return base_half_spread_bps * cautious_multiplier
 
 
 def _clamp_quote_sizes(*, base_size: Decimal, inventory: Decimal, max_inventory: Decimal) -> tuple[Decimal, Decimal]:
@@ -466,6 +548,7 @@ class AlphaMarketMakerAgent(BaseAgent):
         market_data_error_window_seconds: float = _DEFAULT_MARKET_DATA_ERROR_WINDOW_SECONDS,
         max_single_order_units: Decimal | None = None,
         max_daily_loss_usd: Decimal | None = None,
+        vpin_cautious_spread_multiplier: Decimal = _DEFAULT_VPIN_CAUTIOUS_SPREAD_MULTIPLIER,
         order_rate_limit_per_second: float = _DEFAULT_ORDER_RATE_LIMIT_PER_SECOND,
         tick_interval_seconds: float = _DEFAULT_TICK_INTERVAL_SECONDS,
         settings: AppSettings | None = None,
@@ -525,6 +608,21 @@ class AlphaMarketMakerAgent(BaseAgent):
         # own startup warning below, exist specifically so this is never silently left disabled.
         self._max_daily_loss_usd = max_daily_loss_usd
         self._order_rate_limit_per_second = order_rate_limit_per_second
+        self._vpin_cautious_spread_multiplier = vpin_cautious_spread_multiplier
+
+        # VPIN-driven adverse-selection defense -- see module docstring's 2026-09-19 addendum. Real,
+        # already-tested machinery reused unchanged from src/agents/macro_order_execution/agent.py's
+        # own identical wiring; this engine's own SpoofingPatternDetector primary signal stays
+        # honestly unfed (no per-order-ID exchange event feed exists anywhere in this project) --
+        # only CAUTIOUS, via the real external VPIN score, is reachable through this instance.
+        self._latest_vpin_by_symbol: dict[str, float] = {}
+        self._defense_agent = AdverseFlowDefenseAgent(
+            SpoofingPatternDetector(), external_toxicity_score=self._latest_vpin_by_symbol.get,
+        )
+        # Real, current values only -- surfaced on telemetry (_publish_telemetry), never a
+        # fabricated placeholder before the first real posture read completes.
+        self._last_vpin: float | None = None
+        self._last_defensive_mode: str = DefensiveExecutionMode.NORMAL.value
 
         self._broker: BaseBroker | None = None
         self._notifier: TelegramNotifier | None = None
@@ -875,14 +973,18 @@ class AlphaMarketMakerAgent(BaseAgent):
         displayed as if it did. The dashboard labels this state plainly
         as "SIMULÉ".
         """
+        posture = await self._current_defensive_posture()
         bid_price, ask_price = _skewed_quote_prices(
-            mid_price=Decimal(str(metrics.mid_price)), half_spread_bps=self._half_spread_bps,
+            mid_price=Decimal(str(metrics.mid_price)),
+            half_spread_bps=_defensive_half_spread_bps(
+                self._half_spread_bps, mode=posture.mode, cautious_multiplier=self._vpin_cautious_spread_multiplier,
+            ),
             inventory=Decimal(0), max_inventory=self._max_inventory_units, skew_bps=self._inventory_skew_bps,
         )
         self._log.info(
             "alpha_engine_simulated_quote", agent_id=self.agent_id, symbol=self._symbol,
             bid=str(bid_price), ask=str(ask_price), mock_mode=self._settings.mock_mode,
-            control_state=self.control_state.value,
+            control_state=self.control_state.value, defensive_mode=posture.mode.value, vpin=self._last_vpin,
         )
         age_seconds = (datetime.now(timezone.utc) - metrics.timestamp).total_seconds()
         await self._publish_telemetry(status="SIMULATED", market_data_age_seconds=age_seconds, inventory=None)
@@ -927,6 +1029,58 @@ class AlphaMarketMakerAgent(BaseAgent):
             return None, age_seconds
         self._market_data_circuit_breaker.record_success()
         return metrics, age_seconds
+
+    # -- Adverse-selection defense (VPIN) -----------------------------------
+
+    async def _fetch_current_vpin(self) -> float | None:
+        """Real, current VPIN for this engine's own symbol from the real trade tape, or ``None`` if unavailable.
+
+        Same real source, and same bucket/rolling-window sizing
+        (:data:`_VPIN_BUCKET_VOLUME`/:data:`_VPIN_ROLLING_BUCKETS`), as
+        :meth:`~src.agents.macro_order_execution.agent.
+        MacroOrderExecutionAgent._fetch_current_vpin` -- one consistent
+        real reading of "current VPIN" project-wide, not a second,
+        differently-tuned one. ``None`` (Redis unavailable, or not yet
+        enough real trades on the tape for even one bucket) means "no
+        real secondary signal available", the same contract
+        :class:`~execution.predator_honeypot.AdverseFlowDefenseAgent`'s
+        own ``external_toxicity_score`` callable already expects --
+        never a fabricated placeholder VPIN.
+        """
+        if self._redis_client is None:
+            return None
+        trade_tape = await fetch_real_trade_tape(self._redis_client, self._symbol)
+        reading = compute_live_microstructure_reading(
+            trade_tape, symbol=self._symbol, vpin_bucket_volume=_VPIN_BUCKET_VOLUME,
+            vpin_rolling_buckets=_VPIN_ROLLING_BUCKETS,
+        )
+        return reading.vpin
+
+    async def _current_defensive_posture(self) -> DefensivePosture:
+        """Real, current defensive posture for this engine's own symbol -- fetches VPIN, updates telemetry state.
+
+        Called from :meth:`_requote` and :meth:`_run_simulated_cycle`,
+        always before either computes a quote price -- see module
+        docstring's VPIN addendum. A missing reading this cycle
+        (:meth:`_fetch_current_vpin` returned ``None``) deliberately
+        leaves :attr:`_latest_vpin_by_symbol`'s last known value in
+        place rather than clearing it -- the same conservative-by-
+        omission behavior ``MacroOrderExecutionAgent`` already has;
+        quoting slightly too defensively on stale data is the safe
+        failure direction here.
+        """
+        vpin = await self._fetch_current_vpin()
+        if vpin is not None:
+            self._latest_vpin_by_symbol[self._symbol] = vpin
+            self._last_vpin = vpin
+        posture = self._defense_agent.posture_for(self._symbol)
+        self._last_defensive_mode = posture.mode.value
+        if posture.mode != DefensiveExecutionMode.NORMAL:
+            self._log.info(
+                "alpha_engine_defensive_posture_active", agent_id=self.agent_id, symbol=self._symbol,
+                mode=posture.mode.value, vpin=self._last_vpin, reason=posture.reason,
+            )
+        return posture
 
     # -- Inventory / fills -------------------------------------------------
 
@@ -1144,12 +1298,18 @@ class AlphaMarketMakerAgent(BaseAgent):
     async def _requote(self, metrics: MarketMetrics, own_inventory: Decimal) -> None:
         await self._cancel_all_resting_orders()
 
+        posture = await self._current_defensive_posture()
+
         bid_price, ask_price = _skewed_quote_prices(
-            mid_price=Decimal(str(metrics.mid_price)), half_spread_bps=self._half_spread_bps,
+            mid_price=Decimal(str(metrics.mid_price)),
+            half_spread_bps=_defensive_half_spread_bps(
+                self._half_spread_bps, mode=posture.mode, cautious_multiplier=self._vpin_cautious_spread_multiplier,
+            ),
             inventory=own_inventory, max_inventory=self._max_inventory_units, skew_bps=self._inventory_skew_bps,
         )
         buy_size, sell_size = _clamp_quote_sizes(
-            base_size=self._quote_size_units, inventory=own_inventory, max_inventory=self._max_inventory_units,
+            base_size=self._quote_size_units * Decimal(str(posture.max_order_size_multiplier)),
+            inventory=own_inventory, max_inventory=self._max_inventory_units,
         )
 
         if buy_size > 0:
@@ -1542,6 +1702,8 @@ class AlphaMarketMakerAgent(BaseAgent):
             "trade_count_24h": len(self._trade_timestamps),
             "market_data_age_seconds": market_data_age_seconds,
             "api_latency_ms": self._last_api_latency_ms,
+            "vpin": self._last_vpin,
+            "defensive_mode": self._last_defensive_mode,
             "updated_at": time.time(),
         }
         try:
