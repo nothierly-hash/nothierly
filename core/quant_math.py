@@ -273,6 +273,58 @@ construction itself (the same "don't reimplement a solved, well-tested
 numerical routine" precedent :func:`evt_var` already set for this
 module); the recursive bisection and cluster-variance allocation --
 HRP's own genuinely new, domain-specific step -- is implemented directly.
+
+**"Cointegration & Stat-Arb" (2026-09-19)** adds :func:`engle_granger_cointegration_test`
+-- the real, standard two-step Engle-Granger (1987) procedure: an OLS
+regression of one real price series on another for the cointegrating
+hedge ratio, then a real Augmented Dickey-Fuller (ADF) unit-root test
+(:func:`_augmented_dickey_fuller_statistic`) on that regression's
+residual spread, since two series are cointegrated exactly when a real
+linear combination of them is stationary even though each series alone
+is not. **Checked for overlap first, and it is real, not redundant**:
+this project already has both of pairs trading's other two real building
+blocks -- :func:`kalman_dynamic_hedge_ratio` (a time-varying hedge ratio,
+wired into :meth:`~src.agents.execution.agent.ExecutionAgent.
+compute_kalman_pairs_spread`) and :func:`ornstein_uhlenbeck_mean_reversion`
+(mean-reversion speed/half-life) -- but neither answers the one question
+that has to come first: *is this pair of instruments actually
+cointegrated at all*, as opposed to merely correlated (two merely-
+correlated, non-cointegrated series can drift apart forever; only a real
+cointegration relationship gives mean-reversion a real, structural
+reason to hold). That gap is confirmed directly in this project's own
+code: :meth:`compute_kalman_pairs_spread`'s own docstring already states
+"this project has no existing stat-arb/pairs-trading execution agent" --
+exposed as a real, usable building block for one, not yet consumed by
+one. This addition, plus a new pure module (:mod:`risk.pairs_trading`,
+matching :mod:`risk.regime_detector`'s own established "pure decision
+logic, no I/O, wired in by a real caller" pattern) that screens a real
+universe for cointegrated pairs and turns the resulting real spread into
+a real entry/exit signal, is the missing screening layer -- **not** a
+new autonomous execution agent, the same real, disclosed scope boundary
+:meth:`compute_kalman_pairs_spread` already drew, still open after this
+addition.
+
+**Real, disclosed approximation, stated plainly rather than silently
+assumed exact**: :func:`engle_granger_cointegration_test` compares its
+ADF statistic against fixed, textbook asymptotic critical values for the
+2-variable case (MacKinnon, "Critical Values for Cointegration Tests",
+1991/2010: -3.90/-3.34/-3.04 at 1%/5%/10%) -- an asymptotic (large-
+sample) approximation, not a finite-sample-size-adjusted response-
+surface p-value (the exact MacKinnon response surface needs a
+per-sample-size numerical interpolation this module does not implement).
+``statsmodels`` (whose ``coint``/``adfuller`` already do this exactly)
+is not a dependency of this project (see ``requirements.txt``) --
+implemented directly here in pure NumPy instead, the same "no suitable
+pre-built dependency available in this environment" reasoning
+:mod:`risk.regime_detector` already used for its own hand-rolled Gaussian
+HMM instead of ``hmmlearn``, and :func:`morlet_wavelet_transform` for its
+own hand-rolled CWT instead of ``pywt``/``scipy.signal.cwt``. Verified
+against a real, known-answer synthetic case, the same discipline as
+:func:`estimate_lyapunov_exponent`'s logistic-map check: a genuinely
+cointegrated pair (two random walks sharing one common stochastic
+trend, by construction) and a genuinely spurious pair (two fully
+independent random walks) must be told apart -- see ``tests/
+test_quant_math_engle_granger.py``.
 """
 
 from __future__ import annotations
@@ -3360,3 +3412,125 @@ def hierarchical_risk_parity_weights(
 
     weights: npt.NDArray[np.float64] = _hrp_recursive_bisection(sorted_indices, covariance_matrix)
     return weights
+
+
+# =============================================================================
+# Cointegration & Stat-Arb (2026-09-19) -- see module docstring
+# =============================================================================
+
+# Real, fixed asymptotic critical values for the Engle-Granger residual ADF test with 2 variables
+# (1 dependent + 1 independent, no trend) -- MacKinnon, "Critical Values for Cointegration Tests"
+# (1991; updated 2010). A real, disclosed approximation: the exact MacKinnon response surface
+# interpolates by sample size too; this module uses the large-sample asymptotic limit only (see
+# module docstring). More negative than the chosen critical value rejects the unit-root null, i.e.
+# is real evidence *for* cointegration.
+_ENGLE_GRANGER_CRITICAL_VALUES: Final[dict[str, float]] = {"1%": -3.90, "5%": -3.34, "10%": -3.04}
+
+
+def _augmented_dickey_fuller_statistic(series: npt.NDArray[np.float64], *, lags: int) -> float:
+    r"""Real ADF test statistic (no constant, no trend) for the null hypothesis that ``series`` has a unit root.
+
+    Regresses :math:`\Delta y_t = \rho y_{t-1} + \sum_{i=1}^{lags} \phi_i
+    \Delta y_{t-i} + \varepsilon_t` via ordinary least squares -- no
+    intercept/trend term, the standard specification for testing
+    :func:`engle_granger_cointegration_test`'s own residual spread,
+    which already has zero sample mean by construction (the OLS step
+    that produced it included an intercept) -- and returns the real
+    t-statistic on :math:`\rho`. More negative is stronger evidence
+    against a unit root (i.e. for stationarity).
+
+    Args:
+        series: 1D array, chronological order. Must have at least
+            ``lags + 3`` elements (enough real observations left after
+            differencing and lagging to estimate a real standard error).
+        lags: Number of lagged difference terms. Must be ``>= 0``.
+
+    Returns:
+        The real t-statistic on the :math:`y_{t-1}` coefficient.
+
+    Raises:
+        ValueError: If there are not enough observations, or ``lags`` is
+            negative.
+    """
+    if lags < 0:
+        raise ValueError("lags must be >= 0.")
+    if series.size < lags + 3:
+        raise ValueError(f"series must have at least {lags + 3} elements for {lags} lag(s).")
+
+    delta = series[1:] - series[:-1]
+    levels = series[:-1]
+    n_obs = delta.size - lags
+
+    regressors = np.empty((n_obs, 1 + lags), dtype=np.float64)
+    regressors[:, 0] = levels[lags:]
+    for i in range(1, lags + 1):
+        regressors[:, i] = delta[lags - i : delta.size - i]
+    target = delta[lags:]
+
+    coefficients, _, _, _ = np.linalg.lstsq(regressors, target, rcond=None)
+    residuals = target - regressors @ coefficients
+    degrees_of_freedom = n_obs - regressors.shape[1]
+    if degrees_of_freedom <= 0:
+        raise ValueError("Not enough observations left after lagging to estimate a real standard error.")
+
+    residual_variance = float(residuals @ residuals) / degrees_of_freedom
+    gram_inverse = np.linalg.inv(regressors.T @ regressors)
+    rho_standard_error = float(np.sqrt(residual_variance * gram_inverse[0, 0]))
+    return float(coefficients[0] / rho_standard_error)
+
+
+def engle_granger_cointegration_test(
+    series_a: npt.NDArray[np.float64],
+    series_b: npt.NDArray[np.float64],
+    *,
+    adf_lags: int = 1,
+    significance: Literal["1%", "5%", "10%"] = "5%",
+) -> tuple[float, float, npt.NDArray[np.float64], float, float, bool]:
+    r"""Real, two-step Engle-Granger (1987) cointegration test between two real price series.
+
+    Step 1 (OLS): fits :math:`series\_a_t = intercept + hedge\_ratio
+    \cdot series\_b_t + residual_t`. Step 2 (ADF): tests ``residual``
+    for a unit root via :func:`_augmented_dickey_fuller_statistic`. The
+    two series are real, evidenced-cointegrated exactly when that
+    residual spread is stationary -- see module docstring for why
+    neither :func:`kalman_dynamic_hedge_ratio` nor
+    :func:`ornstein_uhlenbeck_mean_reversion` alone answers this.
+
+    Args:
+        series_a: Real dependent price series (typically log-prices --
+            this function itself is agnostic to that choice, but a
+            hedge ratio fitted on raw prices is not scale-invariant the
+            way a log-price hedge ratio is; the caller decides).
+        series_b: Real independent price series, same length as
+            ``series_a``.
+        adf_lags: Lagged-difference terms for the residual ADF test
+            (see :func:`_augmented_dickey_fuller_statistic`). No
+            automatic lag-length selection (e.g. AIC/BIC) is
+            implemented -- a real, disclosed simplification, not a
+            silent default dressed up as a considered choice.
+        significance: Which :data:`_ENGLE_GRANGER_CRITICAL_VALUES`
+            level counts as "cointegrated" for the returned boolean.
+
+    Returns:
+        ``(hedge_ratio, intercept, residuals, adf_statistic,
+        critical_value, is_cointegrated)``.
+
+    Raises:
+        ValueError: If ``series_a``/``series_b`` have mismatched shapes,
+            are empty, or there are too few observations for
+            ``adf_lags`` (propagated from
+            :func:`_augmented_dickey_fuller_statistic`).
+    """
+    if series_a.shape != series_b.shape or series_a.size == 0:
+        raise ValueError("series_a and series_b must be the same nonempty shape.")
+
+    design = np.column_stack([np.ones_like(series_b), series_b])
+    coefficients, _, _, _ = np.linalg.lstsq(design, series_a, rcond=None)
+    intercept, hedge_ratio = float(coefficients[0]), float(coefficients[1])
+    residuals = series_a - (intercept + hedge_ratio * series_b)
+
+    adf_statistic = _augmented_dickey_fuller_statistic(residuals, lags=adf_lags)
+    critical_value = _ENGLE_GRANGER_CRITICAL_VALUES[significance]
+    is_cointegrated = adf_statistic < critical_value
+
+    return hedge_ratio, intercept, residuals, adf_statistic, critical_value, is_cointegrated
