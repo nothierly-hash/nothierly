@@ -27,6 +27,7 @@ from risk.regime_detector import (
     build_regime_features,
     label_regimes,
     load_real_bar_closes,
+    load_real_order_flow_series,
 )
 
 
@@ -132,6 +133,78 @@ def test_load_real_bar_closes_against_real_historical_data() -> None:
 def test_load_real_bar_closes_raises_on_unknown_symbol() -> None:
     with pytest.raises(FileNotFoundError):
         load_real_bar_closes("DOGEUSDT")
+
+
+# =============================================================================
+# Order-flow fusion (2026-09-19)
+# =============================================================================
+
+
+def test_build_regime_features_with_order_flow_adds_a_real_third_column() -> None:
+    closes = np.cumsum(np.random.default_rng(0).normal(0, 1, 100)) + 100
+    order_flow = np.random.default_rng(1).normal(0, 1, 100)
+    features = build_regime_features(closes, window=20, order_flow=order_flow)
+    assert features.shape == (100 - 1 - 20 + 1, 3)
+
+
+def test_third_column_matches_a_hand_computed_rolling_mean_of_order_flow() -> None:
+    closes = np.cumsum(np.random.default_rng(2).normal(0, 1, 50)) + 100
+    order_flow = np.arange(50, dtype=np.float64)  # order_flow[i] = i -- trivial to hand-verify
+    window = 10
+    features = build_regime_features(closes, window=window, order_flow=order_flow)
+
+    aligned = order_flow[1:]  # same convention as returns = diff(log(closes))
+    expected_first = float(np.mean(aligned[0:window]))
+    assert features[0, 2] == pytest.approx(expected_first)
+
+
+def test_order_flow_defaults_to_none_leaves_shape_and_values_unchanged() -> None:
+    """Real backward-compatibility guarantee -- see module docstring's addendum."""
+    closes = np.cumsum(np.random.default_rng(3).normal(0, 1, 80)) + 100
+    without = build_regime_features(closes, window=15)
+    with_none = build_regime_features(closes, window=15, order_flow=None)
+    assert without.shape == with_none.shape == (80 - 1 - 15 + 1, 2)
+    assert np.array_equal(without, with_none)
+
+
+def test_rejects_mismatched_order_flow_shape() -> None:
+    closes = np.array([100.0, 101.0, 102.0, 103.0, 104.0])
+    order_flow = np.array([1.0, 2.0, 3.0])
+    with pytest.raises(ValueError, match="must match bars_close shape"):
+        build_regime_features(closes, window=2, order_flow=order_flow)
+
+
+def test_load_real_order_flow_series_against_real_historical_data() -> None:
+    order_flow = load_real_order_flow_series("BTCUSDT", bar_interval="1m")
+    assert len(order_flow) > 1000
+    assert np.all(np.isfinite(order_flow))
+
+
+def test_order_flow_series_is_bar_aligned_with_close_series() -> None:
+    """The real alignment guarantee this module's docstring makes: same symbol/bar_interval/limit_rows
+    must produce two arrays of the same length, ready to fuse together."""
+    closes = load_real_bar_closes("BTCUSDT", bar_interval="1m", limit_rows=20_000)
+    order_flow = load_real_order_flow_series("BTCUSDT", bar_interval="1m", limit_rows=20_000)
+    assert len(closes) == len(order_flow)
+
+
+def test_load_real_order_flow_series_raises_on_unknown_symbol() -> None:
+    with pytest.raises(FileNotFoundError):
+        load_real_order_flow_series("DOGEUSDT")
+
+
+def test_fused_features_feed_a_real_hmm_without_error() -> None:
+    """End-to-end smoke test: fused features must be directly usable by GaussianHMM, same as the
+    2-feature case already wired into src/dashboard/ems_pages/agent_fleet.py's on-demand detector."""
+    closes = load_real_bar_closes("BTCUSDT", bar_interval="1m", limit_rows=20_000)
+    order_flow = load_real_order_flow_series("BTCUSDT", bar_interval="1m", limit_rows=20_000)
+    features = build_regime_features(closes, window=20, order_flow=order_flow)
+
+    hmm = GaussianHMM(num_states=3, num_features=3, seed=0)
+    hmm.fit(features, num_iterations=5)
+    posterior = hmm.predict_proba(features)
+    assert posterior.shape == (3,)
+    assert np.isfinite(posterior).all()
 
 
 # =============================================================================

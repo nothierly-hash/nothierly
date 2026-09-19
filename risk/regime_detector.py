@@ -55,6 +55,32 @@ This module never bypasses that gate: a regime that would call for
 *more* risk than currently configured returns a real
 ``RegimeApplicationResult`` flagging the change as
 ``requires_confirmation=True`` instead of writing it.
+
+**"Order-Flow-Fused Regime Detection" (2026-09-19)**: a real due-diligence audit finding --
+:func:`build_regime_features` only ever fed price bars (rolling mean/volatility of log-returns) to
+the HMM, so a microstructure-driven regime shift (sustained one-sided aggressive flow) could only be
+detected *after* it had already moved price enough to show up in those two features -- exactly the
+gap :mod:`src.agents.market_data.microstructure_features` (real, live VPIN/TFI) already closed for
+:class:`~src.agents.alpha_engine.agent.AlphaMarketMakerAgent` and
+:class:`~src.agents.macro_order_execution.agent.MacroOrderExecutionAgent`, but never for this
+module. :func:`build_regime_features` now accepts an optional, real, pre-aligned ``order_flow``
+series and adds it as a third feature column (rolling mean over the same window as the price
+features) -- backward compatible: omitted, behavior and output shape are byte-for-byte unchanged
+(see ``tests/test_regime_detector.py``'s own pre-existing shape test, still passing unmodified).
+
+**Real, disclosed choice: TFI, not VPIN, for this specific fusion.** VPIN (:func:`~research.
+alpha_features.compute_vpin`) is computed in volume-bucket time, which does not align to
+fixed-wall-clock-time bars the way this module's price bars are built -- forcing that alignment
+would need a real as-of join this pass does not build. TFI (:func:`~research.alpha_features.
+compute_tfi`, the same real order-flow family, already wall-clock-windowed) aligns to fixed-time
+bars directly. :func:`load_real_order_flow_series` builds a real, per-bar TFI series from the exact
+same real historical trade tape :func:`load_real_bar_closes` already reads, using the identical
+``group_by_dynamic`` bar boundaries -- the two functions' outputs line up index-for-index by
+construction, not by a coincidental shared row count. A live caller (a future regime-detecting
+agent, none exists yet -- see this module's own "on-demand dashboard detector" scope note above)
+would instead pass the real, live VPIN/TFI reading :mod:`src.agents.market_data.
+microstructure_features` already publishes; this module stays data-source-agnostic (the same
+established discipline :mod:`core.quant_math`'s own module docstring states for itself).
 """
 
 from __future__ import annotations
@@ -223,14 +249,51 @@ def label_regimes(hmm: GaussianHMM) -> dict[int, MarketRegime]:
 # =============================================================================
 
 
-def build_regime_features(bars_close: npt.NDArray[np.float64], *, window: int = 20) -> npt.NDArray[np.float64]:
-    """Real [rolling_mean_return, rolling_volatility] feature pairs from a real real close-price series."""
+def build_regime_features(
+    bars_close: npt.NDArray[np.float64], *, window: int = 20, order_flow: npt.NDArray[np.float64] | None = None,
+) -> npt.NDArray[np.float64]:
+    """Real [rolling_mean_return, rolling_volatility(, rolling_mean_order_flow)] features from a real close-price series.
+
+    See module docstring's "Order-Flow-Fused Regime Detection" addendum.
+
+    Args:
+        bars_close: Real, chronologically-ordered close prices.
+        window: Rolling window length, in bars.
+        order_flow: Optional real order-flow reading (e.g. TFI or VPIN)
+            per element of ``bars_close`` -- same length, same bar
+            alignment (see :func:`load_real_order_flow_series` for a
+            real way to build one). ``None`` (the default) keeps this
+            function's original 2-feature output, byte-for-byte
+            unchanged.
+
+    Returns:
+        Shape ``(len(bars_close) - 1 - window + 1, 2)`` when
+        ``order_flow`` is ``None``, or the same with a 3rd column (the
+        rolling mean of ``order_flow``, same windows as the price
+        features) when it is given.
+
+    Raises:
+        ValueError: If ``order_flow`` is given and its shape does not
+            match ``bars_close``.
+    """
+    if order_flow is not None and order_flow.shape != bars_close.shape:
+        raise ValueError(
+            f"order_flow shape {order_flow.shape} must match bars_close shape {bars_close.shape} "
+            "-- one real, aligned order-flow reading per close bar."
+        )
+
     returns = np.diff(np.log(bars_close))
-    features = np.zeros((len(returns) - window + 1, 2))
+    num_features = 3 if order_flow is not None else 2
+    features = np.zeros((len(returns) - window + 1, num_features))
+    # order_flow[0] has no corresponding return (returns[i] is the move *into* bars_close[i+1]) --
+    # dropping it keeps this aligned with `returns` under the exact same convention.
+    order_flow_aligned = order_flow[1:] if order_flow is not None else None
     for i in range(len(features)):
         segment = returns[i : i + window]
         features[i, 0] = float(np.mean(segment))
         features[i, 1] = float(np.std(segment))
+        if order_flow_aligned is not None:
+            features[i, 2] = float(np.mean(order_flow_aligned[i : i + window]))
     return features
 
 
@@ -321,3 +384,62 @@ def load_real_bar_closes(symbol: str, *, bar_interval: str = "1m", limit_rows: i
     bars = scan.group_by_dynamic("ts", every=bar_interval).agg(pl.col("price").last().alias("close")).drop_nulls("close").collect()
     closes: npt.NDArray[np.float64] = bars["close"].to_numpy()
     return closes
+
+
+def load_real_order_flow_series(
+    symbol: str, *, bar_interval: str = "1m", limit_rows: int | None = None, tfi_window: str = "30s",
+) -> npt.NDArray[np.float64]:
+    """Real per-bar Trade Flow Imbalance, aligned index-for-index with :func:`load_real_bar_closes`'s own bars.
+
+    See module docstring's "Order-Flow-Fused Regime Detection" addendum
+    for why TFI (not VPIN) and for the real alignment guarantee: this
+    reads the identical real trade tape, applies the identical
+    ``limit_rows`` truncation and ``group_by_dynamic`` bar boundaries as
+    :func:`load_real_bar_closes`, so calling both with the same
+    ``symbol``/``bar_interval``/``limit_rows`` yields two arrays of the
+    same length, bar-for-bar aligned, ready to pass together into
+    :func:`build_regime_features`.
+
+    Args:
+        symbol: Same real historical sample data as
+            :func:`load_real_bar_closes`.
+        bar_interval: Must match whatever :func:`load_real_bar_closes`
+            call this is meant to align with.
+        limit_rows: Must match whatever :func:`load_real_bar_closes`
+            call this is meant to align with.
+        tfi_window: :func:`~research.alpha_features.compute_tfi`'s own
+            rolling wall-clock window (e.g. ``"30s"``).
+
+    Returns:
+        Real per-bar TFI values (signed: positive means net aggressive
+        buying over the trailing ``tfi_window``), one per bar with at
+        least one real trade in it.
+
+    Raises:
+        FileNotFoundError: If no real historical trades sample data
+            exists for ``symbol``.
+    """
+    import polars as pl
+
+    from research.alpha_features import compute_tfi
+
+    path = _SAMPLE_DATA_DIR / f"{symbol.lower()}_trades_2020-01-01.csv"
+    if not path.exists():
+        raise FileNotFoundError(f"no real historical trades sample data for {symbol!r} at {path}")
+
+    trades = pl.scan_csv(str(path)).with_columns(pl.from_epoch("timestamp", time_unit="us").alias("ts")).sort("ts")
+    if limit_rows is not None:
+        trades = trades.head(limit_rows)
+    trades_df = trades.collect()
+
+    tfi_column = f"tfi_{tfi_window}"
+    with_tfi = compute_tfi(trades_df, windows=(tfi_window,)).with_columns(
+        pl.from_epoch("timestamp", time_unit="us").alias("ts")
+    ).sort("ts")
+    bars = (
+        with_tfi.group_by_dynamic("ts", every=bar_interval)
+        .agg(pl.col(tfi_column).last().alias("order_flow"))
+        .drop_nulls("order_flow")
+    )
+    order_flow: npt.NDArray[np.float64] = bars["order_flow"].to_numpy()
+    return order_flow

@@ -250,15 +250,26 @@ col_hmm, col_snn, col_causal = st.columns(3)
 
 with col_hmm:
     st.markdown("**Markov Regime Switcher**")
-    st.caption("Meta-Controller (HMM) -- risk/regime_detector.py")
+    st.caption("Meta-Controller (HMM, prix + flux d'ordres réel TFI) -- risk/regime_detector.py")
     st.markdown(status_badge("PENDING", "RECHERCHE / SUR DEMANDE"), unsafe_allow_html=True)
     if st.button("▶️ Lancer une détection réelle", key="run_hmm"):
-        with st.spinner("Fit HMM réel sur les barres BTCUSDT réelles..."):
-            from risk.regime_detector import GaussianHMM, build_regime_features, label_regimes, load_real_bar_closes
+        with st.spinner("Fit HMM réel sur les barres BTCUSDT réelles (prix + TFI)..."):
+            from risk.regime_detector import (
+                GaussianHMM,
+                build_regime_features,
+                label_regimes,
+                load_real_bar_closes,
+                load_real_order_flow_series,
+            )
 
+            # "Order-Flow-Fused Regime Detection" (2026-09-19): a 3rd real feature (rolling TFI,
+            # bar-aligned with `closes` -- see load_real_order_flow_series's own docstring for the
+            # alignment guarantee), so a microstructure-driven regime shift doesn't have to wait to
+            # show up in price alone before this detector can react to it.
             closes = load_real_bar_closes("BTCUSDT", bar_interval="1m")
-            features = build_regime_features(closes, window=20)
-            hmm = GaussianHMM(num_states=3, num_features=2, seed=0)
+            order_flow = load_real_order_flow_series("BTCUSDT", bar_interval="1m")
+            features = build_regime_features(closes, window=20, order_flow=order_flow)
+            hmm = GaussianHMM(num_states=3, num_features=3, seed=0)
             hmm.fit(features, num_iterations=100)
             labels = label_regimes(hmm)
             posterior = hmm.predict_proba(features)
