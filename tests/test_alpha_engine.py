@@ -289,6 +289,21 @@ def redis_client() -> Generator[RedisClient, None, None]:
     RedisClient._instance = None
 
 
+# BaseAgent.__init__ opens real ZMQ sockets/contexts; unclosed ones make pytest hang at exit inside
+# zmq.Context.__del__ -> term() (the recurring fixture-leak pattern of this repo's agent tests).
+_LEAKED_ZMQ: list[tuple[Any, Any, Any]] = []
+
+
+@pytest.fixture(autouse=True)
+def _close_real_zmq_sockets() -> Generator[None, None, None]:
+    yield
+    while _LEAKED_ZMQ:
+        publisher, subscriber, context = _LEAKED_ZMQ.pop()
+        publisher.close()
+        subscriber.close()
+        context.term()
+
+
 def _make_agent(redis_client: RedisClient, **kwargs: Any) -> AlphaMarketMakerAgent:
     """Shared construction, real fakeredis + a real minimal broker -- used by the `agent` fixture and any test that needs non-default constructor args (e.g. max_daily_loss_usd)."""
     defaults: dict[str, Any] = dict(
@@ -298,6 +313,7 @@ def _make_agent(redis_client: RedisClient, **kwargs: Any) -> AlphaMarketMakerAge
     defaults.update(kwargs)
     instance = AlphaMarketMakerAgent("BTC/USDT", **defaults)
     instance._redis_client = redis_client
+    _LEAKED_ZMQ.append((instance._publisher, instance._subscriber, instance._zmq_context))
     instance._publisher = _RecordingZmqPublisher()  # type: ignore[assignment]
     instance._settings.mock_mode = False
     instance._broker = _FakeBroker()
@@ -713,6 +729,36 @@ async def test_fat_finger_blocked_order_never_reaches_the_broker_and_forces_off(
     await agent._place_resting_order("buy", Decimal("100"), Decimal("65000"))  # absurdly oversized
     assert fake.limit_orders == []
     assert agent.control_state == AgentControlState.OFF
+
+
+@pytest.mark.asyncio
+async def test_fat_finger_breach_trips_the_global_kill_switch(
+    agent: AlphaMarketMakerAgent, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One of the two systemic triggers of the GLOBAL Kill Switch (2026-09-20 "Protocole UNBLOCK")."""
+    trips: list[str] = []
+
+    async def fake_trip(reason: str) -> None:
+        trips.append(reason)
+
+    monkeypatch.setattr("src.agents.alpha_engine.agent.trip_kill_switch", fake_trip)
+    await agent._place_resting_order("buy", Decimal("100"), Decimal("65000"))
+    assert len(trips) == 1 and "fat-finger" in trips[0]
+
+
+@pytest.mark.asyncio
+async def test_a_brief_feed_blip_does_not_trip_the_market_data_breaker(agent: AlphaMarketMakerAgent) -> None:
+    """2026-09-20 shadow run: two stale ticks in a 60s window (one ~4s blip) forced the engine OFF for
+    good at the old 5% rate. 50% of the window failing is a lost feed."""
+    breaker = agent._market_data_circuit_breaker
+    for _ in range(28):
+        breaker.record_success()
+    for _ in range(2):
+        breaker.record_failure()
+    assert not breaker.tripped
+    for _ in range(40):
+        breaker.record_failure()
+    assert breaker.tripped
 
 
 @pytest.mark.asyncio

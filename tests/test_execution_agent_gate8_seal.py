@@ -180,3 +180,24 @@ async def test_each_approved_decision_gets_a_distinct_order_id_and_chains_indepe
     sealed = _sealed_events(agent._publisher)  # type: ignore[arg-type]
     assert len(sealed) == 2
     assert sealed[0]["order_id"] != sealed[1]["order_id"]
+
+
+@pytest.mark.asyncio
+async def test_every_gate_evaluation_is_traced_in_the_logs_including_gates_4_to_7(agent: ExecutionAgent) -> None:
+    """2026-09-20: the only proof, after the fact, that a decision traversed Margin/RiskManager/
+    PortfolioRiskParity/StochasticCore is a log line -- pass or reject."""
+    import structlog
+
+    with structlog.testing.capture_logs() as captured:
+        await _send_price(agent, _PRICE)
+        await _send_signal(agent, "supervisor-agent", 1)
+        await _send_signal(agent, "rl-signal-agent", 1)
+
+    reports = [entry for entry in captured if entry["event"] == "execution_gate_report"]
+    assert len(reports) == 1
+    report = reports[0]
+    assert report["instrument"] == _INSTRUMENT
+    assert report["final_action"] == "SHADOW_ORDER"
+    assert report["gates"] == "1:PASSED 2:PASSED 3:PASSED 4:PASSED 5:PASSED 6:PASSED 7:PASSED 8:PASSED"
+    assert [g.split(":")[0] for g in report["gates_4_to_7"]] == ["4", "5", "6", "7"]
+    assert all(g.endswith(":PASSED") for g in report["gates_4_to_7"])

@@ -2491,6 +2491,15 @@ class ExecutionAgent(BaseAgent):
         src/dashboard/ems_pages/fleet_command_nexus.py's own Module 1
         already reached for daemon latency (see that module's docstring).
         """
+        # Every evaluation, pass or reject, leaves a log line -- the only place a Gate 4-7 traversal
+        # (Margin/RiskManager/PortfolioRiskParity/StochasticCore) is provable after the fact. Logged
+        # before the Redis persist below so a Redis outage never erases it.
+        self._log.info(
+            "execution_gate_report", agent_id=self.agent_id, instrument=report.instrument,
+            direction=report.direction, final_action=report.final_action,
+            gates=" ".join(f"{g.number}:{g.status}" for g in report.gates),
+            gates_4_to_7=[f"{g.number}:{g.name}:{g.status}" for g in report.gates if 4 <= g.number <= 7],
+        )
         if self._redis_client is None:
             return
         try:

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+from collections.abc import Sequence
 from typing import Any, ClassVar, Final
 
 from redis.asyncio import Redis
@@ -289,6 +290,25 @@ class RedisClient:
             _log.warning("redis_command_failed_reconnecting", command=command, error=str(exc))
             await self._connect_with_backoff()
             return await method(*args, **kwargs)
+
+    async def execute_transaction(self, commands: Sequence[tuple[str, tuple[Any, ...], dict[str, Any]]]) -> list[Any]:
+        """Run ``(command, args, kwargs)`` triples as one atomic MULTI/EXEC, one round trip, with :meth:`execute`'s reconnect-once.
+
+        No other client can observe a partial application -- what a pair of separate
+        ``execute("set", ...)`` calls (two independent round trips) cannot guarantee.
+        """
+        async def _run() -> list[Any]:
+            async with self._redis.pipeline(transaction=True) as pipe:
+                for command, args, kwargs in commands:
+                    getattr(pipe, command)(*args, **kwargs)
+                return list(await pipe.execute())
+
+        try:
+            return await _run()
+        except _RECOVERABLE_ERRORS as exc:
+            _log.warning("redis_transaction_failed_reconnecting", commands=len(commands), error=str(exc))
+            await self._connect_with_backoff()
+            return await _run()
 
     @property
     def client(self) -> Redis[str]:

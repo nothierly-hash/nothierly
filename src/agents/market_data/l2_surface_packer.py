@@ -153,8 +153,7 @@ async def publish_l2_surface(
     """
     encoded = pack_snapshot(snapshot, depth=depth)
     key = f"{L2_SURFACE_REDIS_KEY_PREFIX}{snapshot.symbol}"
-    await redis_client.execute("lpush", key, encoded)
-    await redis_client.execute("ltrim", key, 0, max_history - 1)
+    await redis_client.execute_transaction([("lpush", (key, encoded), {}), ("ltrim", (key, 0, max_history - 1), {})])
 
 
 async def read_l2_surface_history_async(

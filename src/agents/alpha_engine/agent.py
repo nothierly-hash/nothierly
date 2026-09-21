@@ -365,7 +365,7 @@ from core.schemas import (
     ORDER_AUDIT_EVENTS_TOPIC,
     MarketMetrics,
 )
-from core.security import FinancialCallAbortedError, KillSwitchActiveError, safe_financial_call
+from core.security import FinancialCallAbortedError, KillSwitchActiveError, safe_financial_call, trip_kill_switch
 from core.session_manager import MarketSessionManager
 from core.watchdog import SystemWatchdog
 from execution.predator_honeypot import AdverseFlowDefenseAgent, DefensiveExecutionMode, DefensivePosture, SpoofingPatternDetector
@@ -395,7 +395,10 @@ _DEFAULT_ORDER_RATE_WINDOW_SECONDS: Final[float] = 10.0
 # "Protocole AEGIS" (2026-09-16) -- see _market_data_circuit_breaker's own docstring for the real
 # 51.5h/34k+36k-event incident this closes.
 _DEFAULT_MAX_CONSECUTIVE_MARKET_DATA_ERRORS: Final[int] = 50
-_DEFAULT_MARKET_DATA_ERROR_RATE: Final[float] = 0.05
+# 50%, not 5%: at the 2s tick a 5% bar is two stale ticks in a 60s window, so one ~4s feed blip
+# (observed live, 2026-09-20 shadow run) forced the engine OFF for good. Half the window failing is a
+# lost feed (~30s), not a blip.
+_DEFAULT_MARKET_DATA_ERROR_RATE: Final[float] = 0.5
 _DEFAULT_MARKET_DATA_ERROR_WINDOW_SECONDS: Final[float] = 60.0
 
 # VPIN-driven adverse-selection defense -- see module docstring's 2026-09-19 addendum. Same real
@@ -1265,6 +1268,11 @@ class AlphaMarketMakerAgent(BaseAgent):
             "alpha_engine_fat_finger_forced_off",
             notify_message=None,  # already sent above -- avoid a duplicate alert
             extra_log_fields={"requested_size": str(size)},
+        )
+        # A fat-finger breach is one of the two systemic triggers of the GLOBAL Kill Switch: an order
+        # size this wrong means the sizing logic itself is untrustworthy, for every agent's orders.
+        await trip_kill_switch(
+            f"{self.agent_id} fat-finger limit exceeded: requested {size} > cap {self._max_single_order_units}"
         )
 
     async def _force_off(

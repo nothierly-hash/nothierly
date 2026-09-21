@@ -19,7 +19,8 @@ import fakeredis.aioredis
 import pytest
 
 from core.config import RedisSettings
-from core.redis_client import RedisClient
+from core.message_integrity import SignatureVerificationError
+from core.redis_client import RedisClient, RedisUnavailableError
 from core.schemas import MarketMetrics
 from src.agents.supervisor.agent import EmergencyStopError, SignalState, XgboostSignalAgent
 
@@ -115,8 +116,9 @@ async def test_transient_trip_self_heals_instead_of_permanently_stopping(
 async def test_persistent_trip_still_blocks_publishing_every_cycle(
     agent: XgboostSignalAgent, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The fix must not weaken the actual safety condition: a real, PERSISTENT unhealthy state
-    must keep blocking publication on every single cycle, for as long as it persists."""
+    """A PERSISTENT unhealthy read must veto publication on every cycle -- as a soft veto: no raise,
+    no global Kill Switch trip (2026-09-20: a 1% transient read failure used to latch it on)."""
+    trips = _record_kill_switch_trips(monkeypatch)
 
     async def always_unhealthy() -> SignalState:
         return _unhealthy_state()
@@ -125,13 +127,110 @@ async def test_persistent_trip_still_blocks_publishing_every_cycle(
 
     agent._running = True
     for _ in range(5):
-        with pytest.raises(EmergencyStopError):
-            await agent._run_signal_cycle()
+        await agent._run_signal_cycle()  # must not raise
 
     assert agent._publisher.published == [], (  # type: ignore[attr-defined]
         "a persistently unhealthy condition must never let a real signal through, on any cycle"
     )
-    assert agent._emergency_mode is True, "emergency_mode must stay True while the real condition persists"
+    assert trips == [], "a Redis-health problem is a soft veto, never a global Kill Switch trip"
+
+
+def _record_kill_switch_trips(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    trips: list[str] = []
+
+    async def fake_trip(reason: str) -> None:
+        trips.append(reason)
+
+    monkeypatch.setattr("src.agents.supervisor.agent.trip_kill_switch", fake_trip)
+    return trips
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [SignatureVerificationError("torn read"), RedisUnavailableError("blip")])
+async def test_isolated_read_failure_is_a_soft_veto_not_a_kill_switch_trip(
+    agent: XgboostSignalAgent, monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    trips = _record_kill_switch_trips(monkeypatch)
+    calls = 0
+
+    async def flaky_fetch() -> SignalState:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise error
+        return _healthy_state()
+
+    monkeypatch.setattr(agent, "_fetch_latest_state", flaky_fetch)
+    await agent._run_signal_cycle()  # the failing read: veto, no raise
+    assert agent._publisher.published == []  # type: ignore[attr-defined]
+    await agent._run_signal_cycle()  # the very next tick ingests normally
+    assert len(agent._publisher.published) == 1  # type: ignore[attr-defined]
+    assert trips == []
+    assert agent._consecutive_error_count == 0
+
+
+@pytest.mark.asyncio
+async def test_spread_anomaly_and_brief_staleness_are_soft_vetoes(
+    agent: XgboostSignalAgent, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    trips = _record_kill_switch_trips(monkeypatch)
+    for _ in range(agent._spread_history_window):
+        assert await agent._check_kill_switch(_healthy_state()) == []
+    wide = MarketMetrics(symbol=_INSTRUMENT, spread=0.01, order_book_imbalance=0.1, mid_price=1.10000)
+    assert await agent._check_kill_switch(SignalState(wide, {}, [], redis_latency_ms=1.0))  # veto reasons, no raise
+    stale = MarketMetrics(
+        symbol=_INSTRUMENT, spread=0.0001, order_book_imbalance=0.1, mid_price=1.10000,
+        timestamp=datetime.now(timezone.utc) - timedelta(seconds=2),
+    )
+    assert await agent._check_kill_switch(SignalState(stale, {}, [], redis_latency_ms=1.0))
+    assert trips == []
+
+
+@pytest.mark.asyncio
+async def test_total_feed_loss_trips_only_after_the_grace_period(
+    agent: XgboostSignalAgent, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+
+    trips = _record_kill_switch_trips(monkeypatch)
+    agent._feed_loss_grace_seconds = 0.2
+    assert await agent._check_kill_switch(_healthy_state()) == []  # a fresh reading arms the loss clock
+    gone = SignalState(None, {}, [], redis_latency_ms=1.0)  # key expired: the feed is gone
+    assert await agent._check_kill_switch(gone) == []  # inside the grace: nothing
+    assert trips == []
+    await asyncio.sleep(0.25)
+    with pytest.raises(EmergencyStopError):
+        await agent._check_kill_switch(gone)
+    assert len(trips) == 1 and "feed lost" in trips[0]
+
+
+@pytest.mark.asyncio
+async def test_cold_start_without_any_fresh_reading_is_not_a_feed_loss(
+    agent: XgboostSignalAgent, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+
+    trips = _record_kill_switch_trips(monkeypatch)
+    agent._feed_loss_grace_seconds = 0.05
+    gone = SignalState(None, {}, [], redis_latency_ms=1.0)
+    await agent._check_kill_switch(gone)
+    await asyncio.sleep(0.1)
+    await agent._check_kill_switch(gone)
+    assert trips == []
+
+
+@pytest.mark.asyncio
+async def test_flash_crash_still_trips_the_global_kill_switch(
+    agent: XgboostSignalAgent, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trips = _record_kill_switch_trips(monkeypatch)
+    await agent._check_kill_switch(_healthy_state())
+    crashed = MarketMetrics(symbol=_INSTRUMENT, spread=0.0001, order_book_imbalance=0.1, mid_price=0.90000)
+    with pytest.raises(EmergencyStopError):
+        await agent._check_kill_switch(SignalState(crashed, {}, [], redis_latency_ms=1.0))
+    assert len(trips) == 1
 
 
 @pytest.mark.asyncio

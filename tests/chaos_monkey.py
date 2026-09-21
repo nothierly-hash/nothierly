@@ -312,24 +312,28 @@ async def _chaos_latency_spike_staleness() -> None:
         macro_snapshots={}, sentiment_signals=[], redis_latency_ms=5.0,
     )
     tripped = False
+    vetoes: list[str] = []
     try:
         async with _isolated_kill_switch_redis():
-            await agent._check_kill_switch(state)
+            vetoes = await agent._check_kill_switch(state)
     except EmergencyStopError:
         tripped = True
 
-    if tripped:
+    # 2026-09-20 ("Protocole UNBLOCK"): a merely stale reading is a soft veto for that cycle, not a
+    # global trip -- the global Kill Switch needs a *lost* feed (no fresh reading for
+    # feed_loss_grace_seconds). Either way it must never be silently treated as fresh.
+    if vetoes and not tripped:
         _record(
             "Latency Spike: 2s-old MarketMetrics, well within the real 10s Redis TTL",
             "BLOCKED (real fix)",
-            "core.stale_check.staleness_reason, now wired into XgboostSignalAgent._check_kill_switch as "
-            "condition #5, rejects a merely-present-but-stale reading -- confirmed: a 2s-old reading, well "
-            "within the 10s Redis TTL, now halts trading instead of being silently treated as fresh."
+            "core.stale_check.staleness_reason, wired into XgboostSignalAgent._check_kill_switch, rejects a "
+            "merely-present-but-stale reading -- confirmed: a 2s-old reading, well within the 10s Redis TTL, "
+            "is vetoed for that cycle (soft veto) instead of being silently treated as fresh."
         )
     else:
         _record(
             "Latency Spike: 2s-old MarketMetrics", "GAP STILL PRESENT",
-            "Unexpectedly did NOT trip -- re-verify staleness_reason wiring in _check_kill_switch.",
+            "Stale reading was neither vetoed nor tripped -- re-verify staleness_reason wiring in _check_kill_switch.",
         )
 
 

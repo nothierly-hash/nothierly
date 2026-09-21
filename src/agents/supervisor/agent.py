@@ -19,12 +19,16 @@ fighting each other. Neither can place an order at all now; only
 arbitrated consensus between both agents' signals.
 
 Safety-by-default carries over even though execution moved out: this
-agent's local Kill Switch (redis-latency / spread-anomaly /
-consecutive-error conditions) still exists, but since it no longer holds
-a trading client of its own to cancel orders on, tripping it now
-escalates to the *global* Kill Switch (:func:`core.security.
-trip_kill_switch`) instead -- stopping :class:`ExecutionAgent` from
-acting on *anyone's* signal, not just this agent's.
+agent's local Kill Switch still exists, but since it no longer holds a
+trading client of its own to cancel orders on, tripping it escalates to
+the *global* Kill Switch (:func:`core.security.trip_kill_switch`) --
+stopping :class:`ExecutionAgent` from acting on *anyone's* signal. **Only
+systemic threats trip it** (flash crash; total loss of the market-data feed,
+i.e. no fresh reading for ``feed_loss_grace_seconds``). Everything else
+(an isolated Redis read failure, a torn/invalid signature, a latency spike,
+a spread anomaly, a briefly stale reading) is a *soft veto*: a warning, no
+signal this cycle, and the loop keeps ingesting -- a 1% transient read
+failure used to latch the global switch on within ~15 minutes.
 
 **Asset-class note** (carried over, still true): this agent evaluates
 OANDA forex instruments (e.g. ``"EUR_USD"``), but the market data it
@@ -51,10 +55,11 @@ from pydantic import ValidationError
 from core.base_agent import AgentControlState, BaseAgent
 from core.circuit_breaker import MarketAnomalyDetector
 from core.config import AppSettings
-from core.message_integrity import SignatureVerificationError, read_verified_market_metrics
+from core.message_integrity import MARKET_METRICS_SIG_SUFFIX, SignatureVerificationError, verified_market_metrics
 from core.redis_client import RedisUnavailableError
 from core.schemas import (
     FEATURE_VECTOR_REDIS_KEY_PREFIX,
+    MARKET_METRICS_REDIS_KEY_PREFIX,
     TRADING_SIGNALS_TOPIC,
     FeatureVector,
     MacroSnapshot,
@@ -156,6 +161,7 @@ class XgboostSignalAgent(BaseAgent):
         flash_crash_window_seconds: float = 60.0,
         flash_crash_max_move_fraction: float = 0.05,
         max_market_metrics_age_ms: float = 500.0,
+        feed_loss_grace_seconds: float = 30.0,
         model_path: str | Path | None = None,
         scaler_path: str | Path | None = None,
         settings: AppSettings | None = None,
@@ -177,29 +183,30 @@ class XgboostSignalAgent(BaseAgent):
                 must be from ``0.5`` before this agent signals a
                 direction instead of neutral (e.g. ``0.1`` means signal
                 only outside ``[0.4, 0.6]``).
-            redis_latency_threshold_ms: Kill Switch condition #1: trip if
-                a full state read from Redis takes longer than this.
-            spread_anomaly_multiplier: Kill Switch condition #2: trip if
-                the current spread exceeds this many times the rolling
+            redis_latency_threshold_ms: Soft-veto condition: skip this
+                cycle if a full state read from Redis takes longer than this.
+            spread_anomaly_multiplier: Soft-veto condition: skip this cycle
+                if the current spread exceeds this many times the rolling
                 average of the last ``spread_history_window`` readings.
             spread_history_window: Number of past spread readings kept
                 for the anomaly baseline. The check only activates once
                 this many *prior* readings exist.
-            max_consecutive_errors: Kill Switch condition #3: trip once
-                consecutive read/inference errors exceed this count.
-            flash_crash_window_seconds: Kill Switch condition #4: lookback
+            max_consecutive_errors: Consecutive failed state reads after
+                which the soft-fail warning escalates to an ``error`` log
+                (never a Kill Switch trip -- see the module docstring).
+            flash_crash_window_seconds: Systemic trigger #1: lookback
                 window :class:`~core.circuit_breaker.MarketAnomalyDetector`
                 measures a price move over -- independent of spread (see
                 that class's own docstring for why this exists alongside
                 condition #2, not instead of it).
-            flash_crash_max_move_fraction: Kill Switch condition #4:
+            flash_crash_max_move_fraction: Systemic trigger #1:
                 absolute fractional price move within
                 ``flash_crash_window_seconds`` that trips it.
-            max_market_metrics_age_ms: Kill Switch condition #5: trip if
-                the latest :class:`~core.schemas.MarketMetrics` reading is
-                older than this many milliseconds (see
-                :mod:`core.stale_check`'s own docstring on why 500ms is
-                deliberately aggressive).
+            max_market_metrics_age_ms: A reading older than this is
+                *stale*: soft veto for the cycle (see :mod:`core.stale_check`).
+            feed_loss_grace_seconds: Systemic trigger #2: trip the global
+                Kill Switch only once no *fresh* reading has been seen for
+                this long (total feed loss, not a blip).
             model_path: Passed through to :class:`SupervisorMLModel`; see
                 its docstring for the untrained-skeleton fallback.
             scaler_path: Passed through to :class:`SupervisorMLModel`
@@ -253,6 +260,9 @@ class XgboostSignalAgent(BaseAgent):
             window_seconds=flash_crash_window_seconds, max_move_fraction=flash_crash_max_move_fraction
         )
         self._max_market_metrics_age_ms = max_market_metrics_age_ms
+        self._feed_loss_grace_seconds = feed_loss_grace_seconds
+        # None until the first fresh reading: a cold start (feed not up yet) is not a feed *loss*.
+        self._last_fresh_metrics_at: float | None = None
 
     # -- BaseAgent overrides -----------------------------------------
 
@@ -387,20 +397,28 @@ class XgboostSignalAgent(BaseAgent):
         try:
             state = await self._fetch_latest_state()
         except (RedisUnavailableError, ValidationError, SignatureVerificationError) as exc:
+            # Soft fail: an isolated read failure vetoes THIS cycle only. It never touches the global
+            # Kill Switch and never stops the loop -- the next tick simply reads again.
             self._consecutive_error_count += 1
-            self._log.warning(
+            log = self._log.error if self._consecutive_error_count > self._max_consecutive_errors else self._log.warning
+            log(
                 "xgboost_signal_state_fetch_failed",
                 agent_id=self.agent_id,
                 error_type=type(exc).__name__,
                 consecutive_error_count=self._consecutive_error_count,
+                detail="soft veto: cycle skipped, no signal published, global Kill Switch untouched",
             )
-            await self._check_kill_switch(SignalState(None, {}, [], redis_latency_ms=float("inf")))
+            return
+        self._consecutive_error_count = 0
+
+        veto_reasons = await self._check_kill_switch(state)  # raises EmergencyStopError on a systemic threat only
+        if veto_reasons:
+            self._log.warning(
+                "xgboost_signal_soft_veto", agent_id=self.agent_id, symbol=self._symbol, reasons=veto_reasons,
+            )
             return
 
-        await self._check_kill_switch(state)
-
-        # Reaching here means every Kill Switch condition passed.
-        self._consecutive_error_count = 0
+        # Reaching here means no systemic threat and no local veto.
         self._emergency_mode = False
 
         if state.market_metrics is None:
@@ -441,153 +459,119 @@ class XgboostSignalAgent(BaseAgent):
     # -- State fetching / Redis latency measurement ----------------------
 
     async def _fetch_latest_state(self) -> SignalState:
-        """Read every sub-agent's latest published state from Redis.
+        """Read every sub-agent's latest published state: one ``MGET`` for every fixed key, plus one for the sentiment keys.
 
-        The wall-clock time of this whole read **is** the Kill Switch's
-        Redis-latency health check (see :meth:`_check_kill_switch`): a
-        slow round trip here means Redis, the network to it, or the
-        agents feeding it are struggling, regardless of the specific
-        cause.
-
-        Returns:
-            The fetched state, with ``redis_latency_ms`` set to
-            ``float("inf")`` if no Redis connection exists at all
-            (treated as maximally unsafe, not a separate error path).
+        Fixed keys (signed market metrics value + signature, feature vector, macro snapshots) come
+        back from a single atomic ``MGET`` -- the value/signature pair can no longer be torn by a
+        concurrent write, and the read costs one round trip instead of ``3 + len(_MACRO_INDICATORS)``.
+        Sentiment keys are discovered with ``SCAN`` (never ``KEYS``: it would block a shared Redis)
+        and fetched with a second ``MGET``. The wall-clock time of the whole read is the local
+        latency health signal (a soft veto, see :meth:`_check_kill_switch`).
 
         Raises:
-            RedisUnavailableError: If a read fails after Redis's own
-                bounded internal reconnect attempts are exhausted.
-            pydantic.ValidationError: If a value in Redis doesn't
-                deserialize into its expected schema.
+            RedisUnavailableError: If a read fails after Redis's own bounded reconnect attempts.
+            pydantic.ValidationError: If a value doesn't deserialize into its schema.
+            SignatureVerificationError: If the metrics signature is missing or wrong.
         """
         if self._redis_client is None:
             return SignalState(None, {}, [], redis_latency_ms=float("inf"))
 
         start = time.monotonic()
-        market_metrics = await self._read_market_metrics()
-        macro_snapshots = await self._read_macro_snapshots()
-        sentiment_signals = await self._read_sentiment_signals()
-        feature_vector = await self._read_feature_vector()
+        metrics_key = f"{MARKET_METRICS_REDIS_KEY_PREFIX}{self._symbol}"
+        raw_metrics, raw_signature, raw_feature, *raw_macros = await self._redis_client.execute(
+            "mget",
+            metrics_key,
+            f"{metrics_key}{MARKET_METRICS_SIG_SUFFIX}",
+            f"{FEATURE_VECTOR_REDIS_KEY_PREFIX}{self._symbol}",
+            *(f"macro_snapshot:{indicator}" for indicator in _MACRO_INDICATORS),
+        )
+        sentiment_keys = [key async for key in self._redis_client.client.scan_iter(match="nlp_signal:*")]
+        raw_sentiments = await self._redis_client.execute("mget", *sentiment_keys) if sentiment_keys else []
         elapsed_ms = (time.monotonic() - start) * 1000.0
+
+        market_metrics = verified_market_metrics(self._symbol, raw_metrics, raw_signature)
+        macro_snapshots = {
+            indicator: MacroSnapshot.model_validate_json(raw)
+            for indicator, raw in zip(_MACRO_INDICATORS, raw_macros)
+            if raw is not None
+        }
+        sentiment_signals = [SentimentSignal.model_validate_json(raw) for raw in raw_sentiments if raw is not None]
+        feature_vector: FeatureVector | None = None
+        if raw_feature is not None:
+            try:
+                feature_vector = FeatureVector.model_validate_json(raw_feature)
+            except ValidationError:
+                self._log.warning("xgboost_signal_feature_vector_malformed", agent_id=self.agent_id)
 
         return SignalState(
             market_metrics, macro_snapshots, sentiment_signals, feature_vector, redis_latency_ms=elapsed_ms
         )
 
-    async def _read_market_metrics(self) -> MarketMetrics | None:
-        """Read + signature-verify the traded symbol's latest :class:`~core.schemas.MarketMetrics`.
-
-        Real fix for ``tests/red_team_hacker.py``'s Attack 1 (Redis
-        MarketMetrics cache poisoning): a plain ``GET`` accepted anything
-        shaped like a valid reading, including a fabricated one written
-        directly to this key by anyone with Redis access. See
-        :func:`~core.message_integrity.read_verified_market_metrics`'s own
-        docstring for the real, disclosed scope of this fix.
-        """
-        assert self._redis_client is not None
-        return await read_verified_market_metrics(self._redis_client, self._symbol)
-
-    async def _read_feature_vector(self) -> FeatureVector | None:
-        """Read the traded symbol's latest :class:`~core.schemas.FeatureVector`, if any.
-
-        ``None`` (key absent, expired, or malformed) is a normal outcome,
-        not an error -- see :mod:`~src.agents.supervisor.
-        feature_confirmation`'s docstring on why a missing vector simply
-        means "behave as before this integration existed", not a fetch
-        failure worth counting toward the Kill Switch's consecutive-error
-        condition.
-        """
-        assert self._redis_client is not None
-        raw = await self._redis_client.execute("get", f"{FEATURE_VECTOR_REDIS_KEY_PREFIX}{self._symbol}")
-        if raw is None:
-            return None
-        try:
-            return FeatureVector.model_validate_json(raw)
-        except ValidationError:
-            self._log.warning("xgboost_signal_feature_vector_malformed", agent_id=self.agent_id)
-            return None
-
-    async def _read_macro_snapshots(self) -> dict[str, MacroSnapshot]:
-        """Read the latest :class:`~core.schemas.MacroSnapshot` per known indicator."""
-        assert self._redis_client is not None
-        snapshots: dict[str, MacroSnapshot] = {}
-        for indicator in _MACRO_INDICATORS:
-            raw = await self._redis_client.execute("get", f"macro_snapshot:{indicator}")
-            if raw is not None:
-                snapshots[indicator] = MacroSnapshot.model_validate_json(raw)
-        return snapshots
-
-    async def _read_sentiment_signals(self) -> list[SentimentSignal]:
-        """Read every currently-live :class:`~core.schemas.SentimentSignal`.
-
-        Uses ``SCAN`` (via ``scan_iter``), not ``KEYS``: ``KEYS`` walks
-        the entire keyspace in one blocking call, which is fine on a toy
-        dataset but is a well-known way to stall a shared Redis instance
-        under real load. ``SCAN`` iterates in small non-blocking steps.
-        """
-        assert self._redis_client is not None
-        signals: list[SentimentSignal] = []
-        async for key in self._redis_client.client.scan_iter(match="nlp_signal:*"):
-            raw = await self._redis_client.execute("get", key)
-            if raw is not None:
-                signals.append(SentimentSignal.model_validate_json(raw))
-        return signals
-
     # -- Local Kill Switch -----------------------------------------------
 
-    async def _check_kill_switch(self, state: SignalState) -> None:
-        """Check the three local safety conditions; trip if any is met.
+    async def _check_kill_switch(self, state: SignalState) -> list[str]:
+        """Trip the GLOBAL Kill Switch on a systemic threat; otherwise return this cycle's soft-veto reasons.
+
+        Systemic (trips, then raises): a flash crash, or total loss of the market-data feed -- no
+        *fresh* :class:`~core.schemas.MarketMetrics` for ``feed_loss_grace_seconds`` (a cold start
+        that never saw a fresh reading is not a loss). Soft veto (returned, nothing tripped): Redis
+        latency over threshold, spread anomaly, a stale reading that is not yet a lost feed.
 
         Args:
             state: This cycle's fetched state.
 
+        Returns:
+            Human-readable soft-veto reasons; empty when the cycle may proceed.
+
         Raises:
-            EmergencyStopError: If any condition is met. By the time
-                this raises, :meth:`_trigger_kill_switch` has already
-                tripped the *global* Kill Switch and requested shutdown.
+            EmergencyStopError: On a systemic threat, after the global Kill Switch has been tripped.
         """
-        reasons: list[str] = []
+        systemic: list[str] = []
+        vetoes: list[str] = []
+        now = time.monotonic()
 
         if state.redis_latency_ms > self._redis_latency_threshold_ms:
-            reasons.append(
+            vetoes.append(
                 f"redis_latency_ms={state.redis_latency_ms:.1f} exceeds threshold "
                 f"{self._redis_latency_threshold_ms:.1f} (possible system freeze or network outage)"
             )
 
+        fresh = False
         if state.market_metrics is not None:
             spread = state.market_metrics.spread
             if len(self._spread_history) >= self._spread_history_window:
                 baseline = statistics.fmean(self._spread_history)
                 if baseline > 0 and spread > self._spread_anomaly_multiplier * baseline:
-                    reasons.append(
+                    vetoes.append(
                         f"spread={spread:.6f} exceeds {self._spread_anomaly_multiplier}x "
                         f"the recent average {baseline:.6f} (destructive slippage risk)"
                     )
-            # Recorded *after* the check so the current reading never
-            # contaminates its own anomaly baseline.
+            # Recorded *after* the check so the current reading never contaminates its own baseline.
             self._spread_history.append(spread)
 
-            # Condition #4 -- flash crash, independent of spread. Real gap closed: see
-            # core/circuit_breaker.py's module docstring (tests/chaos_monkey.py Chaos 1a).
             price_move_reason = self._anomaly_detector.check(state.market_metrics.mid_price)
             if price_move_reason is not None:
-                reasons.append(price_move_reason)
+                systemic.append(price_move_reason)
 
-            # Condition #5 -- stale-but-present reading. Real gap closed: see
-            # core/stale_check.py's module docstring (tests/chaos_monkey.py Chaos 3).
             stale_reason = staleness_reason(state.market_metrics.timestamp, max_age_ms=self._max_market_metrics_age_ms)
-            if stale_reason is not None:
-                reasons.append(stale_reason)
+            if stale_reason is None:
+                fresh = True
+            else:
+                vetoes.append(stale_reason)
 
-        if self._consecutive_error_count > self._max_consecutive_errors:
-            reasons.append(
-                f"consecutive_error_count={self._consecutive_error_count} exceeds "
-                f"{self._max_consecutive_errors}"
+        if fresh:
+            self._last_fresh_metrics_at = now
+        elif self._last_fresh_metrics_at is not None and now - self._last_fresh_metrics_at >= self._feed_loss_grace_seconds:
+            systemic.append(
+                f"market data feed lost: no fresh MarketMetrics for {now - self._last_fresh_metrics_at:.1f}s "
+                f"(grace {self._feed_loss_grace_seconds:.1f}s)"
             )
+            self._last_fresh_metrics_at = now  # re-arm: at most one trip per grace period while the loss persists
 
-        if reasons:
-            await self._trigger_kill_switch(reasons)
-            raise EmergencyStopError("; ".join(reasons))
+        if systemic:
+            await self._trigger_kill_switch(systemic)
+            raise EmergencyStopError("; ".join(systemic))
+        return vetoes
 
     async def _trigger_kill_switch(self, reasons: list[str]) -> None:
         """Enter emergency mode: log critical, trip the global Kill Switch.
