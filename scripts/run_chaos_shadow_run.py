@@ -54,6 +54,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 import time
@@ -97,10 +98,10 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _spawn(name: str, args: list[str], *, log_path: Path) -> subprocess.Popen:
+def _spawn(name: str, args: list[str], *, log_path: Path, env: dict[str, str]) -> subprocess.Popen:
     log_file = log_path.open("w", encoding="utf-8")
     proc = subprocess.Popen(
-        [_PYTHON, *args], cwd=str(_PROJECT_ROOT), stdout=log_file, stderr=subprocess.STDOUT,
+        [_PYTHON, *args], cwd=str(_PROJECT_ROOT), stdout=log_file, stderr=subprocess.STDOUT, env=env,
     )
     print(f"[orchestrator] started {name} (pid={proc.pid}) -> {log_path}")
     return proc
@@ -115,9 +116,26 @@ def main() -> int:
     procs: dict[str, subprocess.Popen] = {}
     log_files: dict[str, Path] = {}
 
+    # **Real isolation bug, found live (2026-09-23) via an actual chaos burst**: every child below
+    # used to inherit this process's own environment unchanged, so --redis-port only ever controlled
+    # what port the orchestrator's OWN spawned fake_redis binds to -- none of the real agents
+    # (execution_agent, alpha_engine, market_data_chaos) or chaos_reset_kill_switch.py were ever told
+    # to CONNECT to it. Every one of them fell back to core.config.get_settings()'s own default (this
+    # project's real, shared, standing Redis on .env's REDIS_PORT) -- confirmed live: a "quick
+    # validation burst" run this way reset SYSTEM_STATUS and threw 3 minutes of fault injection at
+    # that same shared instance instead of a throwaway one. child_env is now the one, real source of
+    # truth every spawned child (and the one-off chaos_reset_kill_switch.py subprocess.run below) is
+    # given -- REDIS_HOST/REDIS_PORT overridden to the isolated fake_redis this script itself started,
+    # unless --use-real-redis was passed, in which case child_env is left exactly as documented
+    # ("whatever REDIS_HOST/REDIS_PORT is already configured").
+    child_env = os.environ.copy()
+    if not args.use_real_redis:
+        child_env["REDIS_HOST"] = "127.0.0.1"
+        child_env["REDIS_PORT"] = str(args.redis_port)
+
     def spawn(name: str, script: str, script_args: list[str]) -> None:
         log_path = log_dir / f"{name}.log"
-        procs[name] = _spawn(name, [str(_PROJECT_ROOT / "scripts" / script), *script_args], log_path=log_path)
+        procs[name] = _spawn(name, [str(_PROJECT_ROOT / "scripts" / script), *script_args], log_path=log_path, env=child_env)
         log_files[name] = log_path
 
     try:
@@ -126,8 +144,12 @@ def main() -> int:
             time.sleep(2)
 
         if args.reset_kill_switch:
-            print("[orchestrator] --reset-kill-switch passed: running scripts/chaos_reset_kill_switch.py once, explicitly.")
-            subprocess.run([_PYTHON, str(_PROJECT_ROOT / "scripts" / "chaos_reset_kill_switch.py")], cwd=str(_PROJECT_ROOT), check=True)
+            print(f"[orchestrator] --reset-kill-switch passed: running scripts/chaos_reset_kill_switch.py once, explicitly, "
+                  f"against {child_env.get('REDIS_HOST', '<.env default>')}:{child_env.get('REDIS_PORT', '<.env default>')}.")
+            subprocess.run(
+                [_PYTHON, str(_PROJECT_ROOT / "scripts" / "chaos_reset_kill_switch.py")],
+                cwd=str(_PROJECT_ROOT), check=True, env=child_env,
+            )
         else:
             print("[orchestrator] NOTE: SYSTEM_STATUS is not being reset (pass --reset-kill-switch to do so explicitly).")
             print("[orchestrator]       Every real order attempt will be blocked upstream by the global Kill Switch's own")
