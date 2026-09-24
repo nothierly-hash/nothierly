@@ -29,9 +29,10 @@ is not duplicated here.
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Awaitable, Callable
 from functools import wraps
-from typing import Any, Final, ParamSpec, TypeVar
+from typing import Any, Final, NamedTuple, ParamSpec, TypeVar
 
 from core.logger import get_logger
 from core.message_integrity import sign, verify
@@ -77,6 +78,16 @@ SYSTEM_STATUS_SIG_KEY: Final[str] = "SYSTEM_STATUS:sig"
 SYSTEM_STATUS_EPOCH_KEY: Final[str] = "SYSTEM_STATUS:epoch"
 STATUS_SAFE: Final[str] = "SAFE"
 STATUS_PANIC: Final[str] = "PANIC"
+# "Resilient Kill Switch" (2026-09-24): a real due-diligence finding from a 24h Chaos Shadow Run --
+# a single 30s Binance WebSocket blip latched the *entire* system's Kill Switch on PANIC for the
+# rest of the run, indistinguishable from a flash crash or a compromised credential, both of which
+# genuinely require a human to look before trading resumes. LATCHED_DATA is a third, real status,
+# reserved for exactly one systemic condition (total market-data feed loss -- see
+# src.agents.supervisor.agent.XgboostSignalAgent._check_kill_switch) that a real, measured period
+# of continuous fresh data can honestly certify as resolved on its own -- see
+# auto_recover_from_data_loss below. is_system_safe() treats it exactly like PANIC (blocks
+# trading); the only difference is *what may lift it*.
+STATUS_LATCHED_DATA: Final[str] = "LATCHED_DATA"
 
 # Per-process high-water mark -- see SYSTEM_STATUS_EPOCH_KEY's own docstring above. Module-level by
 # design: every caller within one process shares the same defense, the same way RedisClient._instance
@@ -92,6 +103,11 @@ _min_accepted_epoch: int = 0
 # never stall indefinitely on the safety check meant to protect it.
 _CHECK_TIMEOUT_SECONDS: Final[float] = 3.0
 _TRIP_TIMEOUT_SECONDS: Final[float] = 3.0
+
+# manual_authenticated_reset's own anti-replay window: a (timestamp, signature) pair verifies only
+# within this many real seconds of "now" -- a captured pair stops working the moment it goes stale,
+# regardless of how long an attacker (or a stale automation script) waits to replay it.
+_RESET_REPLAY_TOLERANCE_SECONDS: Final[float] = 10.0
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
@@ -111,19 +127,47 @@ class FinancialCallAbortedError(RuntimeError):
     """
 
 
-async def is_system_safe() -> bool:
-    """Check Redis's ``SYSTEM_STATUS`` flag. Fails closed on any doubt.
+def _decode_redis_str(value: str | bytes | None) -> str | None:
+    """Normalize a raw Redis read to ``str``. Real, disclosed defensive fix.
 
-    Returns:
-        ``False`` (block) if Redis is unreachable, the check times out,
-        ``SYSTEM_STATUS`` is ``"PANIC"``, a value is present but its
-        companion :data:`SYSTEM_STATUS_SIG_KEY` is missing/does not match
-        the value+epoch it claims to authenticate, or the epoch itself is
-        older than one this process has already observed (a replay -- see
-        :data:`SYSTEM_STATUS_EPOCH_KEY`'s own docstring for what this does
-        and does not defend against). ``True`` (safe) only if the key is
-        absent, or present, signed, fresh, and equal to ``"SAFE"``.
+    Real production ``redis-py`` (``decode_responses=True``, see
+    :class:`~core.redis_client.RedisClient`) always returns ``str``
+    here. ``fakeredis``'s async client does not always honor that flag
+    -- the identical, independently-found quirk
+    :func:`~core.message_integrity.sign` already defends against on its
+    own input. Found here (2026-09-24) via a real end-to-end test
+    exercising :func:`auto_recover_from_data_loss` against real
+    fakeredis for the first time in this codebase: an undecoded
+    ``bytes`` status previously broke both the ``f"{status}:{epoch}"``
+    signature payload (producing ``"b'LATCHED_DATA':1"``, which was
+    never what was actually signed) and any direct ``status ==
+    STATUS_SAFE``-style comparison (``bytes`` never equals ``str`` in
+    Python) -- the same latent bug in both, silently defaulting to the
+    safe, fail-closed direction (never a false "safe"), but real and
+    now fixed at its one real source rather than at each comparison
+    site.
     """
+    return value.decode("utf-8") if isinstance(value, bytes) else value
+
+
+class _VerifiedStatus(NamedTuple):
+    """One real, verified read of SYSTEM_STATUS -- shared by every real reader below.
+
+    ``ok=False`` means "treat this as failed/unsafe/unknown" (Redis
+    unreachable, an epoch rollback, or an invalid signature) -- the
+    exact same fail-closed conditions :func:`is_system_safe` has always
+    checked, now factored out so :func:`auto_recover_from_data_loss`
+    shares them exactly rather than re-deriving a second, possibly
+    inconsistent copy.
+    """
+
+    status: str | None
+    epoch: int
+    ok: bool
+
+
+async def _read_and_verify_status() -> _VerifiedStatus:
+    """Real, shared read + signature/epoch verification of SYSTEM_STATUS. See :class:`_VerifiedStatus`."""
     global _min_accepted_epoch
     try:
         client = await asyncio.wait_for(RedisClient.get_instance(), timeout=_CHECK_TIMEOUT_SECONDS)
@@ -141,10 +185,13 @@ async def is_system_safe() -> bool:
             error_type=type(exc).__name__,
             error=str(exc),
         )
-        return False
+        return _VerifiedStatus(None, 0, False)
+
+    status = _decode_redis_str(status)
+    raw_epoch = _decode_redis_str(raw_epoch)
 
     if status is None:
-        return True
+        return _VerifiedStatus(None, 0, True)
 
     epoch = int(raw_epoch) if raw_epoch is not None else 0
     if epoch < _min_accepted_epoch:
@@ -152,17 +199,39 @@ async def is_system_safe() -> bool:
             "kill_switch_epoch_rollback_detected_failing_closed",
             status=status, observed_epoch=epoch, min_accepted_epoch=_min_accepted_epoch,
         )
-        return False
+        return _VerifiedStatus(status, epoch, False)
 
     if not verify(f"{status}:{epoch}", signature):
         _log.critical(
             "kill_switch_signature_invalid_failing_closed",
             status=status, epoch=epoch,
         )
-        return False
+        return _VerifiedStatus(status, epoch, False)
 
     _min_accepted_epoch = max(_min_accepted_epoch, epoch)
-    return bool(status == STATUS_SAFE)
+    return _VerifiedStatus(status, epoch, True)
+
+
+async def is_system_safe() -> bool:
+    """Check Redis's ``SYSTEM_STATUS`` flag. Fails closed on any doubt.
+
+    Returns:
+        ``False`` (block) if Redis is unreachable, the check times out,
+        ``SYSTEM_STATUS`` is ``"PANIC"`` or ``"LATCHED_DATA"`` (see that
+        status's own docstring -- still a real halt, only *how it may be
+        lifted* differs), a value is present but its companion
+        :data:`SYSTEM_STATUS_SIG_KEY` is missing/does not match the
+        value+epoch it claims to authenticate, or the epoch itself is
+        older than one this process has already observed (a replay --
+        see :data:`SYSTEM_STATUS_EPOCH_KEY`'s own docstring for what
+        this does and does not defend against). ``True`` (safe) only if
+        the key is absent, or present, signed, fresh, and equal to
+        ``"SAFE"``.
+    """
+    result = await _read_and_verify_status()
+    if not result.ok:
+        return False
+    return result.status is None or result.status == STATUS_SAFE
 
 
 async def _set_system_status(status: str) -> None:
@@ -206,12 +275,120 @@ async def trip_kill_switch(reason: str) -> None:
 async def reset_kill_switch() -> None:
     """Set ``SYSTEM_STATUS=SAFE`` (signed, epoch-bound) in Redis. An explicit, deliberate operator action.
 
-    No code path in this system calls this automatically -- recovering
-    from a global panic is a decision for a human to make on purpose,
-    never something an agent decides for itself.
+    No code path in this system calls this automatically to clear
+    ``PANIC`` -- recovering from a genuine systemic panic is a decision
+    for a human to make on purpose, never something an agent decides
+    for itself. :data:`STATUS_LATCHED_DATA` is the one, narrower
+    exception -- see :func:`auto_recover_from_data_loss`.
     """
     _log.warning("GLOBAL_KILL_SWITCH_RESET")
     await _set_system_status(STATUS_SAFE)
+
+
+async def latch_data_loss(reason: str) -> None:
+    """Set ``SYSTEM_STATUS=LATCHED_DATA`` (signed, epoch-bound) -- a real halt, but auto-recoverable.
+
+    Reserved for one specific systemic condition: total market-data feed
+    loss (see :meth:`~src.agents.supervisor.agent.
+    XgboostSignalAgent._check_kill_switch`). Unlike :func:`trip_kill_switch`'s
+    ``PANIC`` (a flash crash, a compromised credential, a financial call
+    that exhausted its retry budget -- conditions no amount of "the feed
+    came back" can certify safe again), a feed loss is exactly the kind
+    of condition a real, continuous, sufficiently long window of fresh
+    data *can* honestly certify as resolved -- see
+    :func:`auto_recover_from_data_loss`. :func:`is_system_safe` still
+    returns ``False`` for this status: trading stays blocked exactly as
+    it would under ``PANIC``. Only *what may lift it* differs.
+
+    Args:
+        reason: Human-readable cause, logged at CRITICAL.
+    """
+    _log.critical("GLOBAL_KILL_SWITCH_LATCHED_DATA", reason=reason)
+    try:
+        await asyncio.wait_for(_set_system_status(STATUS_LATCHED_DATA), timeout=_TRIP_TIMEOUT_SECONDS)
+    except (RedisUnavailableError, asyncio.TimeoutError) as exc:
+        _log.error(
+            "kill_switch_latch_could_not_persist_to_redis",
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
+
+
+async def auto_recover_from_data_loss() -> bool:
+    """The one automatic recovery path this module has -- and only ever from ``LATCHED_DATA``, never ``PANIC``.
+
+    Intended caller: :meth:`~src.agents.supervisor.agent.
+    XgboostSignalAgent._check_kill_switch`, once its own probation
+    window of continuous fresh ticks (measured from the ticks' own
+    timestamps, not wall-clock polling time) has fully elapsed. A real
+    no-op -- never a forced transition -- whenever the verified current
+    status is not exactly ``LATCHED_DATA``: already ``SAFE``, still
+    ``PANIC`` (a flash crash or an exhausted retry budget needs a real
+    human decision via :func:`reset_kill_switch`/
+    :func:`manual_authenticated_reset`, unchanged by this function's
+    existence), or unreadable all return ``False`` and touch nothing.
+
+    Returns:
+        ``True`` if a real ``LATCHED_DATA -> SAFE`` transition was just
+        written; ``False`` otherwise.
+    """
+    result = await _read_and_verify_status()
+    if not result.ok or result.status != STATUS_LATCHED_DATA:
+        return False
+    _log.warning(
+        "GLOBAL_KILL_SWITCH_AUTO_RECOVERED",
+        detail="Continuous fresh market data observed through the full probation window.",
+    )
+    await _set_system_status(STATUS_SAFE)
+    return True
+
+
+def _reset_signing_payload(timestamp: float) -> str:
+    return f"RESET:{timestamp}"
+
+
+async def manual_authenticated_reset(timestamp: float, signature: str) -> bool:
+    """Reset ``SYSTEM_STATUS`` to ``SAFE`` from any state, authenticated by a fresh HMAC-SHA256 signature.
+
+    A second, stronger real reset path alongside :func:`reset_kill_switch`.
+    That one's only real gate is "called from an already-authenticated
+    dashboard session" (see ``src/dashboard/ems_pages/red_phone.py``);
+    this one instead proves possession of ``VAULT_MASTER_KEY`` itself --
+    for a caller that is *not* an interactive dashboard session (an
+    on-call script, an incident-response API). Reuses
+    :func:`~core.message_integrity.verify` unchanged (``hmac.
+    compare_digest`` under a ``hashlib.sha256`` HMAC) -- the same real
+    primitive every other signed value in this project already trusts,
+    not a second, parallel signing scheme.
+
+    Args:
+        timestamp: Real Unix epoch seconds the caller signed at.
+        signature: Hex HMAC-SHA256 of ``f"RESET:{timestamp}"`` under
+            ``VAULT_MASTER_KEY`` (see :func:`~core.message_integrity.sign`).
+
+    Returns:
+        ``True`` if the reset was applied. ``False`` -- fails closed, no
+        exception -- if ``timestamp`` is more than
+        :data:`_RESET_REPLAY_TOLERANCE_SECONDS` away from the real
+        current time (the anti-replay guard: a captured
+        ``(timestamp, signature)`` pair stops verifying the moment it
+        goes stale, regardless of how long it is held before being
+        replayed), or if the signature itself does not verify.
+    """
+    now = time.time()
+    if abs(now - timestamp) > _RESET_REPLAY_TOLERANCE_SECONDS:
+        _log.critical(
+            "kill_switch_manual_reset_rejected_stale_timestamp",
+            provided_timestamp=timestamp, now=now, tolerance_seconds=_RESET_REPLAY_TOLERANCE_SECONDS,
+        )
+        return False
+    if not verify(_reset_signing_payload(timestamp), signature):
+        _log.critical("kill_switch_manual_reset_rejected_invalid_signature", provided_timestamp=timestamp)
+        return False
+
+    _log.warning("GLOBAL_KILL_SWITCH_MANUAL_AUTHENTICATED_RESET", timestamp=timestamp)
+    await _set_system_status(STATUS_SAFE)
+    return True
 
 
 def requires_system_active(func: Callable[_P, Awaitable[_R]]) -> Callable[_P, Awaitable[_R]]:

@@ -21,14 +21,33 @@ arbitrated consensus between both agents' signals.
 Safety-by-default carries over even though execution moved out: this
 agent's local Kill Switch still exists, but since it no longer holds a
 trading client of its own to cancel orders on, tripping it escalates to
-the *global* Kill Switch (:func:`core.security.trip_kill_switch`) --
-stopping :class:`ExecutionAgent` from acting on *anyone's* signal. **Only
-systemic threats trip it** (flash crash; total loss of the market-data feed,
-i.e. no fresh reading for ``feed_loss_grace_seconds``). Everything else
-(an isolated Redis read failure, a torn/invalid signature, a latency spike,
-a spread anomaly, a briefly stale reading) is a *soft veto*: a warning, no
-signal this cycle, and the loop keeps ingesting -- a 1% transient read
-failure used to latch the global switch on within ~15 minutes.
+the *global* Kill Switch -- stopping :class:`ExecutionAgent` from acting
+on *anyone's* signal. **Only systemic threats trip it**, and, since a
+real 24h Chaos Shadow Run (2026-09-24), not all of them the same way:
+
+- **Flash crash** (:class:`~core.circuit_breaker.MarketAnomalyDetector`)
+  still escalates to :func:`core.security.trip_kill_switch`'s real
+  ``PANIC`` -- a condition serious enough that only a real human,
+  via :func:`~core.security.reset_kill_switch`/:func:`~core.security.
+  manual_authenticated_reset`, may clear it.
+- **Total market-data feed loss** (no fresh reading for
+  ``feed_loss_grace_seconds``) now escalates to
+  :func:`core.security.latch_data_loss`'s real, distinct
+  ``LATCHED_DATA`` instead -- a real halt (trading stays blocked exactly
+  like ``PANIC``), but one this agent can itself lift, automatically,
+  once a real, continuous window of fresh ticks (measured from the
+  ticks' own timestamps, ``data_loss_probation_seconds``, default 60s)
+  has elapsed -- see :meth:`_track_data_loss_probation` and
+  :func:`core.security.auto_recover_from_data_loss`. The real gap this
+  closes: a single 30s WebSocket blip used to latch the *entire* system
+  on ``PANIC`` -- indistinguishable from a flash crash -- for as long as
+  a human took to notice and manually reset it.
+
+Everything else (an isolated Redis read failure, a torn/invalid signature,
+a latency spike, a spread anomaly, a briefly stale reading) is still a
+*soft veto*: a warning, no signal this cycle, and the loop keeps ingesting
+-- a 1% transient read failure used to latch the global switch on within
+~15 minutes before the 2026-09-20 fix that introduced soft vetoes at all.
 
 **Asset-class note** (carried over, still true): this agent evaluates
 OANDA forex instruments (e.g. ``"EUR_USD"``), but the market data it
@@ -67,7 +86,7 @@ from core.schemas import (
     SentimentSignal,
     TradingSignal,
 )
-from core.security import trip_kill_switch
+from core.security import auto_recover_from_data_loss, latch_data_loss, trip_kill_switch
 from core.stale_check import staleness_reason
 from src.agents.supervisor.feature_confirmation import apply_feature_confirmation
 from src.agents.supervisor.ml_engine import SupervisorMLModel
@@ -162,6 +181,7 @@ class XgboostSignalAgent(BaseAgent):
         flash_crash_max_move_fraction: float = 0.05,
         max_market_metrics_age_ms: float = 500.0,
         feed_loss_grace_seconds: float = 30.0,
+        data_loss_probation_seconds: float = 60.0,
         model_path: str | Path | None = None,
         scaler_path: str | Path | None = None,
         settings: AppSettings | None = None,
@@ -204,9 +224,17 @@ class XgboostSignalAgent(BaseAgent):
                 ``flash_crash_window_seconds`` that trips it.
             max_market_metrics_age_ms: A reading older than this is
                 *stale*: soft veto for the cycle (see :mod:`core.stale_check`).
-            feed_loss_grace_seconds: Systemic trigger #2: trip the global
-                Kill Switch only once no *fresh* reading has been seen for
+            feed_loss_grace_seconds: Systemic trigger #2: latch the global
+                Kill Switch's ``LATCHED_DATA`` status (see module
+                docstring) only once no *fresh* reading has been seen for
                 this long (total feed loss, not a blip).
+            data_loss_probation_seconds: How long a *continuous* streak
+                of fresh ticks (measured from the ticks' own timestamps)
+                must hold before this agent attempts to automatically
+                lift a real ``LATCHED_DATA`` halt -- see
+                :meth:`_track_data_loss_probation`. Never applies to
+                ``PANIC`` (flash crash) -- that still requires a real
+                human reset regardless of this value.
             model_path: Passed through to :class:`SupervisorMLModel`; see
                 its docstring for the untrained-skeleton fallback.
             scaler_path: Passed through to :class:`SupervisorMLModel`
@@ -263,6 +291,15 @@ class XgboostSignalAgent(BaseAgent):
         self._feed_loss_grace_seconds = feed_loss_grace_seconds
         # None until the first fresh reading: a cold start (feed not up yet) is not a feed *loss*.
         self._last_fresh_metrics_at: float | None = None
+
+        # "Resilient Kill Switch" (2026-09-24): real probation tracking for auto-recovering a
+        # LATCHED_DATA halt -- see _track_data_loss_probation. _fresh_streak_started_at is a real
+        # tick timestamp (epoch seconds, from MarketMetrics.timestamp), not time.monotonic() -- the
+        # probation window is about how long the *data itself* has been continuously fresh, not how
+        # long this process happened to be polling.
+        self._data_loss_probation_seconds = data_loss_probation_seconds
+        self._fresh_streak_started_at: float | None = None
+        self._probation_recovery_attempted_for_streak = False
 
     # -- BaseAgent overrides -----------------------------------------
 
@@ -510,12 +547,15 @@ class XgboostSignalAgent(BaseAgent):
     # -- Local Kill Switch -----------------------------------------------
 
     async def _check_kill_switch(self, state: SignalState) -> list[str]:
-        """Trip the GLOBAL Kill Switch on a systemic threat; otherwise return this cycle's soft-veto reasons.
+        """Escalate a systemic threat to the GLOBAL Kill Switch; otherwise return this cycle's soft-veto reasons.
 
-        Systemic (trips, then raises): a flash crash, or total loss of the market-data feed -- no
-        *fresh* :class:`~core.schemas.MarketMetrics` for ``feed_loss_grace_seconds`` (a cold start
-        that never saw a fresh reading is not a loss). Soft veto (returned, nothing tripped): Redis
-        latency over threshold, spread anomaly, a stale reading that is not yet a lost feed.
+        Systemic (raises): a flash crash (:func:`~core.security.trip_kill_switch`, real ``PANIC``,
+        human-reset-only), or total loss of the market-data feed -- no *fresh*
+        :class:`~core.schemas.MarketMetrics` for ``feed_loss_grace_seconds`` (a cold start that
+        never saw a fresh reading is not a loss) -- (:func:`~core.security.latch_data_loss`, real
+        ``LATCHED_DATA``, auto-recoverable -- see :meth:`_track_data_loss_probation`). Soft veto
+        (returned, nothing tripped): Redis latency over threshold, spread anomaly, a stale reading
+        that is not yet a lost feed.
 
         Args:
             state: This cycle's fetched state.
@@ -524,9 +564,10 @@ class XgboostSignalAgent(BaseAgent):
             Human-readable soft-veto reasons; empty when the cycle may proceed.
 
         Raises:
-            EmergencyStopError: On a systemic threat, after the global Kill Switch has been tripped.
+            EmergencyStopError: On a systemic threat, after the appropriate global Kill Switch
+                status has already been written.
         """
-        systemic: list[str] = []
+        fatal_reasons: list[str] = []
         vetoes: list[str] = []
         now = time.monotonic()
 
@@ -551,7 +592,7 @@ class XgboostSignalAgent(BaseAgent):
 
             price_move_reason = self._anomaly_detector.check(state.market_metrics.mid_price)
             if price_move_reason is not None:
-                systemic.append(price_move_reason)
+                fatal_reasons.append(price_move_reason)
 
             stale_reason = staleness_reason(state.market_metrics.timestamp, max_age_ms=self._max_market_metrics_age_ms)
             if stale_reason is None:
@@ -561,17 +602,81 @@ class XgboostSignalAgent(BaseAgent):
 
         if fresh:
             self._last_fresh_metrics_at = now
-        elif self._last_fresh_metrics_at is not None and now - self._last_fresh_metrics_at >= self._feed_loss_grace_seconds:
-            systemic.append(
-                f"market data feed lost: no fresh MarketMetrics for {now - self._last_fresh_metrics_at:.1f}s "
-                f"(grace {self._feed_loss_grace_seconds:.1f}s)"
-            )
-            self._last_fresh_metrics_at = now  # re-arm: at most one trip per grace period while the loss persists
+            assert state.market_metrics is not None  # fresh=True is only ever set inside the block above
+            await self._track_data_loss_probation(state.market_metrics.timestamp.timestamp())
+        else:
+            self._fresh_streak_started_at = None
+            self._probation_recovery_attempted_for_streak = False
+            if self._last_fresh_metrics_at is not None and now - self._last_fresh_metrics_at >= self._feed_loss_grace_seconds:
+                reason = (
+                    f"market data feed lost: no fresh MarketMetrics for "
+                    f"{now - self._last_fresh_metrics_at:.1f}s (grace {self._feed_loss_grace_seconds:.1f}s)"
+                )
+                self._last_fresh_metrics_at = now  # re-arm: at most one latch per grace period while the loss persists
+                await self._trigger_data_loss_latch(reason)
+                raise EmergencyStopError(reason)
 
-        if systemic:
-            await self._trigger_kill_switch(systemic)
-            raise EmergencyStopError("; ".join(systemic))
+        if fatal_reasons:
+            await self._trigger_kill_switch(fatal_reasons)
+            raise EmergencyStopError("; ".join(fatal_reasons))
         return vetoes
+
+    async def _track_data_loss_probation(self, tick_timestamp: float) -> None:
+        """Advance this cycle's continuous-fresh-tick streak; auto-recover a real ``LATCHED_DATA`` halt once it holds long enough.
+
+        Called on every fresh reading (see :meth:`_check_kill_switch`).
+        ``tick_timestamp`` is the real tick's own embedded timestamp
+        (epoch seconds), not wall-clock polling time -- a probation
+        window measured against *when the data itself says it is* stays
+        correct even if this agent's own loop briefly stalls.
+
+        At most one real :func:`~core.security.auto_recover_from_data_loss`
+        call per streak: once the probation window has been checked for
+        the current unbroken streak, this does nothing further until the
+        streak resets (a fresh break, see :meth:`_check_kill_switch`) --
+        never a real Redis round-trip on every single healthy cycle.
+
+        Args:
+            tick_timestamp: The current cycle's fresh
+                :class:`~core.schemas.MarketMetrics`' own ``timestamp``,
+                as epoch seconds.
+        """
+        if self._fresh_streak_started_at is None:
+            self._fresh_streak_started_at = tick_timestamp
+            self._probation_recovery_attempted_for_streak = False
+            return
+        if self._probation_recovery_attempted_for_streak:
+            return
+        if tick_timestamp - self._fresh_streak_started_at >= self._data_loss_probation_seconds:
+            self._probation_recovery_attempted_for_streak = True
+            recovered = await auto_recover_from_data_loss()
+            if recovered:
+                self._log.warning(
+                    "supervisor_agent_data_loss_probation_cleared",
+                    agent_id=self.agent_id,
+                    symbol=self._symbol,
+                    probation_seconds=self._data_loss_probation_seconds,
+                )
+
+    async def _trigger_data_loss_latch(self, reason: str) -> None:
+        """Enter emergency mode for a total market-data feed loss: latch (not ``PANIC``-trip) the global Kill Switch.
+
+        See module docstring / :func:`~core.security.latch_data_loss`'s
+        own docstring for why this is deliberately a different,
+        auto-recoverable status than :meth:`_trigger_kill_switch`'s
+        ``PANIC``.
+
+        Args:
+            reason: Human-readable description of the feed-loss condition.
+        """
+        self._emergency_mode = True
+        self._log.critical(
+            "LOCAL_KILL_SWITCH_LATCHED_DATA",
+            agent_id=self.agent_id,
+            symbol=self._symbol,
+            reason=reason,
+        )
+        await latch_data_loss(f"{self.agent_id} local Kill Switch latched (data loss) for {self._symbol}: {reason}")
 
     async def _trigger_kill_switch(self, reasons: list[str]) -> None:
         """Enter emergency mode: log critical, trip the global Kill Switch.
