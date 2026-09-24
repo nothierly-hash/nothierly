@@ -21,6 +21,10 @@ structlog>=24.1.0,<25.0.0
 # the main open-source `ccxt` package since v4.0 -- no separate/paid
 # package needed. Accessed as `import ccxt.pro`.
 ccxt>=4.3.0,<5.0.0
+# Already an installed transitive dependency of ccxt.pro's own WebSocket stack --
+# now a direct one too: core/network/resilient_ws.py uses websockets.connect/
+# websockets.exceptions directly for its own, exchange-agnostic reconnect logic.
+websockets>=13.0,<16.0.0
 # Interactive Brokers connectivity (src/execution/broker_gateway.py's
 # IBKRBrokerAdapter) -- ib_async is the actively-maintained fork of the
 # archived ib_insync, native asyncio support (connectAsync/qualifyContractsAsync/
