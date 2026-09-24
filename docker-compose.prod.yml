@@ -64,12 +64,71 @@ services:
       --save 60 1
       --loglevel warning
     networks: [internal_core]
+    # Loopback-only (127.0.0.1:, not 0.0.0.0:) -- reachable from the Docker host's own network
+    # namespace only. The one real reason this needs publishing at all: alpha-engine below runs on
+    # network_mode: host (real HFT ZMQ/TCP latency requirement) and therefore cannot resolve this
+    # service by Compose's embedded DNS the way every other, bridge-networked container still does
+    # -- host networking bypasses that resolver entirely. This does not widen this service's real
+    # exposure beyond the Docker host itself: still unreachable from outside it, still unreachable
+    # from another host on the same LAN, exactly as internal_core's own isolation already intended.
+    ports:
+      - "127.0.0.1:6379:6379"
 
   timescaledb:
     networks: [internal_core]
 
   nothierly-agents:
     networks: [internal_core]
+    # Same real reason as redis-broker's own ports: above -- host-networked alpha-engine can't reach
+    # this container by Compose DNS, only by the Docker host's own loopback address. This container
+    # already binds these two ports on 0.0.0.0 internally (see docker-compose.yml's own
+    # ZMQ_BROKER_BIND_*_ADDRESS comment) -- publishing them loopback-only does not create a new bind,
+    # only a new, narrowly-scoped path to reach the one that already exists.
+    ports:
+      - "127.0.0.1:5559:5559"
+      - "127.0.0.1:5560:5560"
+
+  # --- Real, targeted latency hardening for the one real HFT-sensitive process (2026-09-24 audit
+  # finding: bare-metal Windows path bugs already fixed in core/watchdog.py separately -- this is
+  # the Linux-deployment-only hardening half of that same finding, scoped narrowly rather than
+  # applied fleet-wide).
+  #
+  # **network_mode: host, not networks: [internal_core]** -- Compose forbids a service from
+  # declaring both; host networking gives this one container the Docker host's real network stack
+  # directly (no bridge/NAT hop), the real latency win this exists for. Real, disclosed cost: it
+  # loses Compose's embedded DNS the same way every other container here still has it, so it can no
+  # longer resolve `redis-broker`/`nothierly-agents` by service name -- the environment overrides
+  # below point it at the Docker host's own loopback interface instead, which only resolves because
+  # of the two `ports:` additions above. Every other service in this stack (dashboard, gateway,
+  # timescaledb, ...) is deliberately left on internal_core/public_net, unchanged -- this is not a
+  # fleet-wide network-isolation rollback, only this one container trades it for latency.
+  #
+  # **ulimits.nofile: 65536, not this chapter's own literal "massive async sockets" framing taken
+  # further** -- a real, generous ceiling for one process's own async event loop (market-data
+  # WebSocket, ZMQ pub/sub, Redis, OANDA/Binance REST) well above the low thousands it actually
+  # holds open at once, not sized against a claim this codebase has no evidence for.
+  #
+  # **No `/tmp` or `/logs` volume mount here, despite this chapter's own literal ask, and why**:
+  # core.watchdog.SystemWatchdog's own heartbeat file is checked "entirely inside this container's
+  # own filesystem, no volume mount needed" (see docker-compose.yml's own healthcheck comment on
+  # this exact service) -- bind-mounting /tmp would make a stale heartbeat from a crashed previous
+  # run survive a container recreation and pass the very first healthcheck before the new process
+  # has written anything, an active regression, not a hardening. /logs is inert today: this
+  # project's own scripts/run_alpha_engine.py calls core.logger.configure_logging(log_dir=None) --
+  # stdout-only, captured by this file's own x-default-logging-prod anchor -- so nothing would ever
+  # write to a mounted host directory. Wiring real file-based logging for this one agent is a real,
+  # separate, larger change (touching application code, not just this deployment manifest) -- not
+  # made here unasked.
+  alpha-engine:
+    network_mode: host
+    environment:
+      REDIS_HOST: 127.0.0.1
+      ZMQ_BROKER_FRONTEND_ADDRESS: tcp://127.0.0.1:5559
+      ZMQ_BROKER_BACKEND_ADDRESS: tcp://127.0.0.1:5560
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
 
   nothierly-political-agent:
     networks: [internal_core]
