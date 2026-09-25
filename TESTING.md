@@ -90,3 +90,30 @@ This file does not contain the Swiss National Bank shock. The SNB announced the 
 Reading it: the default correctly does not trip, because there is no crash in this window. Set against the EUR/USD hour, no single low threshold fits both: 0.4% caught the EUR/USD burst and says nothing here, while 0.3% and 0.2% trip here on moves that are not crashes, which is the false-positive cost of a low threshold. Calibration has to be per instrument and needs far more data than two hours.
 
 Not yet run: the shock window itself (about 09:00-10:30 UTC the same day). It is the check of whether the default 5% threshold trips on a real crash, and its result is unknown until it is run and recorded here.
+
+### Third dataset: GBP/USD, 2016-10-07 12:00-13:00 UTC
+
+27,256 bid-only ticks, replayed with `--symbol GBP_USD` and an assumed 1-pip spread (0.0001). Price 1.23668 to 1.23849 (+0.15%), range 1.23117 to 1.239. The largest 60-second move is 0.425% (12:31:00 UTC), and the tick rate steps up at 12:30 UTC from about 410 to 590-650 per minute, consistent with a scheduled release. The sterling flash crash of that day happened earlier, in Asian trading hours, so it is not in this file.
+
+- **Bus delivery.** 27,256 published, 27,256 received, in file order, 0 value differences against the CSV (one run, `--speed 0`, local machine). This is the largest replay so far.
+- **Flash-crash detector** (driven offline with the file's timestamps): 5.0% and 0.5% never trip; 0.4% trips on 3 ticks from 12:31:00; 0.3% on 262 ticks from 12:30:29; 0.2% on 948 ticks from 12:13:32, which is 17 minutes before the 12:30 burst.
+
+### Fourth dataset: USD/JPY, 2019-01-03 12:00-13:00 UTC
+
+3,700 bid-only ticks, replayed with `--symbol USD_JPY`. For a yen pair 1 pip is 0.01, so the assumed spread was `--assumed-spread 0.01` (the real spread is unknown). Price 107.55 to 107.662 (+0.10%), largest 60-second move 0.085% (12:04:13 UTC). A quiet hour: the yen flash crash of that day happened earlier, in Asian trading hours, so it is not in this file.
+
+- **Bus delivery.** 3,700 published, 3,700 received, in file order, 0 value differences against the CSV.
+- **Flash-crash detector:** none of 5.0%, 0.5%, 0.4%, 0.3% or 0.2% trips.
+
+### Comparison of the four hours
+
+| Dataset | Ticks | Largest 60 s move | Ticks in breach at 0.4% | Ticks in breach at 0.2% |
+|---|---|---|---|---|
+| EUR/USD 2024-06-07 | 12,194 | 0.49% | 646 (from 12:30:07) | 751 (from 12:30:03) |
+| EUR/CHF 2015-01-15 | 5,924 | 0.33% | 0 | 191 (from 12:01:13) |
+| GBP/USD 2016-10-07 | 27,256 | 0.43% | 3 (from 12:31:00) | 948 (from 12:13:32) |
+| USD/JPY 2019-01-03 | 3,700 | 0.085% | 0 | 0 |
+
+The default 5%/60 s threshold trips on none of them, as expected, since none is a crash. A low threshold trips in the volatile hours, including once well before the 12:30 burst (GBP/USD at 0.2%), and not at all in the quiet yen hour, so the right value depends on each instrument's volatility regime. This supports a per-instrument threshold, calibrated on far more data than four hours, and does not establish any particular value.
+
+Not yet run: the true-crash windows, which are the only data that would show whether the default 5% threshold trips on a real crash: the SNB shock (2015-01-15, about 09:00-10:30 UTC), the sterling flash crash (2016-10-07, Asian trading hours) and the yen flash crash (2019-01-03, Asian trading hours). Their results are unknown until they are run and recorded here.
