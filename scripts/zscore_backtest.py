@@ -16,9 +16,10 @@ Fill model, all in data time:
 
 - A signal computed on quote i is filled on the first later quote whose timestamp is at least
   ``signal_ts + --latency-ms``. A signal is never filled on the quote that produced it.
-- BUY fills at that quote's ask and SELL at its bid. With ``--price-is bid`` (a bid-only file) the ask is
+- BUY fills at that quote's ask and SELL at its bid. With a real ask column (``--ask-column``, price column
+  = real bid) the spread is the file's own. Otherwise: with ``--price-is bid`` (a bid-only file) the ask is
   ``bid + --assumed-spread``; with ``--price-is mid`` (e.g. trade prints) the bid and ask are
-  ``price -/+ spread / 2``. The spread is an assumption, never measured.
+  ``price -/+ spread / 2``, and that spread is an assumption, never measured.
 - Commission: ``--commission-per-lot`` for every fill (entry and exit) per ``--lot-size`` units traded.
 - ``Net_PnL`` = gross PnL x ``--quote-to-usd`` - commissions. It is in USD only if the quote currency is
   USD or a rate is supplied.
@@ -121,6 +122,7 @@ def iter_quotes(
     timestamp_column: str = "timestamp",
     price_column: str = "price",
     timestamp_unit: str = "iso",
+    ask_column: str | None = None,
 ) -> Iterator[Quote]:
     """Stream quotes from a file, in file order. Raises ``ValueError`` with the line number on a bad row."""
     with _open_text(path) as handle:
@@ -136,17 +138,20 @@ def iter_quotes(
         reader = csv.DictReader(handle)
         header = {name.strip().lower(): name for name in (reader.fieldnames or [])}
         ts_key, price_key = timestamp_column.strip().lower(), price_column.strip().lower()
-        missing = [name for name in (ts_key, price_key) if name not in header]
+        ask_key = ask_column.strip().lower() if ask_column else None
+        missing = [name for name in (ts_key, price_key, ask_key) if name and name not in header]
         if missing:
             raise ValueError(f"{path}: missing column(s): {', '.join(missing)}")
         for line_number, row in enumerate(reader, start=2):
             try:
-                yield make_quote(
-                    float(row[header[price_key]]),
-                    parse_timestamp(row[header[ts_key]], timestamp_unit),
-                    price_is=price_is,
-                    spread=spread,
-                )
+                timestamp = parse_timestamp(row[header[ts_key]], timestamp_unit)
+                if ask_key is None:
+                    yield make_quote(float(row[header[price_key]]), timestamp, price_is=price_is, spread=spread)
+                else:
+                    bid, ask = float(row[header[price_key]]), float(row[header[ask_key]])
+                    if bid <= 0 or ask < bid:
+                        raise ValueError(f"invalid or crossed quote (bid {bid}, ask {ask})")
+                    yield Quote(timestamp, bid, ask)
             except (ValueError, TypeError) as exc:
                 raise ValueError(f"{path}:{line_number}: {exc}") from exc
 
@@ -373,7 +378,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--price-column", default="price")
     parser.add_argument("--timestamp-unit", choices=("iso", "s", "ms", "us"), default="iso")
     parser.add_argument("--price-is", choices=("bid", "mid"), default=None, help="What the price column is (default: bid for csv, mid for binance-trades).")
-    parser.add_argument("--assumed-spread", type=float, required=True, help="Assumed spread in price units. An assumption, not a measurement.")
+    parser.add_argument("--ask-column", default=None, help="csv format: a real ask column. The price column is then the real bid, and no spread is assumed.")
+    parser.add_argument("--assumed-spread", type=float, default=None, help="Assumed spread in price units (required unless --ask-column is given). An assumption, not a measurement.")
     parser.add_argument("--size", type=float, default=1.0, help="Units per trade (default 1.0).")
     parser.add_argument("--lot-size", type=float, default=1.0, help="Units in a standard lot for commissions (default 1.0; FX: 100000).")
     parser.add_argument("--latency-ms", type=float, default=5.0)
@@ -391,17 +397,26 @@ def main() -> int:
     if not args.data.exists():
         print(f"data file not found: {args.data}")
         return 2
-    price_is = args.price_is or ("mid" if args.format == "binance-trades" else "bid")
+    real_book = args.ask_column is not None
+    if args.format == "binance-trades" and real_book:
+        print("--ask-column applies to --format csv only")
+        return 2
+    if not real_book and args.assumed_spread is None:
+        print("--assumed-spread is required unless the file has a real ask column (--ask-column)")
+        return 2
+    price_is = "bid_ask" if real_book else (args.price_is or ("mid" if args.format == "binance-trades" else "bid"))
     timestamp_unit = "ms" if args.format == "binance-trades" else args.timestamp_unit
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     meta = {
-        "Run_ID": run_id, "Data_File": args.data.name, "Assumed_Spread": repr(args.assumed_spread), "Price_Is": price_is,
+        "Run_ID": run_id, "Data_File": args.data.name,
+        "Assumed_Spread": "none (real bid/ask)" if real_book else repr(args.assumed_spread), "Price_Is": price_is,
         "Latency_Model_ms": repr(args.latency_ms), "Commission_Per_Lot": repr(args.commission_per_lot),
         "Quote_To_USD": repr(args.quote_to_usd),
     }
     quotes = iter_quotes(
-        args.data, fmt=args.format, price_is=price_is, spread=args.assumed_spread,
+        args.data, fmt=args.format, price_is=price_is, spread=args.assumed_spread or 0.0,
         timestamp_column=args.timestamp_column, price_column=args.price_column, timestamp_unit=timestamp_unit,
+        ask_column=args.ask_column,
     )
     logger = TradeLogger(args.output, run_meta=meta)
     try:
@@ -422,7 +437,8 @@ def main() -> int:
         if stats.fractional_second_quotes / stats.quotes < 0.01:
             print(f"WARNING: timestamps are (nearly) whole seconds, so the {args.latency_ms:g} ms latency cannot be resolved; "
                   "fills happen on the first quote of a later second. See Latency_Slippage_ms for the delay actually applied.")
-    print(f"assumptions: spread {args.assumed_spread} ({price_is} prices), latency {args.latency_ms:g} ms, {args.commission_per_lot} USD/lot/fill, "
+    spread_note = "spread from the file's real bid/ask" if real_book else f"spread {args.assumed_spread} ({price_is} prices)"
+    print(f"assumptions: {spread_note}, latency {args.latency_ms:g} ms, {args.commission_per_lot} USD/lot/fill, "
           f"size {args.size} of lot {args.lot_size}. Appended to {args.output}.")
     return 0
 

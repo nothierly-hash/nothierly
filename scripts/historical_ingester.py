@@ -15,10 +15,13 @@ What it is not:
   at the high-water mark, so at ``--speed 0`` a slow consumer can miss ticks silently.
 - **Which checks fire depends on what is subscribed.** This script only feeds the bus.
 
-CSV columns (case-insensitive; rename with ``--timestamp-column`` / ``--bid-column`` / ``--ask-column``):
-``bid`` and ``ask``, ``bid_vol`` and ``ask_vol`` (optional), ``symbol`` (optional, else ``--symbol``,
-which must match the consumer's configured instrument), and ``timestamp`` (ISO-8601 or epoch seconds;
-required only when ``--speed`` > 0).
+CSV columns (case-insensitive; rename with ``--timestamp-column`` / ``--bid-column`` / ``--ask-column`` /
+``--bid-volume-column`` / ``--ask-volume-column``): ``bid`` and ``ask``, ``bid_vol`` and ``ask_vol``
+(optional), ``symbol`` (optional, else ``--symbol``, which must match the consumer's configured
+instrument), and ``timestamp`` (required only when ``--speed`` > 0; ISO-8601 or epoch seconds by default,
+or force the unit with ``--timestamp-unit iso|s|ms|us``, e.g. ``ms`` for Binance exports). A ``.zip`` is
+read directly (its first member). With a real ask and both quantities, spread, imbalance and liquidity
+are the file's own, not assumed.
 
 Bid-only files (e.g. a Dukascopy BID export) have no ask, hence no real spread or mid. Pass
 ``--assumed-spread``: an explicit operator assumption applied to every tick (ask = bid + spread, mid =
@@ -49,9 +52,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import argparse
 import asyncio
 import csv
+import io
+import zipfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Final
+from typing import Final, TextIO
 
 import zmq.asyncio
 
@@ -115,11 +122,31 @@ class ReplayStats:
             self.first_rejections.append(f"line {line_number}: {reason}")
 
 
-def _parse_timestamp(raw: str) -> float:
-    try:
-        return float(raw)
-    except ValueError:
-        return datetime.fromisoformat(raw.strip().replace("Z", "+00:00")).timestamp()
+_TIME_UNIT_DIVISORS: Final[dict[str, float]] = {"s": 1.0, "ms": 1e3, "us": 1e6}
+
+
+def _parse_timestamp(raw: str, unit: str = "auto") -> float:
+    """Epoch seconds. ``auto`` = a number is seconds, anything else is ISO-8601; or force ``iso``/``s``/``ms``/``us``."""
+    if unit in _TIME_UNIT_DIVISORS:
+        return float(raw) / _TIME_UNIT_DIVISORS[unit]
+    if unit == "auto":
+        try:
+            return float(raw)
+        except ValueError:
+            pass
+    return datetime.fromisoformat(raw.strip().replace("Z", "+00:00")).timestamp()
+
+
+@contextmanager
+def _open_text(path: Path) -> Iterator[TextIO]:
+    """The CSV as text; a ``.zip`` is read directly (its first member)."""
+    if path.suffix.lower() == ".zip":
+        with zipfile.ZipFile(path) as archive:
+            with archive.open(archive.namelist()[0]) as raw:
+                yield io.TextIOWrapper(raw, encoding="utf-8", newline="")
+    else:
+        with path.open("r", newline="", encoding="utf-8") as handle:
+            yield handle
 
 
 def _optional_float(row: dict[str, str], key: str) -> float | None:
@@ -131,6 +158,7 @@ def parse_row(
     row: dict[str, str],
     columns: ColumnMap = ColumnMap(),
     assumed_spread: float | None = None,
+    timestamp_unit: str = "auto",
 ) -> Tick:
     """Parse one CSV row (keys and ``columns`` already lowercased). Raises ``ValueError`` on anything unusable.
 
@@ -146,7 +174,7 @@ def parse_row(
         raise ValueError("no ask column and no --assumed-spread")
     return Tick(
         symbol=(row.get(columns.symbol) or "").strip() or None,
-        timestamp_seconds=_parse_timestamp(raw_timestamp) if raw_timestamp else None,
+        timestamp_seconds=_parse_timestamp(raw_timestamp, timestamp_unit) if raw_timestamp else None,
         bid=bid,
         ask=ask,
         bid_volume=_optional_float(row, columns.bid_volume),
@@ -184,12 +212,13 @@ async def replay_csv(
     speed: float,
     columns: ColumnMap = ColumnMap(),
     assumed_spread: float | None = None,
+    timestamp_unit: str = "auto",
 ) -> ReplayStats:
     """Publish every valid row of ``path``. ``speed`` 0 = no pacing, N > 0 = N x real time."""
     stats = ReplayStats()
     previous_timestamp: float | None = None
     mapping = columns.lowered()
-    with path.open("r", newline="", encoding="utf-8") as handle:
+    with _open_text(path) as handle:
         reader = csv.DictReader(handle)
         header = {name.strip().lower() for name in (reader.fieldnames or [])}
         if mapping.bid not in header:
@@ -204,7 +233,7 @@ async def replay_csv(
         for line_number, raw_row in enumerate(reader, start=2):
             row = {key.strip().lower(): value for key, value in raw_row.items() if key}
             try:
-                tick = parse_row(row, mapping, assumed_spread)
+                tick = parse_row(row, mapping, assumed_spread, timestamp_unit)
                 if speed > 0 and tick.timestamp_seconds is None:
                     raise ValueError("a timestamp is required when --speed > 0")
             except (ValueError, KeyError) as exc:
@@ -244,6 +273,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--timestamp-column", default="timestamp", help="Timestamp column name (default: timestamp).")
     parser.add_argument("--bid-column", default="bid", help="Bid price column name (default: bid).")
     parser.add_argument("--ask-column", default="ask", help="Ask price column name (default: ask).")
+    parser.add_argument("--bid-volume-column", default="bid_vol", help="Best-bid quantity column (default: bid_vol). With both quantities present, imbalance and liquidity are real.")
+    parser.add_argument("--ask-volume-column", default="ask_vol", help="Best-ask quantity column (default: ask_vol).")
+    parser.add_argument("--timestamp-unit", choices=("auto", "iso", "s", "ms", "us"), default="auto", help="Timestamp format: auto = a number is seconds, else ISO-8601 (default); or force iso, s, ms (e.g. Binance) or us.")
     parser.add_argument("--assumed-spread", type=float, default=None, help="Bid-only files: assumed spread in price units (e.g. 0.0001 = 1 pip on EUR/USD), applied to every tick.")
     parser.add_argument("--high-water-mark", type=int, default=100_000, help="PUB send high-water mark (default: 100000).")
     parser.add_argument("--flush-ms", type=int, default=5000, help="At exit, wait up to this long for queued ticks to flush before discarding the rest (default: 5000).")
@@ -260,7 +292,10 @@ async def _run(args: argparse.Namespace) -> int:
         print("No broker frontend address: set ZMQ_BROKER_FRONTEND_ADDRESS or pass --address, and start scripts/run_zmq_broker.py first.")
         return 2
 
-    columns = ColumnMap(timestamp=args.timestamp_column, bid=args.bid_column, ask=args.ask_column)
+    columns = ColumnMap(
+        timestamp=args.timestamp_column, bid=args.bid_column, ask=args.ask_column,
+        bid_volume=args.bid_volume_column, ask_volume=args.ask_volume_column,
+    )
     context = zmq.asyncio.Context()
     publisher = ZmqPublisher(address, high_water_mark=args.high_water_mark, context=context, bind=False)
     try:
@@ -268,7 +303,7 @@ async def _run(args: argparse.Namespace) -> int:
         try:
             stats = await replay_csv(
                 args.csv_path, publisher, default_symbol=args.symbol, speed=args.speed,
-                columns=columns, assumed_spread=args.assumed_spread,
+                columns=columns, assumed_spread=args.assumed_spread, timestamp_unit=args.timestamp_unit,
             )
         except ValueError as exc:
             print(f"Cannot replay: {exc}")

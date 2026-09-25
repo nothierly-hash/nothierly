@@ -11,6 +11,7 @@ import asyncio
 import importlib.util
 import sys
 import time
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -231,6 +232,57 @@ async def test_custom_column_names_are_case_insensitive_and_pace_by_the_named_ti
 
     assert stats.sent == 2
     assert 0.08 <= elapsed < 0.35  # 0.4s of recorded time at 4x is about 0.1s
+
+
+# =============================================================================
+# Real bid/ask books (e.g. a Binance bookTicker export): units, zip, quantities
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_millisecond_timestamps_pace_correctly_only_with_the_unit_declared(tmp_path: Path) -> None:
+    csv_path = _write_csv(tmp_path / "book.csv", ["time_ms,bid,ask", "1685577600000,1.10,1.12", "1685577600200,1.10,1.12", "1685577600400,1.10,1.12"])
+    publisher = _RecordingPublisher()
+
+    started = time.perf_counter()
+    stats = await historical_ingester.replay_csv(
+        csv_path, publisher, default_symbol="X", speed=4.0, timestamp_unit="ms",
+        columns=historical_ingester.ColumnMap(timestamp="time_ms"),
+    )
+    elapsed = time.perf_counter() - started
+
+    assert stats.sent == 3
+    assert 0.08 <= elapsed < 0.35  # 0.4 s of recorded time at 4x is about 0.1 s
+
+
+@pytest.mark.asyncio
+async def test_a_zip_is_read_directly(tmp_path: Path) -> None:
+    archive = tmp_path / "book.zip"
+    with zipfile.ZipFile(archive, "w") as z:
+        z.writestr("book.csv", "bid,ask\n1.10,1.12\n1.11,1.13\n")
+    publisher = _RecordingPublisher()
+
+    stats = await historical_ingester.replay_csv(archive, publisher, default_symbol="X", speed=0)
+
+    assert stats.sent == 2 and len(publisher.payloads) == 2
+
+
+@pytest.mark.asyncio
+async def test_real_ask_and_quantities_give_the_files_own_spread_imbalance_and_liquidity(tmp_path: Path) -> None:
+    csv_path = _write_csv(tmp_path / "book.csv", [
+        "best_bid_price,best_bid_qty,best_ask_price,best_ask_qty",
+        "0.2600,300,0.2604,100",
+    ])
+    publisher = _RecordingPublisher()
+    columns = historical_ingester.ColumnMap(bid="best_bid_price", ask="best_ask_price",
+                                            bid_volume="best_bid_qty", ask_volume="best_ask_qty")
+
+    stats = await historical_ingester.replay_csv(csv_path, publisher, default_symbol="X", speed=0, columns=columns)
+
+    metrics = MarketMetrics.model_validate(publisher.payloads[0].data)
+    assert stats.assumed_spread_used is False
+    assert metrics.spread == pytest.approx(0.0004) and metrics.mid_price == pytest.approx(0.2602)
+    assert metrics.order_book_imbalance == pytest.approx(0.5) and metrics.top_of_book_liquidity == pytest.approx(400.0)
 
 
 # =============================================================================

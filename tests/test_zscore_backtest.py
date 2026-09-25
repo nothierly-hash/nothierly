@@ -176,6 +176,31 @@ def test_a_missing_column_and_a_bad_row_fail_loudly(tmp_path: Path) -> None:
         list(zb.iter_quotes(bad_row, fmt="csv", price_is="bid", spread=0.0, timestamp_unit="s"))
 
 
+def test_a_real_ask_column_gives_the_files_own_spread_and_millisecond_time(tmp_path: Path) -> None:
+    path = tmp_path / "book.csv"
+    path.write_text("event_time,best_bid,best_ask\n1685577600123,0.2600,0.2604\n1685577600456,0.2601,0.2603\n", encoding="utf-8")
+
+    quotes = list(zb.iter_quotes(path, fmt="csv", price_is="bid", spread=0.0, timestamp_column="event_time",
+                                 price_column="best_bid", timestamp_unit="ms", ask_column="best_ask"))
+
+    assert [(q.bid, q.ask) for q in quotes] == [(0.2600, 0.2604), (0.2601, 0.2603)]
+    assert quotes[0].timestamp == pytest.approx(1685577600.123)
+    assert quotes[0].mid == pytest.approx(0.2602)
+
+
+def test_a_crossed_or_missing_real_ask_fails_loudly_with_the_line(tmp_path: Path) -> None:
+    crossed = tmp_path / "crossed.csv"
+    crossed.write_text("t,bid,ask\n1,10.0,10.1\n2,10.2,10.1\n", encoding="utf-8")
+    with pytest.raises(ValueError, match=":3:.*crossed"):
+        list(zb.iter_quotes(crossed, fmt="csv", price_is="bid", spread=0.0, timestamp_column="t",
+                            price_column="bid", timestamp_unit="s", ask_column="ask"))
+    no_ask = tmp_path / "noask.csv"
+    no_ask.write_text("t,bid\n1,10.0\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="ask"):
+        list(zb.iter_quotes(no_ask, fmt="csv", price_is="bid", spread=0.0, timestamp_column="t",
+                            price_column="bid", timestamp_unit="s", ask_column="ask"))
+
+
 # =============================================================================
 # Executions log
 # =============================================================================
