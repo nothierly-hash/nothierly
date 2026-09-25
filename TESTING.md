@@ -116,6 +116,7 @@ The shock window itself was run later; see the seventh dataset below.
 | USD/JPY 2019-01-03 | 3,700 | 0.085% | 0 | 0 |
 | Copper 2026-09-08 | 2,615 | 0.26% | 0 | 26 (from 12:10:05) |
 | BTC/USD 2026-09-19 (Saturday) | 1,088 | 0.083% | 0 | 0 |
+| BTC/USD 2022-11-08 | 3,833 | 0.18% | 0 | 0 |
 
 The default 5%/60 s threshold trips on none of them, as expected, since none is a crash. A low threshold trips in the volatile hours, including once well before the 12:30 burst (GBP/USD at 0.2%), and not at all in the quiet yen hour, so the right value depends on each instrument's volatility regime. This supports a per-instrument threshold, calibrated on far more data than a handful of hours, and does not establish any particular value.
 
@@ -208,3 +209,12 @@ Six 4-hour bars, too coarse for a 60-second detector, so nothing was replayed. T
 - **Flash-crash detector** (driven offline with the file's timestamps): none of 5.0%, 0.5%, 0.4%, 0.3% or 0.2% trips.
 
 One quiet weekend hour says nothing about a threshold for crypto, the asset class of the shadow-run instrument (BTC/USDT). No volatile crypto day is in the set yet.
+
+### Tenth dataset: BTC/USD, 2022-11-08 12:00-13:00 UTC (the day of the FTX collapse, before the violent part)
+
+3,833 bid-only ticks, replayed with `--symbol BTC_USD` and an arbitrary assumed spread of 1.0 (the real spread is unknown, and the detector uses the mid price). The bid goes from 19,670.1 to 19,692.3 (+0.11%), with a 0.473% range (low 19,616.8 at 12:40:03, high 19,709.6 at 12:14:44) and a largest 60-second move of 0.179% (12:39:19 UTC). The feed is sparse, with gaps of up to 84 s. The hour is calm: the violent part of that day is later and is not in this file.
+
+- **Bus delivery.** 3,833 published, 3,833 received, in file order, 0 value differences against the CSV.
+- **Flash-crash detector** (driven offline with the file's timestamps): none of 5.0%, 2.0%, 1.0%, 0.5%, 0.4%, 0.3% or 0.2% trips.
+
+There is still no volatile crypto day in the set. To locate the window without guessing, extract 1-minute bars for the full days 2022-11-08 and 2022-11-09, as was done for the AUD/JPY day, then ticks for the window they show.
