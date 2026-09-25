@@ -105,7 +105,7 @@ Not yet run: the shock window itself (about 09:00-10:30 UTC the same day). It is
 - **Bus delivery.** 3,700 published, 3,700 received, in file order, 0 value differences against the CSV.
 - **Flash-crash detector:** none of 5.0%, 0.5%, 0.4%, 0.3% or 0.2% trips.
 
-### Comparison of the four hours
+### Comparison of the tick-data hours
 
 | Dataset | Ticks | Largest 60 s move | Ticks in breach at 0.4% | Ticks in breach at 0.2% |
 |---|---|---|---|---|
@@ -113,8 +113,9 @@ Not yet run: the shock window itself (about 09:00-10:30 UTC the same day). It is
 | EUR/CHF 2015-01-15 | 5,924 | 0.33% | 0 | 191 (from 12:01:13) |
 | GBP/USD 2016-10-07 | 27,256 | 0.43% | 3 (from 12:31:00) | 948 (from 12:13:32) |
 | USD/JPY 2019-01-03 | 3,700 | 0.085% | 0 | 0 |
+| Copper 2026-09-08 | 2,615 | 0.26% | 0 | 26 (from 12:10:05) |
 
-The default 5%/60 s threshold trips on none of them, as expected, since none is a crash. A low threshold trips in the volatile hours, including once well before the 12:30 burst (GBP/USD at 0.2%), and not at all in the quiet yen hour, so the right value depends on each instrument's volatility regime. This supports a per-instrument threshold, calibrated on far more data than four hours, and does not establish any particular value.
+The default 5%/60 s threshold trips on none of them, as expected, since none is a crash. A low threshold trips in the volatile hours, including once well before the 12:30 burst (GBP/USD at 0.2%), and not at all in the quiet yen hour, so the right value depends on each instrument's volatility regime. This supports a per-instrument threshold, calibrated on far more data than a handful of hours, and does not establish any particular value.
 
 Not yet run: the true-crash windows, which are the only data that would show whether the default 5% threshold trips on a real crash: the SNB shock (2015-01-15, about 09:00-10:30 UTC), the sterling flash crash (2016-10-07, Asian trading hours) and the yen flash crash (2019-01-03, Asian trading hours). Their results are unknown until they are run and recorded here.
 
@@ -142,3 +143,16 @@ Reading it: even on a day with a 7% range the default does not trip, because its
 ### Set aside: AUD/CAD, 2020-03-18, 4-hour bars
 
 Six bars, too coarse for a 60-second detector, so nothing was replayed. The only thing it supports is the same bound: the largest adjacent-pair span is 2.41% (bars 13:00 and 17:00), so the default 5% could not have tripped, which says nothing about lower thresholds. One-minute bars or ticks are needed.
+
+### Sixth dataset: copper (COPPER.CMD/USD), 2026-09-08 12:00-13:00 UTC
+
+2,615 bid-only ticks, replayed with `--symbol COPPER`. A commodity has no pip, so the assumed spread of 0.001 is arbitrary; it does not affect the detector, which uses the mid price. Price 6.8258 to 6.8153 (-0.15%), a 0.62% range over the hour, and a largest 60-second move of 0.256% (12:10:54 UTC). A quiet hour with no crash. The tick rate is much lower than in the FX files: at most 101 ticks in a minute (12:10).
+
+- **Bus delivery.** 2,615 published, 2,615 received, in file order, 0 value differences against the CSV.
+- **Flash-crash detector** (driven offline with the file's timestamps): 5.0%, 0.5%, 0.4% and 0.3% never trip; 0.2% trips on 26 ticks from 12:10:05.
+
+A 60-second window holds few ticks in this feed. One quiet hour cannot show whether that makes the detector more sensitive to single-tick noise, and no threshold value follows from it.
+
+### Set aside: empty extractions
+
+Three downloads contain the header row and no data (34 bytes, 0 rows), so nothing was replayed: AUD/CZK and OJUICE.CMD/USX for 2020-03-08 12:00-13:00 UTC, and XPT.CMD/USD for 2020-03-08 from 00:00. 2020-03-08 was a Sunday, and these markets had no quotes at those times (the weekly reopen is later that evening UTC). Check the weekday and the instrument's trading hours before extracting.
