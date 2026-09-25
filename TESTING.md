@@ -89,7 +89,7 @@ This file does not contain the Swiss National Bank shock. The SNB announced the 
 
 Reading it: the default correctly does not trip, because there is no crash in this window. Set against the EUR/USD hour, no single low threshold fits both: 0.4% caught the EUR/USD burst and says nothing here, while 0.3% and 0.2% trip here on moves that are not crashes, which is the false-positive cost of a low threshold. Calibration has to be per instrument and needs far more data than two hours.
 
-Not yet run: the shock window itself (about 09:00-10:30 UTC the same day). It is the check of whether the default 5% threshold trips on a real crash, and its result is unknown until it is run and recorded here.
+The shock window itself was run later; see the seventh dataset below.
 
 ### Third dataset: GBP/USD, 2016-10-07 12:00-13:00 UTC
 
@@ -117,7 +117,7 @@ Not yet run: the shock window itself (about 09:00-10:30 UTC the same day). It is
 
 The default 5%/60 s threshold trips on none of them, as expected, since none is a crash. A low threshold trips in the volatile hours, including once well before the 12:30 burst (GBP/USD at 0.2%), and not at all in the quiet yen hour, so the right value depends on each instrument's volatility regime. This supports a per-instrument threshold, calibrated on far more data than a handful of hours, and does not establish any particular value.
 
-Not yet run: the true-crash windows, which are the only data that would show whether the default 5% threshold trips on a real crash: the SNB shock (2015-01-15, about 09:00-10:30 UTC), the sterling flash crash (2016-10-07, Asian trading hours) and the yen flash crash (2019-01-03, Asian trading hours). Their results are unknown until they are run and recorded here.
+The SNB shock window has since been run (seventh dataset below). Not yet run: the other true-crash windows, the sterling flash crash (2016-10-07, Asian trading hours) and the yen flash crash (2019-01-03, Asian trading hours). Their results are unknown until they are run and recorded here.
 
 ### Fifth dataset: AUD/JPY, 2020-03-09, 1-minute bars (full day)
 
@@ -156,3 +156,24 @@ A 60-second window holds few ticks in this feed. One quiet hour cannot show whet
 ### Set aside: empty extractions
 
 Three downloads contain the header row and no data (34 bytes, 0 rows), so nothing was replayed: AUD/CZK and OJUICE.CMD/USX for 2020-03-08 12:00-13:00 UTC, and XPT.CMD/USD for 2020-03-08 from 00:00. 2020-03-08 was a Sunday, and these markets had no quotes at those times (the weekly reopen is later that evening UTC). Check the weekday and the instrument's trading hours before extracting.
+
+### Seventh dataset: EUR/CHF, 2015-01-15 09:00-10:00 UTC (the SNB shock)
+
+The first real crash in the set: 973 bid-only ticks, replayed with `--symbol EUR_CHF` and an assumed 1-pip spread (0.0001; the real spread in this window is unknown, and the detector uses the mid price). The feed thins out as liquidity vanishes: gaps of up to 102 s, and at most 170 ticks in a minute (09:30). The bid goes from 1.20094 at 09:00:07 to 1.02542 at 09:59:12 (-14.62%), with a low of 0.84989 at 09:49:14 (-29.23% from the first tick). The largest 60-second move is 8.67% (09:33:39 UTC, 1.14754 to 1.04808). The fall starts at about 09:30:47 to 09:30:49: the bid is -0.14% versus the last pre-shock bid (1.20094) at 09:30:49 and -0.43% one second later.
+
+- **Bus delivery.** 973 published, 973 received, in file order, 0 value differences against the CSV.
+- **Flash-crash detector** (driven offline with the file's timestamps). "Fall already suffered" is the bid at the first trip versus the pre-shock bid of 1.20094:
+
+| Threshold (60 s) | Ticks in breach | First trip (UTC) | Fall already suffered at first trip |
+|---|---|---|---|
+| 5.0% (default) | 74 | 09:31:09 | -5.60% |
+| 2.0% | 198 | 09:30:56 | -2.00% |
+| 1.0% | 279 | 09:30:52 | -1.07% |
+| 0.5% | 361 | 09:30:50 | -0.54% |
+| 0.4% | 391 | 09:30:50 | not measured |
+| 0.3% | 398 | 09:30:49 | not measured |
+| 0.2% | 421 | 09:30:49 | -0.20% |
+
+Reading it: the default 5%/60 s does trip on a real crash of this speed, at 09:31:09, about 20 seconds after the move began, when the bid was already 5.60% below the pre-shock level. The price went on to fall about 29% from the first tick. A 0.5% threshold would have tripped one second after the onset, at -0.54%. Together with the AUD/JPY day (a 7% range spread over minutes, on which the default never trips), the default behaves as a catastrophe tripwire: it catches a collapse of this speed after a large part of the first leg has happened, and misses slower stress. Lower thresholds trip earlier, but they also trip in ordinary volatile hours (see the comparison above). No threshold value follows from this.
+
+Limits: this is the detector alone, driven with the tick timestamps, not the Kill Switch chain, so supervisor cycle time, Redis and ZMQ latency add nothing here and were not measured. It is one event on a bid-only feed, and no orders, positions or losses were modeled, so it says nothing about capital preserved.
