@@ -44,12 +44,17 @@ def redis_client() -> Generator[RedisClient, None, None]:
 
 
 @pytest.fixture
-def engine(redis_client: RedisClient) -> ShadowCrossingEngine:
+def engine(redis_client: RedisClient) -> Generator[ShadowCrossingEngine, None, None]:
     instance = ShadowCrossingEngine(
         manage_own_signals=False, manage_own_redis=False, matching_window_ms=_TEST_MATCHING_WINDOW_MS
     )
     instance._redis_client = redis_client
-    return instance
+    yield instance
+    # BaseAgent.__init__ opens real ZMQ PUB/SUB sockets; left open, the pytest process never exits
+    # (the leaked context blocks in term() during pytest's own unconfigure GC). See TESTING.md.
+    instance._publisher.close()
+    instance._subscriber.close()
+    instance._zmq_context.term()
 
 
 def _order_message(*, order_id: str, client_id: str, asset: str, side: str, quantity: float) -> MessagePayload:

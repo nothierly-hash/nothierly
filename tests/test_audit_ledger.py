@@ -184,10 +184,15 @@ def redis_client() -> Generator[RedisClient, None, None]:
 
 
 @pytest.fixture
-def ledger(redis_client: RedisClient) -> CryptographicAuditLedger:
+def ledger(redis_client: RedisClient) -> Generator[CryptographicAuditLedger, None, None]:
     instance = CryptographicAuditLedger(manage_own_signals=False, manage_own_redis=False)
     instance._redis_client = redis_client
-    return instance
+    yield instance
+    # BaseAgent.__init__ opens real ZMQ PUB/SUB sockets; left open, the pytest process never exits
+    # (the leaked context blocks in term() during pytest's own unconfigure GC). See TESTING.md.
+    instance._publisher.close()
+    instance._subscriber.close()
+    instance._zmq_context.term()
 
 
 def _audit_message(*, event_type: Literal["SUBMITTED", "EXECUTED", "REJECTED"], order_id: str, detail: str = "test") -> MessagePayload:

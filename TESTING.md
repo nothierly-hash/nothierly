@@ -2,15 +2,15 @@
 
 ## Running the suites
 
-Main suite (1,398 tests collected as of 2026-09-25):
+Main suite (1,398 tests):
 
 ```
 ./.venv/Scripts/python.exe -m pytest tests/ -q
 ```
 
-`pyproject.toml` sets a per-test timeout of 120 s (thread method), so a hung test fails instead of blocking the run.
+Last full run, 2026-09-25: `1398 passed in 198.61s`, and the process exits on its own with code 0.
 
-Known issue: on a full `tests/` run, all 1,398 tests pass, but the pytest process then does not exit or print its summary (see "ZeroMQ teardown" below). Until that is resolved, run the full suite under an external time limit, and read results from the progress output, or run test files individually.
+`pyproject.toml` sets a per-test timeout of 120 s (thread method), so a hung test fails instead of blocking the run. That timeout does not cover a hang after the last test, which is what the ZeroMQ section below is about.
 
 ## Retail Gateway tests are locked by default
 
@@ -24,14 +24,19 @@ How it works:
 
 What this means for coverage: a default run does not execute the Retail Gateway tests (about 2,300 lines of code), so default-run pass counts exclude them. Last verified with an ephemeral key on 2026-09-25: 56 passed.
 
-## ZeroMQ teardown
+## ZeroMQ teardown: the pytest exit hang
 
-`tests/conftest.py` applies `setsockopt(zmq.LINGER, 0)` to every socket created during the test session. Production code is untouched (`core/zmq_bus.py` already closes its own sockets with `linger=0`).
+Symptom: pytest reached 100% but the process never exited, so the summary could be lost.
 
-Why: `BaseAgent` creates its own `zmq.asyncio.Context()`. A test that does not shut its agent down leaves a context with open sockets, and with ZeroMQ's default `LINGER = -1` terminating it can block. The symptom is pytest reaching 100% and then never exiting or printing its summary.
+Root cause: `BaseAgent.__init__` opens its own PUB and SUB sockets and its own `zmq.asyncio.Context`. Two agent fixtures returned the agent without closing any of them, so the leaked context was finalized during pytest's own `pytest_unconfigure` garbage collection, where `Context.__del__` -> `destroy()` -> `term()` blocked forever. Found by running every test file in its own process under a time limit, then every test id in the two files that failed to exit, then dumping thread stacks with `faulthandler`.
 
-Status, as verified on 2026-09-25:
+Leaking fixtures, now fixed (they `yield`, then close `_publisher`, `_subscriber` and `_zmq_context`, the pattern already used in `tests/test_spectral_denoiser_cwt.py`):
 
-- `tests/test_shadow_crossing_engine.py` on its own reproduced the hang (9 tests pass, then the process was killed at 100 s). With the LINGER setting: `9 passed in 3.09s`, exit code 0.
-- The full `tests/` run is **not** fixed by this alone: all 1,398 tests pass, and the process still does not exit after the last test (observed for more than 2 minutes at 100%). The leaking test or fixture has not been identified yet.
-- A variant that also destroyed every live ZMQ context with `linger=0` at session end was tried and rejected: it made the process abort with a libzmq assertion (`ctx.cpp:185`, exit code 21) before the summary printed.
+- `tests/test_audit_ledger.py::ledger` (one test, `test_gate8_sealed_success_logs_the_brief_own_literal_audit_line`, triggered it)
+- `tests/test_shadow_crossing_engine.py::engine` (all 9 tests triggered it)
+
+Rule for new tests: any fixture that builds a `BaseAgent` subclass must close its real publisher, subscriber and context at teardown.
+
+`tests/conftest.py` additionally sets `setsockopt(zmq.LINGER, 0)` on every socket created in the session. This was tried first and did not fix the hang on its own, since the blocking was in `term()` on sockets that were never closed, not on unsent messages. It is kept as defense in depth. A variant that destroyed every live context at session end was tried and rejected: it made the process abort with a libzmq assertion (`ctx.cpp:185`, exit code 21).
+
+Notes from the per-file sweep: `tests/test_evolutionary_tuner.py` is slow (about 50 s, CMA-ES) but exits normally, and `tests/test_data_lake_sync.py` and `tests/test_execution_agent_multi_asset.py` contain no test functions.
