@@ -159,6 +159,72 @@ async def test_speed_scales_the_gap_between_ticks(tmp_path: Path) -> None:
     assert 0.08 <= elapsed < 0.35  # 0.4s of recorded time at 4x is about 0.1s
 
 
+class _FakeTime:
+    """A clock and a sleep that agree: sleeping advances the clock, by the request plus an optional overshoot."""
+
+    def __init__(self, overshoot: float = 0.0) -> None:
+        self.now = 1000.0
+        self.overshoot = overshoot
+        self.sleeps: list[float] = []
+
+    def clock(self) -> float:
+        return self.now
+
+    async def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds + self.overshoot
+
+
+@pytest.mark.asyncio
+async def test_the_pacer_does_not_sleep_for_gaps_below_the_timer_resolution() -> None:
+    fake = _FakeTime()
+    pacer = historical_ingester._Pacer(1.0, clock=fake.clock, sleep=fake.sleep)
+
+    for timestamp in (0.0, 0.0005, 0.001, 0.0015):
+        await pacer.wait_for(timestamp)
+
+    assert fake.sleeps == []  # sub-2 ms gaps go out back to back
+
+
+@pytest.mark.asyncio
+async def test_the_pacer_keeps_the_average_rate_even_when_every_sleep_overshoots() -> None:
+    """Summing per-gap sleeps drifts by the overshoot on every tick; a deadline schedule catches it up."""
+    fake = _FakeTime(overshoot=0.012)  # a timer tick's worth of overshoot on every sleep
+    pacer = historical_ingester._Pacer(1.0, clock=fake.clock, sleep=fake.sleep)
+    start = fake.now
+
+    for index in range(1000):
+        await pacer.wait_for(index * 0.005)  # 5 ms gaps, 4.995 s of recorded time
+
+    assert fake.now - start < 4.995 + 0.02  # about the recorded span; the old per-gap sleeps would add 12 ms per tick
+
+
+@pytest.mark.asyncio
+async def test_the_pacer_scales_the_schedule_by_speed() -> None:
+    fake = _FakeTime()
+    pacer = historical_ingester._Pacer(4.0, clock=fake.clock, sleep=fake.sleep)
+    start = fake.now
+
+    for timestamp in (0.0, 1.0, 2.0, 3.0):
+        await pacer.wait_for(timestamp)
+
+    assert fake.now - start == pytest.approx(0.75)  # 3 s of recorded time at 4x
+
+
+@pytest.mark.asyncio
+async def test_a_timestamp_that_goes_backwards_starts_a_new_schedule_instead_of_bursting() -> None:
+    fake = _FakeTime()
+    pacer = historical_ingester._Pacer(1.0, clock=fake.clock, sleep=fake.sleep)
+
+    for timestamp in (100.0, 101.0, 102.0):
+        await pacer.wait_for(timestamp)
+    before_jump = fake.now
+    for timestamp in (0.0, 1.0, 2.0):  # the same file appended again, starting over
+        await pacer.wait_for(timestamp)
+
+    assert fake.now - before_jump == pytest.approx(2.0)  # paced again, not sent as an instant burst
+
+
 # =============================================================================
 # Bid-only files (e.g. a Dukascopy BID export) and custom column names
 # =============================================================================

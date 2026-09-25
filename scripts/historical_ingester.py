@@ -53,8 +53,9 @@ import argparse
 import asyncio
 import csv
 import io
+import time
 import zipfile
-from collections.abc import Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -204,6 +205,41 @@ def tick_to_metrics(tick: Tick, *, symbol: str) -> MarketMetrics:
     )
 
 
+_MIN_SLEEP_SECONDS: Final[float] = 0.002
+
+
+class _Pacer:
+    """Replays recorded time at ``speed`` x by deadline, instead of summing one sleep per tick gap.
+
+    Sleeping each gap costs at least one timer tick per message (1 to 15 ms on Windows), so a file with many
+    sub-millisecond gaps ran far slower than recorded time / speed: 922,179 trades at 190x took over 19 minutes
+    where the recorded day at that speed is about 8. Here every tick has a deadline measured from the first
+    tick, and the pacer sleeps only when that deadline is more than ``_MIN_SLEEP_SECONDS`` away. Closer ticks go out
+    back to back, so a sleep that overshoots is caught up by the following ticks and the average rate is right.
+    A timestamp that goes backwards (files concatenated) starts a new schedule instead of sending a burst.
+    """
+
+    def __init__(
+        self, speed: float, *, clock: Callable[[], float] = time.perf_counter,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    ) -> None:
+        self._speed = speed
+        self._clock = clock
+        self._sleep = sleep
+        self._anchor_timestamp: float | None = None
+        self._anchor_time = 0.0
+        self._previous_timestamp = 0.0
+
+    async def wait_for(self, timestamp: float) -> None:
+        now = self._clock()
+        if self._anchor_timestamp is None or timestamp < self._previous_timestamp:
+            self._anchor_timestamp, self._anchor_time = timestamp, now
+        self._previous_timestamp = timestamp
+        wait = self._anchor_time + (timestamp - self._anchor_timestamp) / self._speed - now
+        if wait > _MIN_SLEEP_SECONDS:
+            await self._sleep(wait)
+
+
 async def replay_csv(
     path: Path,
     publisher: ZmqPublisher,
@@ -216,7 +252,7 @@ async def replay_csv(
 ) -> ReplayStats:
     """Publish every valid row of ``path``. ``speed`` 0 = no pacing, N > 0 = N x real time."""
     stats = ReplayStats()
-    previous_timestamp: float | None = None
+    pacer = _Pacer(speed) if speed > 0 else None
     mapping = columns.lowered()
     with _open_text(path) as handle:
         reader = csv.DictReader(handle)
@@ -240,12 +276,8 @@ async def replay_csv(
                 stats.reject(line_number, str(exc))
                 continue
 
-            if speed > 0 and tick.timestamp_seconds is not None:
-                if previous_timestamp is not None:
-                    delay = (tick.timestamp_seconds - previous_timestamp) / speed
-                    if delay > 0:
-                        await asyncio.sleep(delay)
-                previous_timestamp = tick.timestamp_seconds
+            if pacer is not None and tick.timestamp_seconds is not None:
+                await pacer.wait_for(tick.timestamp_seconds)
 
             try:
                 metrics = tick_to_metrics(tick, symbol=tick.symbol or default_symbol)
