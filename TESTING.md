@@ -341,3 +341,34 @@ The default 5%/60 s threshold, first trip and trades in breach (the "running hig
 Reading it: the default trips on all four days, but it is far from prompt. On 2020-03-12 it trips on a fall only when the price is already 24% below the day's high; on 2020-03-13 and 2021-05-19 its first trip is a rebound. On FTT it trips early, at -6.20%, about 17 hours before the low (2.51 at 19:32:00). On every day the largest 60-second fall exceeds 5%, so on these days the 5% scale fits crashes, unlike on the majors in FX. Thresholds of 0.2% to 1% trip within the first seconds or minutes of the day (the 0.2% one within the first 32 seconds on all four), which is noise on these assets. No threshold value follows.
 
 Limits: this is the detector alone, not the Kill Switch chain; four spot days on one venue; no orders, positions or losses were modeled.
+
+
+## 24-hour shadow run, 2026-09-23 02:43 to 2026-09-24 02:43 UTC
+
+Source: `logs/shadow_run_24h_20260923_024500/` (`summary.json`, `status.json`, `samples.jsonl` every 300 s, `digest.json`, `backend.log`, `alpha_engine.log`, `orchestrator.log`). The orchestrator started three processes: a private fakeredis, `scripts/run_backend.py` (the agent fleet in mock mode, on live public Binance market data for BTC/USDT and ETH/USDT) and `scripts/run_alpha_engine.py` (BTC/USDT, `--tick-interval 2.0`, `--max-daily-loss-usd -50`). No order reaches an exchange (`alpha_engine_mock_mode_broker_not_connected`). No API gateway and no HTTP client were part of the run.
+
+| Item | Recorded |
+|---|---|
+| Duration | planned 86,400 s, actual 86,401.8 s |
+| Premature exits | none (`premature_exits` is empty); all three processes alive in all 179 samples and at the end |
+| Feed | Binance through ccxt.pro: `watchOrderBook` with `limit` 5 (top 5 levels, not the full book) and `watchTrades`, publishing throttled. 500 `exchange_ws_error_reconnecting` |
+| Backend log lines | info 108,463, warning 20,508, error 2, critical 7,539 |
+| Global Kill Switch | `GLOBAL_KILL_SWITCH_TRIPPED` 451 times, the first at 02:58:05 UTC. Status sampled as `PANIC` in 176 of 179 samples, from 987.7 s to the end of the run, and `PANIC` at the end |
+| Orders | 6,618 consensus-approved orders, each blocked by the Kill Switch (`consensus_reached`, `kill_switch_blocked_call` and `consensus_order_blocked_by_global_kill_switch` are all 6,618). 11,218 conflicting signals vetoed by the arbitrator |
+| Fills | 0. `fills_blotter_len` is 0 in all 179 samples and no gate report reached gates 4 to 7 |
+| Signed status | `kill_switch_signature_invalid_failing_closed` 4 times, 13:18:15 to 13:18:30 UTC, status `PANIC`, epoch 159. Cause not established |
+| Persistence | TimescaleDB refused every connection (`audit_ledger_timescale_unavailable_at_startup`, 1,618 `timescale_connect_retry`), so nothing reached the audit ledger |
+| Alpha engine | its market-data circuit breaker tripped at 02:57:34 and forced it OFF; 399 simulated quotes; 5,132 `watchdog_heartbeat_file_write_failed` |
+| Memory | backend RSS 1,426.7 MB at the first sample (87 s), 415 to 445 MB from about 20 minutes on, 432.7 MB at the end; least-squares slope +2.9 MB/h after the first hour |
+
+Reading it:
+
+- "No crash" holds in one narrow sense: no process exited during 24 hours. It is not a clean run. The backend logged 7,539 critical lines, the feed was lost at least once for 191.9 s (13:17 UTC, with `getaddrinfo failed` and WebSocket close code 1006), and the Kill Switch was `PANIC` in 176 of 179 samples.
+- The run says nothing about fill safety. The system was halted, so there were no fills of any kind, safe or unsafe. What it shows is that a tripped Kill Switch blocked every consensus-approved order (6,618 of 6,618).
+- The 6,618 are blocked order attempts, not blocked HTTP requests. No request reached an API in this run, so it does not measure authentication or unauthenticated traffic.
+- The memory figures are not a leak test. With the system halted for most of the run, the process was mostly idle.
+
+Kill Switch and alerting, as recorded:
+
+- The global status is stored with an HMAC-SHA256 signature over the value and its epoch (`core/security.py`, `core/message_integrity.py`), and `is_system_safe()` fails closed on a mismatch. The run recorded four such failures and failed closed each time (status stayed `PANIC`). The orchestrator ran no injection step, so what produced them is unknown; the run does not show the signature stopping a forgery. That is covered by `tests/red_team_hacker.py` and the kill-switch tests.
+- No SMS and no Telegram message was sent. `sms_alert_sent` and the Twilio log lines appear 0 times in both logs, and no launcher in `scripts/`, `src/` or `core/` instantiates `AlertAgent` (the Twilio SMS agent in `src/agents/alert_agent.py`), so it did not run. The Telegram notifier logged `telegram_not_configured_alert_not_sent` 5 times in the alpha engine: not sent. The SMS path is designed to stay off the event loop (`asyncio.to_thread` around the blocking Twilio SDK call) and never to raise; that comes from the code and `tests/test_alert_agent.py`, not from this run.
