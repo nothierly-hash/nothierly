@@ -218,7 +218,7 @@ Six 4-hour bars, too coarse for a 60-second detector, so nothing was replayed. T
 - **Bus delivery.** 1,088 published, 1,088 received, in file order, 0 value differences against the CSV.
 - **Flash-crash detector** (driven offline with the file's timestamps): none of 5.0%, 0.5%, 0.4%, 0.3% or 0.2% trips.
 
-One quiet weekend hour says nothing about a threshold for crypto, the asset class of the shadow-run instrument (BTC/USDT). No volatile crypto day is in the set yet.
+One quiet weekend hour says nothing about a threshold for crypto, the asset class of the shadow-run instrument (BTC/USDT). No volatile crypto day is in the set at tick level yet (one is located in 1-minute bars in the companion to the tenth dataset).
 
 ### Tenth dataset: BTC/USD, 2022-11-08 12:00-13:00 UTC (the day of the FTX collapse, before the violent part)
 
@@ -227,4 +227,28 @@ One quiet weekend hour says nothing about a threshold for crypto, the asset clas
 - **Bus delivery.** 3,833 published, 3,833 received, in file order, 0 value differences against the CSV.
 - **Flash-crash detector** (driven offline with the file's timestamps): none of 5.0%, 2.0%, 1.0%, 0.5%, 0.4%, 0.3% or 0.2% trips.
 
-There is still no volatile crypto day in the set. To locate the window without guessing, extract 1-minute bars for the full days 2022-11-08 and 2022-11-09, as was done for the AUD/JPY day, then ticks for the window they show.
+The 1-minute bars for the full day were obtained afterwards and locate the violent part (companion section below); the ticks for that window are still to be extracted.
+
+### Companion to the tenth dataset: BTC/USD 2022-11-08, full day in 1-minute bars
+
+1,391 bid-side one-minute bars (00:00-23:59 UTC; a minute without a trade has no bar, so 49 are missing). They are not replayed as ticks. Cross-check: the 12:00-12:59 bars give a low of 19,616.8 and a high of 19,709.6, identical to the extremes of the tick file above.
+
+- **The day.** First open 20,560.7, last close 18,511.1 (-9.97%). High 20,635.8 at 16:42, low 17,151.1 at 19:32: a 20.32% high-to-low range, with the high first.
+- **The violent part.** The most violent 60-minute window is 18:33 to 19:32 UTC, with a 10.58% range (18,966.1 to 17,151.1). Largest close-to-close one-minute moves: +4.39% (19:34, a rebound right after the low), -2.00% (19:35), -1.63% (19:32) and +1.52% (18:22). The largest single-bar range is 4.77% (19:34).
+- **Flash-crash detector** (driven offline on the closes with the bar timestamps, which are bar open times):
+
+| Threshold (60 s) | Bars in breach | First trip (UTC) |
+|---|---|---|
+| 5.0% (default) | 0 | never |
+| 2.0% | 2 | 19:34 |
+| 1.0% | 11 | 04:11 |
+| 0.5% | 54 | 04:11 |
+| 0.4% | 82 | 04:11 |
+| 0.3% | 141 | 03:18 |
+| 0.2% | 246 | 02:52 |
+
+- **Bound on the default.** The largest span of two adjacent bars is 5.99% (bars 19:33 and 19:34), above 5%. Unlike the AUD/JPY day, the bars therefore do not exclude a trip of the default 5%/60 s threshold, and they do not show one either: only ticks can tell.
+
+Reading it: thresholds of 0.2% to 1% trip hours before the crash, in ordinary trading, so on bitcoin they are noise; 2% catches the 19:34 bar. No threshold value follows from this.
+
+Window to extract next: BTC/USD ticks from 2022-11-08 18:30 to 20:00 UTC, which would show whether the default threshold trips at the sharpest point and when.
