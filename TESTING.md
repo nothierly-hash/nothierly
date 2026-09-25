@@ -372,3 +372,56 @@ Kill Switch and alerting, as recorded:
 
 - The global status is stored with an HMAC-SHA256 signature over the value and its epoch (`core/security.py`, `core/message_integrity.py`), and `is_system_safe()` fails closed on a mismatch. The run recorded four such failures and failed closed each time (status stayed `PANIC`). The orchestrator ran no injection step, so what produced them is unknown; the run does not show the signature stopping a forgery. That is covered by `tests/red_team_hacker.py` and the kill-switch tests.
 - No SMS and no Telegram message was sent. `sms_alert_sent` and the Twilio log lines appear 0 times in both logs, and no launcher in `scripts/`, `src/` or `core/` instantiates `AlertAgent` (the Twilio SMS agent in `src/agents/alert_agent.py`), so it did not run. The Telegram notifier logged `telegram_not_configured_alert_not_sent` 5 times in the alpha engine: not sent. The SMS path is designed to stay off the event loop (`asyncio.to_thread` around the blocking Twilio SDK call) and never to raise; that comes from the code and `tests/test_alert_agent.py`, not from this run.
+
+
+## Tick-to-decision and tick-to-order latency of the Python pipeline
+
+`scripts/latency_profile.py` is a consumer on the real ZMQ bus (broker and ingester started by `scripts/run_replay.sh`). For each `MARKET_DATA_L2` tick it runs, in order: decode (`MessagePayload` and `MarketMetrics`), `XgboostSignalAgent._check_kill_switch`, the z-score alpha of `scripts/zscore_backtest.py` (window 100, entry 3.0, exit 0.5) and, on an entry signal, `is_system_safe` plus `ExecutionAgent._validate_execution_gates`. T1 is `perf_counter_ns()` when `recv` returns to the consumer; T2 is taken after the last stage, before a sink that only counts. Two latencies are recorded: tick-to-decision (T1 to the end of the alpha step, every tick) and tick-to-order (T1 to T2, entry signals only). `scripts/analyze_t2t.py` computes nearest-rank percentiles in plain Python.
+
+Setup: Binance BTCUSDT trades of 2020-03-25 (912,179 trades, data.binance.vision) as a headered CSV, preceded by its own first 10,000 rows as warm-up: 922,179 ticks in total. The warm-up ticks run through the whole pipeline and are not recorded, and the strategy and detector state are reset after them. Machine: Intel i5-8365U (4 cores, 8 threads, 1.6 GHz base) laptop, Windows 11, CPython 3.14.4, pyzmq 27.2.0. The broker, the ingester and the consumer ran on that one machine. Two runs of the same file:
+
+```bash
+export ZMQ_BROKER_FRONTEND_ADDRESS=tcp://127.0.0.1:26101 ZMQ_BROKER_BACKEND_ADDRESS=tcp://127.0.0.1:26102
+export REPLAY_CONSUMER_WARMUP_SECONDS=40 REPLAY_DRAIN_SECONDS=60
+export REPLAY_CONSUMER_CMD="python scripts/latency_profile.py --output t2t.csv --warmup 10000 --expected 912179 --symbol BTC_USDT --idle-timeout 25"
+bash scripts/run_replay.sh blast.csv --symbol BTC_USDT --timestamp-column time_ms --timestamp-unit ms --bid-column price --assumed-spread 1.0 --speed 150   # or --speed 0
+python scripts/analyze_t2t.py t2t.csv
+```
+
+The CSVs (about 50 MB each) are not kept in the repository. Both runs received all 922,179 ticks, recorded 912,179, dropped none.
+
+| Run | Tick-to-decision, every tick (n = 912,179) | p50 | p90 | p99 | p99.9 | max |
+|---|---|---:|---:|---:|---:|---:|
+| Paced, `--speed 150` | latency in us | 125.6 | 303.7 | 544.4 | 896.6 | 35,521 |
+| Blast, `--speed 0` | latency in us | 109.0 | 156.2 | 238.2 | 711.7 | 48,662 |
+
+| Run | Tick-to-order through the Risk Gates | n | p50 | p90 | p99 | p99.9 | max |
+|---|---|---:|---:|---:|---:|---:|---:|
+| Paced | latency in us | 2,693 | 5,826 | 15,558 | 20,363 | 57,130 (top 3 samples) | 78,108 |
+| Blast | latency in us | 424 | 5,675 | 6,249 | 7,277 | 21,506 (1 sample) | 21,506 |
+
+The paced run's stage medians: decode 36 us, risk pre-check 34 us, alpha 54 us, `is_system_safe` plus Risk Gates 5,696 us.
+
+Queue delay before T1, from the ingester's own timestamp on each message to T1 (same machine, same clock):
+
+| Run | p50 | p90 | p99 | max | Kill Switch events | Consumer RSS |
+|---|---:|---:|---:|---:|---:|---|
+| Paced | 5.3 ms | 875 ms | 2.1 s | 2.2 s | 0 | 293 MB at the start, 313 to 366 MB for most of the run, one peak of 439 MB, 332 MB at the end |
+| Blast | 16.8 s | 27.0 s | 28.7 s | 29.0 s | 6 | 294 MB, up to 1,774 MB at 760,000 ticks, 243 MB at the end |
+
+Reading it:
+
+- Deciding on a tick takes about 110 to 125 us at the median and stays under 1 ms up to the 99.9th percentile in both runs. In the paced run 665 of 912,179 ticks (0.07%) took more than 1 ms, 27 took more than 5 ms and the worst took 35.5 ms. The cause of that tail is not established. It is not queueing: ticks that arrived on an empty queue (delay under 10 ms, n = 528,843) have a higher p99 (567 us) than ticks processed in a backlog (delay of 500 ms or more, n = 147,910, p99 240 us), which is consistent with cold caches or CPU frequency changes after idle time but was not tested. Python's GC counters show 0, 12 and 1 collections for generations 0, 1 and 2, too few to explain it alone.
+- Going through the Risk Gates takes about 5.7 to 5.8 ms at the median, not under a millisecond. In a 50-call profile a gate traversal made about 11 Redis commands (550 `execute` calls over 50 traversals), and here they run against fakeredis in the same process; a network Redis would add a round trip to each. The paced p99.9 rests on 3 samples and the blast one on 1, so neither is a stable estimate.
+- The blast saturates the pipeline. The queue grows to 29 s, the data is stale by the time it is processed, the Kill Switch latches, and 9,930 of the 10,354 entry signals are refused before the gates (that is why only 424 went through; those refusals cost 892 us at the median and are reported separately by `analyze_t2t.py`). The consumer's memory rises to 1.8 GB because its socket buffer is unbounded (`RCVHWM` 0) and then falls back to 243 MB: it is backlog, not a leak, but it is not flat either.
+- The paced run is not a light-load figure. At 150x the busy hours of that day arrive faster than the pipeline consumes, so 16.2% of the ticks waited 500 ms or more and 8.6% waited a second or more. It did not become stale enough to latch the Kill Switch (0 events), and its RSS stayed between 293 and 439 MB over 912,179 ticks with no upward trend.
+
+What these figures are not:
+
+- They are CPython, not C++: there is no native code in this repository. They are service time inside one process, not wire to wire. Time in the kernel, in the broker and in the queue before `recv` returns is outside the latencies (queue delay is recorded separately, above).
+- There is no broker and no FIX. The sink only counts, and order construction, position bookkeeping, the audit ledger and any network send are not measured, so tick-to-order is a lower bound on a real order path. Nothing here says the core would stay under a millisecond behind a real prime broker.
+- The Redis behind the gates is fakeredis in the same process, and the gates run against synthetic, already agreeing signals (as in `scripts/replay_harness.py`).
+- The flash-crash detector was built with a threshold of 100% so it never trips, because a blast compresses a day into minutes and its 60 s window is real time. Its per-tick cost is in the figures; its trip path is not. Logging was set to WARNING, so INFO logging cost is not included. One `perf_counter_ns()` call costs about 0.15 to 0.18 us on this machine and each latency contains two to five of them.
+- One machine, one day of data, one run per mode. The figures describe this laptop and should not be extrapolated to a server.
+
+For context, not comparison: the STAC-T0 benchmark measures network I/O latency, from a UDP market-data frame in to a TCP order out, with hardware timestamps and without timing any trading decision; the April 2024 Exegy/AMD FPGA result reports a minimum of about 14 ns ([STAC report summary](https://docs.stacresearch.com/news/AMD240422)). The LMAX Disruptor paper's 52 ns is a mean per-hop latency between threads in a three-stage pipeline microbenchmark on 2011 hardware in Java ([paper](https://lmax-exchange.github.io/disruptor/disruptor.html)). Neither measures what this section measures.
