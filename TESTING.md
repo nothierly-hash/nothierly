@@ -93,7 +93,7 @@ The shock window itself was run later; see the seventh dataset below.
 
 ### Third dataset: GBP/USD, 2016-10-07 12:00-13:00 UTC
 
-27,256 bid-only ticks, replayed with `--symbol GBP_USD` and an assumed 1-pip spread (0.0001). Price 1.23668 to 1.23849 (+0.15%), range 1.23117 to 1.239. The largest 60-second move is 0.425% (12:31:00 UTC), and the tick rate steps up at 12:30 UTC from about 410 to 590-650 per minute, consistent with a scheduled release. The sterling flash crash of that day happened earlier, in Asian trading hours, so it is not in this file.
+27,256 bid-only ticks, replayed with `--symbol GBP_USD` and an assumed 1-pip spread (0.0001). Price 1.23668 to 1.23849 (+0.15%), range 1.23117 to 1.239. The largest 60-second move is 0.425% (12:31:00 UTC), and the tick rate steps up at 12:30 UTC from about 410 to 590-650 per minute, consistent with a scheduled release. The sterling flash crash happened about 13 hours earlier (around 23:07 UTC on 2016-10-06, see the twelfth dataset), so it is not in this file.
 
 - **Bus delivery.** 27,256 published, 27,256 received, in file order, 0 value differences against the CSV (one run, `--speed 0`, local machine). This is the largest replay so far.
 - **Flash-crash detector** (driven offline with the file's timestamps): 5.0% and 0.5% never trip; 0.4% trips on 3 ticks from 12:31:00; 0.3% on 262 ticks from 12:30:29; 0.2% on 948 ticks from 12:13:32, which is 17 minutes before the 12:30 burst.
@@ -120,7 +120,7 @@ The shock window itself was run later; see the seventh dataset below.
 
 The default 5%/60 s threshold trips on none of them, as expected, since none is a crash. A low threshold trips in the volatile hours, including once well before the 12:30 burst (GBP/USD at 0.2%), and not at all in the quiet yen hour, so the right value depends on each instrument's volatility regime. This supports a per-instrument threshold, calibrated on far more data than a handful of hours, and does not establish any particular value.
 
-The SNB shock window has since been run (seventh dataset below). Not yet run: the other true-crash windows, the sterling flash crash (2016-10-07, Asian trading hours) and the yen flash crash (inside the 4-hour bar opening 2019-01-02 22:00 UTC; see the set-aside note below). Their results are unknown until they are run and recorded here.
+The SNB shock window (seventh dataset) and the sterling flash crash (twelfth dataset) have since been run. Not yet run: the yen flash crash (inside the 4-hour bar opening 2019-01-02 22:00 UTC; see the set-aside note below), whose result is unknown until it is run and recorded here.
 
 ### Fifth dataset: AUD/JPY, 2020-03-09, 1-minute bars (full day)
 
@@ -191,9 +191,9 @@ Limits: this is the detector alone, driven with the tick timestamps, not the Kil
 - **Rest of the day.** Volatile but without a second collapse: after 10:10 the largest 10-minute range is 2.81% (21:50), and 9 bars exceed 1%. The largest span of two adjacent 10-minute bars is 3.25% (21:40 and 21:50), below 5%, so the default 5%/60 s could not have tripped on any 60-second window lying entirely after 10:10. With bars this coarse the bound says nothing about lower thresholds.
 - **Regime note.** Before the shock the range is about 0.01% per 10 minutes, so a threshold calibrated on that regime alone would sit orders of magnitude below the volatility of the rest of the day. This is an observation about how far apart the two regimes are, not a recommendation.
 
-### Eighth dataset: GBP/USD, 2016-10-06 12:00-13:00 UTC (the afternoon before the sterling flash crash)
+### Eighth dataset: GBP/USD, 2016-10-06 12:00-13:00 UTC (about 11 hours before the sterling flash crash)
 
-18,441 bid-only ticks, replayed with `--symbol GBP_USD` and an assumed 1-pip spread (0.0001). The bid goes from 1.26612 to 1.26362 (-0.20%), with a 0.27% range over the hour and a largest 60-second move of 0.106% (12:21:41 UTC). A calm hour. The flash crash itself (7 October, in Asian trading hours) is not in this file.
+18,441 bid-only ticks, replayed with `--symbol GBP_USD` and an assumed 1-pip spread (0.0001). The bid goes from 1.26612 to 1.26362 (-0.20%), with a 0.27% range over the hour and a largest 60-second move of 0.106% (12:21:41 UTC). A calm hour. The flash crash itself (around 23:07 UTC the same day) is not in this file.
 
 - **Bus delivery.** 18,441 published, 18,441 received, in file order, 0 value differences against the CSV.
 - **Flash-crash detector** (driven offline with the file's timestamps): none of 5.0%, 0.5%, 0.4%, 0.3% or 0.2% trips.
@@ -202,8 +202,8 @@ The same pair in the same hour on two consecutive days:
 
 | GBP/USD, 12:00-13:00 UTC | Ticks | Largest 60 s move | Ticks in breach at 0.2% |
 |---|---|---|---|
-| 2016-10-06 (day before) | 18,441 | 0.106% | 0 |
-| 2016-10-07 (day of the flash crash, this hour) | 27,256 | 0.43% | 948 |
+| 2016-10-06 (about 11 hours before the crash) | 18,441 | 0.106% | 0 |
+| 2016-10-07 (about 13 hours after the crash) | 27,256 | 0.43% | 948 |
 
 The largest 60-second move is about four times larger on the second day, and the 0.2% threshold goes from never tripping to tripping on 948 ticks. A threshold's behavior depends on the volatility regime of the moment as well as on the instrument. This is one pair of days, an example and not a measure of how regimes vary.
 
@@ -287,3 +287,53 @@ Ingester on a real book: the first 50,000 rows, read from a zip with `--timestam
 - **Where the loss comes from.** The average gross loss per round trip (3.52) is close to the file's average full spread for this size (3.59 USD for 10,000 ADA). At the mid the strategy earns roughly nothing, and the loss is the spread plus the commission.
 - **Return.** It depends entirely on an illustrative capital. With 1,000,000 the report shows -54.67% (maximum drawdown -54.67%; annualized Sharpe -35.2 over 30 daily observations, which means nothing for this toy). With 10,000 the report refuses to build, because equity reaches zero. Nothing here is evidence of an edge.
 - **Alpha step timing.** Mean 31.0 microseconds per update over 15.2 million updates, worst single call 33 milliseconds.
+
+### Raw Dukascopy ticks: the datafeed decoder and the export's clock
+
+The public Dukascopy datafeed (`datafeed.dukascopy.com`) holds one LZMA-compressed `.bi5` file per pair and UTC hour (the month is 0-based in the URL). Each tick is 20 bytes, big-endian: a millisecond offset within the hour, the ask, the bid (integers in units of 1e-5 for GBP/USD) and two float32 volumes. A decoder was validated against a CSV exported from the Dukascopy website for the same hour (GBP/USD, 2016-10-07 12:00-13:00 UTC): all 27,256 exported bids equal the raw bids, in order.
+
+The export's clock differs from the raw feed's: every exported timestamp is the raw timestamp truncated to the second plus one second (27,256 of 27,256 rows), and the export omits the raw ticks of the last second of the requested hour (7 ticks here, which would be stamped 13:00:00). Trip times measured on exported Dukascopy CSVs elsewhere in this document are therefore up to about one second later than the raw feed's. The server throttles (HTTP 503, connection resets), so requests need spacing and retries.
+
+### Twelfth dataset: GBP/USD, 2016-10-06 23:00-24:00 UTC (the sterling flash crash, raw ticks)
+
+24,005 raw bid/ask ticks with millisecond timestamps, from 23:00:00.639 to 23:59:56.867, with the real spread and not an assumed one. The spread has a median of 0.00028 and widens to 0.00399 at 23:11:38 (bid 1.20493, ask 1.20892), with 489 ticks above 20 pips. The bid goes from 1.26137 at the start (high 1.26147 at 23:01:34.940) to a low of 1.19198 at 23:09:02.737, a 5.83% high-to-low range with the high first, and ends at 1.23878. The largest 60-second move on the mid is a fall of 3.866% (23:07:32.212, 1.26058 to 1.21184); the largest rise is 1.778% (23:17:16). The tick rate rises from about 90-100 per minute (23:04-23:05) to 238-246 (23:06-23:07), then drops to 28 at 23:10, with a 39-second gap (23:10:12 to 23:10:52).
+
+Flash-crash detector on the mid (offline, tick timestamps). Pre-crash reference: 1.26092, the last mid before 23:06:00. Every first trip is on a fall:
+
+| Threshold (60 s) | Ticks in breach | First trip (UTC) | Price at first trip | Versus pre-crash |
+|---|---|---|---|---|
+| 5.0% (default) | 0 | never | | |
+| 3.0% | 103 | 23:07:18.048 | 1.22259 | -3.04% |
+| 2.0% | 140 | 23:07:15.569 | 1.23508 | -2.05% |
+| 1.0% | 1,086 | 23:07:12.763 | 1.24811 | -1.02% |
+| 0.5% | 2,635 | 23:07:08.251 | 1.25419 | -0.53% |
+| 0.3% | 4,430 | 23:07:06.352 | 1.25704 | -0.31% |
+| 0.2% | 7,276 | 23:07:05.161 | 1.25831 | -0.21% |
+
+Reading it: this is the first real crash in this document on which the default 5%/60 s never trips. On this feed the fall peaked at 3.87% in 60 seconds even though the low was 5.83% below the high. Thresholds from 0.2% to 3% all trip within 13 seconds of the onset (about 23:07:05), the 3% one when the price was already 3.04% down. Compared with the SNB window (the default tripped about 20 seconds after the onset), the fitting threshold clearly depends on the instrument's crash speed. No value follows from two events.
+
+The 2016-10-07 00:00-02:00 UTC hours were also decoded and are calm (largest 60-second move 0.34%, no threshold above 0.3% trips): the crash is at about 00:07 London time, which is 23:07 UTC on the 6th.
+
+### Crash days from Binance spot trades
+
+Four full UTC days from data.binance.vision (SHA-256 verified against the site's checksums), streamed. These are trade prints, not quotes, and the detector was fed the trade price.
+
+| Day | Trades | First to last price | Low to high range | Largest 60 s fall | Largest 60 s rise |
+|---|---|---|---|---|---|
+| BTCUSDT 2020-03-12 | 1,770,812 | -39.51% | 80.64% | -9.82% (10:47:38) | +17.37% (10:49:37) |
+| BTCUSDT 2020-03-13 | 2,309,830 | +16.22% | 57.45% (low first) | -7.84% (02:41:01) | +9.45% (02:31:43) |
+| FTTUSDT 2022-11-08 | 2,742,536 | -75.09% | 780.48% | -21.62% (19:31:20) | +37.09% (19:39:34) |
+| BTCUSDT 2021-05-19 | 6,331,062 | -14.38% | 45.28% | -7.45% (13:21:43) | +8.69% (12:56:17) |
+
+The default 5%/60 s threshold, first trip and trades in breach (the "running high" is the highest price seen so far that day):
+
+| Day | First trip (UTC) | Direction | Price versus the running high | Trades in breach |
+|---|---|---|---|---|
+| BTCUSDT 2020-03-12 | 10:46:05 | fall | -24.03% | 27,962 |
+| BTCUSDT 2020-03-13 | 02:31:16 | rise | -11.06% | 16,060 |
+| FTTUSDT 2022-11-08 | 02:48:49 | fall | -6.20% | 414,902 |
+| BTCUSDT 2021-05-19 | 12:51:15 | rise | -15.54% | 18,831 |
+
+Reading it: the default trips on all four days, but it is far from prompt. On 2020-03-12 it trips on a fall only when the price is already 24% below the day's high; on 2020-03-13 and 2021-05-19 its first trip is a rebound. On FTT it trips early, at -6.20%, about 17 hours before the low (2.51 at 19:32:00). On every day the largest 60-second fall exceeds 5%, so on these days the 5% scale fits crashes, unlike on the majors in FX. Thresholds of 0.2% to 1% trip within the first seconds or minutes of the day (the 0.2% one within the first 32 seconds on all four), which is noise on these assets. No threshold value follows.
+
+Limits: this is the detector alone, not the Kill Switch chain; four spot days on one venue; no orders, positions or losses were modeled.
