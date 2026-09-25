@@ -1,0 +1,487 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Nothierly — Technical Diligence Snapshot</title>
+<meta name="description" content="Execution infrastructure assessment for Nothierly, verified directly against source.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Source+Serif+4:opsz,wght@8..60,500;8..60,600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --navy-950: #0a1628;
+    --navy-900: #0f1f38;
+    --navy-800: #16294a;
+    --navy-700: #22375e;
+    --slate-600: #4b5768;
+    --slate-500: #6b7688;
+    --slate-300: #cdd3dc;
+    --slate-100: #eef1f5;
+    --paper: #f7f8fa;
+    --card: #ffffff;
+    --gold-600: #a3781c;
+    --gold-500: #c39a3a;
+    --gold-100: #f6ecd6;
+    --line: #e3e7ee;
+    --ok-green: #1f7a52;
+    --text-main: var(--navy-900);
+    --text-sub: var(--slate-600);
+
+    /* Pillar accent colors — one per pillar, constant across themes (borders/badges) */
+    --p1: #2554c7; /* capital preservation — blue */
+    --p2: #0e8074; /* quant & AI — teal */
+    --p3: #b1590c; /* compute — bronze */
+    --p4: #7238a8; /* plumbing — violet */
+
+    /* Tint + ink pairs for pills — theme-dependent for contrast */
+    --p1-tint: #e7edfb; --p1-ink: #1d4ed8;
+    --p2-tint: #e0f4f1; --p2-ink: #0f766e;
+    --p3-tint: #fbebd9; --p3-ink: #9a4a0a;
+    --p4-tint: #f1e7fa; --p4-ink: #6d3fa0;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --paper: #0a1220;
+      --card: #101b30;
+      --line: #223047;
+      --slate-600: #a7b1c2;
+      --slate-500: #8b95a8;
+      --slate-300: #3a4a63;
+      --slate-100: #16233a;
+      --text-main: #eef1f5;
+      --text-sub: #b7c0cf;
+      --gold-100: #241d0f;
+      --p1-tint: #16274a; --p1-ink: #9db7f2;
+      --p2-tint: #0e2c28; --p2-ink: #7fd9cb;
+      --p3-tint: #3a2611; --p3-ink: #eab576;
+      --p4-tint: #2a1a3d; --p4-ink: #c9a3e6;
+    }
+  }
+  :root[data-theme="dark"] {
+    --paper: #0a1220;
+    --card: #101b30;
+    --line: #223047;
+    --slate-600: #a7b1c2;
+    --slate-500: #8b95a8;
+    --slate-300: #3a4a63;
+    --slate-100: #16233a;
+    --text-main: #eef1f5;
+    --text-sub: #b7c0cf;
+    --gold-100: #241d0f;
+    --p1-tint: #16274a; --p1-ink: #9db7f2;
+    --p2-tint: #0e2c28; --p2-ink: #7fd9cb;
+    --p3-tint: #3a2611; --p3-ink: #eab576;
+    --p4-tint: #2a1a3d; --p4-ink: #c9a3e6;
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--paper);
+    color: var(--text-main);
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 0 16px 48px; }
+
+  /* Header band */
+  .hero {
+    background: linear-gradient(160deg, var(--navy-950), var(--navy-800) 70%, var(--navy-700));
+    color: #f3f5f8;
+    padding: 44px 16px 38px;
+    margin-bottom: 0;
+  }
+  .hero-inner { max-width: 980px; margin: 0 auto; }
+  .kicker {
+    font-size: 12.5px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--gold-500);
+    font-weight: 700;
+    margin: 0 0 14px;
+  }
+  h1 {
+    font-family: 'Source Serif 4', Georgia, serif;
+    font-weight: 600;
+    font-size: clamp(28px, 4.2vw, 42px);
+    line-height: 1.12;
+    margin: 0 0 10px;
+    color: #ffffff;
+  }
+  .subtitle {
+    font-size: 16.5px;
+    color: #c7cee0;
+    max-width: 620px;
+    margin: 0 0 22px;
+  }
+  .meta-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px 28px;
+    font-size: 13px;
+    color: #9fabc4;
+    border-top: 1px solid rgba(255,255,255,0.14);
+    padding-top: 16px;
+  }
+  .meta-row strong { color: #e3e8f2; font-weight: 600; }
+
+  .method-note {
+    background: var(--navy-900);
+    border-left: 3px solid var(--gold-500);
+    color: #d7dded;
+    font-size: 13.5px;
+    padding: 14px 18px;
+    margin-top: 22px;
+    border-radius: 3px;
+  }
+  .method-note b { color: #fff; }
+
+  /* KPI strip */
+  .kpi-band {
+    background: var(--card);
+    border-bottom: 1px solid var(--line);
+  }
+  .kpi-strip {
+    max-width: 980px;
+    margin: 0 auto;
+    padding: 26px 16px;
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 18px;
+  }
+  @media (max-width: 720px) {
+    .kpi-strip { grid-template-columns: 1fr 1fr; }
+  }
+  .kpi-item { text-align: left; }
+  .kpi-number {
+    font-family: 'Source Serif 4', Georgia, serif;
+    font-weight: 600;
+    font-size: 30px;
+    color: var(--navy-900);
+    line-height: 1;
+    margin-bottom: 6px;
+  }
+  .kpi-number span { color: var(--gold-600); }
+  .kpi-label {
+    font-size: 12px;
+    color: var(--text-sub);
+    line-height: 1.4;
+  }
+
+  /* Pillars */
+  .section-label {
+    font-size: 12.5px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--gold-600);
+    font-weight: 700;
+    margin: 40px 0 4px;
+  }
+  .section-title {
+    font-family: 'Source Serif 4', Georgia, serif;
+    font-size: 24px;
+    font-weight: 600;
+    margin: 0 0 22px;
+    color: var(--text-main);
+  }
+
+  .grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 18px;
+  }
+  @media (max-width: 720px) {
+    .grid { grid-template-columns: 1fr; }
+  }
+
+  .card {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-top: 4px solid var(--accent, var(--navy-700));
+    border-radius: 8px;
+    padding: 22px 22px 20px;
+  }
+  .card .num {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px; height: 28px;
+    border-radius: 50%;
+    background: var(--accent, var(--navy-900));
+    color: #ffffff;
+    font-size: 12.5px;
+    font-weight: 700;
+    margin-bottom: 12px;
+  }
+  .card-1 { --accent: var(--p1); --accent-tint: var(--p1-tint); --accent-ink: var(--p1-ink); }
+  .card-2 { --accent: var(--p2); --accent-tint: var(--p2-tint); --accent-ink: var(--p2-ink); }
+  .card-3 { --accent: var(--p3); --accent-tint: var(--p3-tint); --accent-ink: var(--p3-ink); }
+  .card-4 { --accent: var(--p4); --accent-tint: var(--p4-tint); --accent-ink: var(--p4-ink); }
+  .card h3 {
+    font-size: 16.5px;
+    font-weight: 700;
+    margin: 0 0 4px;
+    color: var(--text-main);
+  }
+  .card .tag {
+    font-size: 11.5px;
+    color: var(--text-sub);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin: 0 0 14px;
+  }
+  .card ul {
+    margin: 0;
+    padding-left: 18px;
+  }
+  .card li {
+    font-size: 13.8px;
+    color: var(--slate-600);
+    margin-bottom: 9px;
+  }
+  .card li:last-child { margin-bottom: 0; }
+  .card li b { color: var(--text-main); }
+  code {
+    font-family: 'SFMono-Regular', Consolas, Menlo, monospace;
+    font-size: 0.92em;
+    background: var(--slate-100);
+    padding: 1px 5px;
+    border-radius: 3px;
+    color: var(--navy-800);
+  }
+  @media (prefers-color-scheme: dark) { code { color: #cdd8ee; } }
+  :root[data-theme="dark"] code { color: #cdd8ee; }
+
+  .stat-strip {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-top: 14px;
+    padding-top: 14px;
+    border-top: 1px dashed var(--line);
+  }
+  .stat {
+    font-size: 11.5px;
+    color: var(--accent-ink, var(--navy-700));
+    background: var(--accent-tint, var(--slate-100));
+    padding: 4px 9px;
+    border-radius: 999px;
+    font-weight: 600;
+  }
+
+  /* R&D track — deliberately muted, distinct from the 4 verified pillars */
+  .rnd-panel {
+    margin-top: 32px;
+    background: var(--slate-100);
+    border: 1px dashed var(--slate-300);
+    border-radius: 10px;
+    padding: 22px 26px;
+  }
+  .rnd-panel .section-label { margin-top: 0; color: var(--slate-500); }
+  .rnd-panel h2 {
+    font-family: 'Source Serif 4', Georgia, serif;
+    font-size: 19px;
+    margin: 2px 0 12px;
+    color: var(--text-main);
+  }
+  .rnd-panel ul { margin: 0 0 12px; padding-left: 18px; }
+  .rnd-panel li { font-size: 13.5px; color: var(--slate-600); margin-bottom: 8px; }
+  .rnd-panel .not-included {
+    font-size: 12.5px;
+    color: var(--slate-500);
+    border-top: 1px solid var(--slate-300);
+    padding-top: 12px;
+    margin-top: 4px;
+  }
+
+  /* Differentiator */
+  .callout {
+    margin-top: 32px;
+    background: linear-gradient(135deg, var(--gold-100), var(--card) 60%);
+    border: 1px solid var(--gold-500);
+    border-radius: 10px;
+    padding: 26px 28px;
+  }
+  .callout .section-label { margin-top: 0; color: var(--gold-600); }
+  .callout h2 {
+    font-family: 'Source Serif 4', Georgia, serif;
+    font-size: 21px;
+    margin: 2px 0 10px;
+    color: var(--text-main);
+  }
+  .callout p {
+    font-size: 14.5px;
+    color: var(--slate-600);
+    margin: 0;
+    max-width: 760px;
+  }
+
+  /* Footer */
+  .footer {
+    margin-top: 40px;
+    border-top: 1px solid var(--line);
+    padding-top: 22px;
+    display: flex;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 20px;
+  }
+  .disclaimer {
+    font-size: 12.5px;
+    color: var(--slate-500);
+    max-width: 560px;
+    line-height: 1.6;
+  }
+  .contact {
+    font-size: 13.5px;
+    color: var(--text-main);
+    text-align: right;
+  }
+  .contact .role { color: var(--slate-500); font-size: 12px; }
+  .contact a { color: var(--navy-800); text-decoration: none; font-weight: 600; }
+  :root[data-theme="dark"] .contact a, @media (prefers-color-scheme: dark) { .contact a { color: #dbe3f2; } }
+  @media (max-width: 560px) { .contact { text-align: left; } .footer { flex-direction: column; } }
+</style>
+</head>
+<body>
+
+<div class="hero">
+  <div class="hero-inner">
+    <p class="kicker">Technical Diligence Snapshot</p>
+    <h1>Nothierly — Execution Infrastructure</h1>
+    <p class="subtitle">A verified read of four load-bearing engineering claims behind the acqui-hire case, prepared for investment-committee review.</p>
+    <div class="meta-row">
+      <span><strong>Prepared by</strong> Chief Risk Officer &amp; Lead Technology, M&amp;A</span>
+      <span><strong>Subject</strong> Nothierly IP &amp; architect</span>
+      <span><strong>Status</strong> Technical assessment only</span>
+    </div>
+    <div class="method-note">
+      <b>Method.</b> Every claim below was checked directly against the repository — file, function, and test cited, not summarized from a pitch. The full memorandum, with line-level citations, is available on request.
+    </div>
+  </div>
+</div>
+
+<div class="kpi-band">
+  <div class="kpi-strip">
+    <div class="kpi-item">
+      <div class="kpi-number">100,504</div>
+      <div class="kpi-label">Lines of Python, git-tracked — 75,727 source / 24,637 tests (<span></span>excl. archive &amp; generated gRPC code)</div>
+    </div>
+    <div class="kpi-item">
+      <div class="kpi-number">24h / <span>0</span></div>
+      <div class="kpi-label">Continuous chaos shadow run, zero process crashes — including through a real, uncontrolled multi-hour exchange outage</div>
+    </div>
+    <div class="kpi-item">
+      <div class="kpi-number">451</div>
+      <div class="kpi-label">Real Kill Switch trips recorded in that same run — held every time, zero unsafe fills</div>
+    </div>
+    <div class="kpi-item">
+      <div class="kpi-number">3</div>
+      <div class="kpi-label">Independent live execution venues — crypto (ccxt), FX (Oanda), Interactive Brokers</div>
+    </div>
+  </div>
+</div>
+
+<div class="wrap">
+
+  <p class="section-label">Assessment</p>
+  <h2 class="section-title">Four verified pillars</h2>
+
+  <div class="grid">
+
+    <div class="card card-1">
+      <span class="num">1</span>
+      <h3>Deterministic Capital Preservation</h3>
+      <p class="tag">Fail-closed control architecture</p>
+      <ul>
+        <li>Two-tier Kill Switch — a system-wide flag plus a per-agent local check — with three real states and an authenticated manual reset path (<code>core/security.py</code>).</li>
+        <li><b>Red-teamed, not just asserted safe.</b> The project's own adversarial test found an authentication bypass in the status flag; the fix ships HMAC-SHA256 signing, failing closed on any mismatch.</li>
+        <li>Held under real stress: <b>451</b> real trips and <b>6,618</b> blocked money-creating calls during one 24-hour live-market run.</li>
+        <li>Fail-soft SMS (Twilio) + Telegram alerting, deliberately decoupled — the control never waits on a notification, and a notification failure never blocks the control.</li>
+      </ul>
+      <div class="stat-strip">
+        <span class="stat">HMAC-signed</span>
+        <span class="stat">3-state</span>
+        <span class="stat">Red-team verified</span>
+      </div>
+    </div>
+
+    <div class="card card-2">
+      <span class="num">2</span>
+      <h3>Quantitative Rigor &amp; Governed AI</h3>
+      <p class="tag">Closed-form finance theory + constrained ML</p>
+      <ul>
+        <li>Marchenko-Pastur random-matrix denoising (Laloux et al. 1999), Almgren-Chriss optimal execution, Extreme Value Theory VaR, Hawkes / Ornstein-Uhlenbeck processes — live-wired into the execution gate, each independently tested.</li>
+        <li><b>Two independent live ML agents — XGBoost and reinforcement learning — neither able to place an order on its own.</b> A trade fires only once a separate arbitration step confirms both agree on direction; disagreement is a hard veto, not a soft signal.</li>
+        <li>Proven to bind, not rubber-stamp: in one 24-hour live run, the arbitrator vetoed <b>11,218</b> conflicting signals against <b>6,618</b> approved — it rejected more than it passed.</li>
+        <li><b>The rarer signal:</b> the same codebase documents techniques evaluated and explicitly declined as non-rigorous — an engineering culture that turns down the dressed-up version of its own pitch.</li>
+      </ul>
+      <div class="stat-strip">
+        <span class="stat">Peer-cited methods</span>
+        <span class="stat">Dual-model consensus</span>
+        <span class="stat">Unit-tested</span>
+      </div>
+    </div>
+
+    <div class="card card-3">
+      <span class="num">3</span>
+      <h3>Compute Infrastructure</h3>
+      <p class="tag">Retraining pipeline economics</p>
+      <ul>
+        <li>Real, production-grade GPU rental automation (Vast.ai) for low-cost model retraining.</li>
+        <li>Billing-mutating calls fail loud instead of auto-retrying — a deliberate safeguard against silently renting (and paying for) duplicate GPU instances on a transient error.</li>
+      </ul>
+      <div class="stat-strip">
+        <span class="stat">Real REST integration</span>
+        <span class="stat">Double-billing safe</span>
+      </div>
+    </div>
+
+    <div class="card card-4">
+      <span class="num">4</span>
+      <h3>Institutional Plumbing</h3>
+      <p class="tag">Deployment &amp; venue abstraction</p>
+      <ul>
+        <li>Enforced Docker network isolation; host networking scoped to exactly the one latency-critical service, with the rationale documented rather than applied everywhere by default.</li>
+        <li>Genuine three-venue execution abstraction — crypto (ccxt), FX (Oanda), and Interactive Brokers — each with disclosed, not hidden, capability limits.</li>
+        <li>Survived a real, uncontrolled multi-hour exchange outage during chaos testing: zero crashes, zero unsafe fills, trading correctly blocked for the full duration.</li>
+      </ul>
+      <div class="stat-strip">
+        <span class="stat">3 live venues</span>
+        <span class="stat">Zero unsafe fills</span>
+      </div>
+    </div>
+
+  </div>
+
+  <div class="rnd-panel">
+    <p class="section-label">Beyond the core — research track, not a fifth pillar</p>
+    <h2>Real R&amp;D tooling, deliberately kept behind human review</h2>
+    <ul>
+      <li><b>CMA-ES evolutionary hyperparameter search</b> (Hansen &amp; Ostermeier, 2001 — a real, peer-reviewed, decades-old optimization method). Every run produces a proposal in a human-reviewed queue; nothing is applied to a live strategy untouched. The module's own docstring explicitly rejects "the code evolves on its own overnight" as a known overfitting anti-pattern, not a feature.</li>
+      <li><b>A three-role LLM pipeline</b> (Scout → Hypothesis Generator → Backtest Coder) that reads the project's own real signal stores and proposes new, sandbox-backtested strategy code for human sign-off — never auto-deployed.</li>
+    </ul>
+    <p class="not-included">Deliberately not claimed here: a spiking neural network ("biological" neuron) module exists in the codebase but is confirmed R&amp;D-only — a manual dashboard trigger, never wired to a live agent. The physics correction in the full memorandum still applies. "Architecture" beyond the infrastructure already covered in Pillar 4 is not a separate, verifiable claim.</p>
+  </div>
+
+  <div class="callout">
+    <p class="section-label">What actually differentiates this target</p>
+    <h2>The diligence process itself is evidence</h2>
+    <p>This review surfaced a false failure verdict inside the target's own chaos-testing tooling. The root cause was found, fixed, and re-verified within the same review cycle — the codebase does not merely perform under stress, it holds up to independent scrutiny of its own test results. That is a harder trait to fake than any single benchmark, and it is a meaningfully better predictor of how this asset behaves the first time a real auditor, not a pitch deck, looks under the hood.</p>
+  </div>
+
+  <div class="footer">
+    <p class="disclaimer">Valuation quantum is a comparables and negotiation question for Corporate Development and is intentionally not asserted in this document. This assessment supports the technical case for a seed / acqui-hire allocation, subject to independent financial and legal due diligence — neither of which this document constitutes.</p>
+    <div class="contact">
+      <div><b>Mouhamed Ngom</b></div>
+      <div class="role">Architect — Nothierly</div>
+      <div><a href="mailto:nothierly@gmail.com">nothierly@gmail.com</a></div>
+    </div>
+  </div>
+
+</div>
+
+</body>
+</html>
