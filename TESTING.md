@@ -118,7 +118,7 @@ The shock window itself was run later; see the seventh dataset below.
 
 The default 5%/60 s threshold trips on none of them, as expected, since none is a crash. A low threshold trips in the volatile hours, including once well before the 12:30 burst (GBP/USD at 0.2%), and not at all in the quiet yen hour, so the right value depends on each instrument's volatility regime. This supports a per-instrument threshold, calibrated on far more data than a handful of hours, and does not establish any particular value.
 
-The SNB shock window has since been run (seventh dataset below). Not yet run: the other true-crash windows, the sterling flash crash (2016-10-07, Asian trading hours) and the yen flash crash (2019-01-03, Asian trading hours). Their results are unknown until they are run and recorded here.
+The SNB shock window has since been run (seventh dataset below). Not yet run: the other true-crash windows, the sterling flash crash (2016-10-07, Asian trading hours) and the yen flash crash (inside the 4-hour bar opening 2019-01-02 22:00 UTC; see the set-aside note below). Their results are unknown until they are run and recorded here.
 
 ### Fifth dataset: AUD/JPY, 2020-03-09, 1-minute bars (full day)
 
@@ -194,3 +194,7 @@ The same pair in the same hour on two consecutive days:
 | 2016-10-07 (day of the flash crash, this hour) | 27,256 | 0.43% | 948 |
 
 The largest 60-second move is about four times larger on the second day, and the 0.2% threshold goes from never tripping to tripping on 948 ticks. A threshold's behavior depends on the volatility regime of the moment as well as on the instrument. This is one pair of days, an example and not a measure of how regimes vary.
+
+### Set aside: AUD/JPY, 2019-01-02, 4-hour bars
+
+Six 4-hour bars, too coarse for a 60-second detector, so nothing was replayed. The first five are ordinary, with ranges of 0.47% to 0.82% against each bar's open. The last bar, which opens at 22:00 UTC on 2019-01-02 and covers the following four hours, contains the yen flash crash: open 76.044, low 70.406 (-7.41%), close 74.303, a rebound of +5.54% from the low. The largest adjacent-bar span is 8.80% (bars 18:00 and 22:00). Unlike the earlier bar files, that bound is above 5%, so it no longer excludes a trip of the default threshold; it does not show one either, because 4-hour bars do not say how fast the price fell. What the file does settle is the window to extract: ticks or 1-minute bars of AUD/JPY from 2019-01-02 22:00 UTC to 2019-01-03 02:00 UTC.
