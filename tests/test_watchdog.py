@@ -10,6 +10,7 @@ killing the pytest process.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from pathlib import Path
 from typing import Generator
@@ -272,8 +273,8 @@ async def test_healthy_tick_writes_a_fresh_heartbeat_file(redis_client: RedisCli
     after = time.time()
 
     assert heartbeat_file.exists()
-    written_at = float(heartbeat_file.read_text())
-    assert before <= written_at <= after
+    payload = json.loads(heartbeat_file.read_text(encoding="utf-8"))
+    assert before <= payload["timestamp"] <= after
 
 
 # =============================================================================
