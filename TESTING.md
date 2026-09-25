@@ -111,6 +111,7 @@ The shock window itself was run later; see the seventh dataset below.
 |---|---|---|---|---|
 | EUR/USD 2024-06-07 | 12,194 | 0.49% | 646 (from 12:30:07) | 751 (from 12:30:03) |
 | EUR/CHF 2015-01-15 | 5,924 | 0.33% | 0 | 191 (from 12:01:13) |
+| GBP/USD 2016-10-06 | 18,441 | 0.11% | 0 | 0 |
 | GBP/USD 2016-10-07 | 27,256 | 0.43% | 3 (from 12:31:00) | 948 (from 12:13:32) |
 | USD/JPY 2019-01-03 | 3,700 | 0.085% | 0 | 0 |
 | Copper 2026-09-08 | 2,615 | 0.26% | 0 | 26 (from 12:10:05) |
@@ -177,3 +178,19 @@ The first real crash in the set: 973 bid-only ticks, replayed with `--symbol EUR
 Reading it: the default 5%/60 s does trip on a real crash of this speed, at 09:31:09, about 20 seconds after the move began, when the bid was already 5.60% below the pre-shock level. The price went on to fall about 29% from the first tick. A 0.5% threshold would have tripped one second after the onset, at -0.54%. Together with the AUD/JPY day (a 7% range spread over minutes, on which the default never trips), the default behaves as a catastrophe tripwire: it catches a collapse of this speed after a large part of the first leg has happened, and misses slower stress. Lower thresholds trip earlier, but they also trip in ordinary volatile hours (see the comparison above). No threshold value follows from this.
 
 Limits: this is the detector alone, driven with the tick timestamps, not the Kill Switch chain, so supervisor cycle time, Redis and ZMQ latency add nothing here and were not measured. It is one event on a bid-only feed, and no orders, positions or losses were modeled, so it says nothing about capital preserved.
+
+### Eighth dataset: GBP/USD, 2016-10-06 12:00-13:00 UTC (the afternoon before the sterling flash crash)
+
+18,441 bid-only ticks, replayed with `--symbol GBP_USD` and an assumed 1-pip spread (0.0001). The bid goes from 1.26612 to 1.26362 (-0.20%), with a 0.27% range over the hour and a largest 60-second move of 0.106% (12:21:41 UTC). A calm hour. The flash crash itself (7 October, in Asian trading hours) is not in this file.
+
+- **Bus delivery.** 18,441 published, 18,441 received, in file order, 0 value differences against the CSV.
+- **Flash-crash detector** (driven offline with the file's timestamps): none of 5.0%, 0.5%, 0.4%, 0.3% or 0.2% trips.
+
+The same pair in the same hour on two consecutive days:
+
+| GBP/USD, 12:00-13:00 UTC | Ticks | Largest 60 s move | Ticks in breach at 0.2% |
+|---|---|---|---|
+| 2016-10-06 (day before) | 18,441 | 0.106% | 0 |
+| 2016-10-07 (day of the flash crash, this hour) | 27,256 | 0.43% | 948 |
+
+The largest 60-second move is about four times larger on the second day, and the 0.2% threshold goes from never tripping to tripping on 948 ticks. A threshold's behavior depends on the volatility regime of the moment as well as on the instrument. This is one pair of days, an example and not a measure of how regimes vary.
