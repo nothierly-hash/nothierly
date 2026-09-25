@@ -109,6 +109,33 @@ def test_a_guardrail_firing_during_shadow_is_a_no_go(tmp_path: Path) -> None:
     assert exit_code == 2
 
 
+def test_market_data_circuit_breaker_trip_is_not_a_false_no_go(tmp_path: Path) -> None:
+    """Real bug found and fixed running this analyzer against the real 24h run in
+    logs/shadow_run_24h_20260923_024500: alpha_engine_market_data_circuit_breaker_tripped fell
+    through to the generic "uncategorized critical" bucket and single-handedly forced a false
+    NO_GO for a real Binance WS outage the breaker correctly reacted to. Unlike the 4
+    _GUARDRAIL_TRIP_EVENTS (order/risk guardrails structurally unreachable in SHADOW), this one
+    reacts to the real, live market-data feed and can legitimately fire during SHADOW too."""
+    start = datetime(2026, 9, 7, tzinfo=timezone.utc)
+    lines = [
+        _line("alpha_engine_started", timestamp=_timestamps(start, 0)[0]),
+        _line(
+            "alpha_engine_market_data_circuit_breaker_tripped",
+            level="critical",
+            timestamp=_timestamps(start, 100)[0],
+            consecutive_failures=6,
+        ),
+        _line("alpha_engine_simulated_quote", timestamp=_timestamps(start, 24 * 3600)[0]),
+    ]
+    path = _write_log(tmp_path, lines)
+
+    diagnostics = analyze_shadow_run.compute_diagnostics(path.read_text(encoding="utf-8").splitlines())
+
+    assert diagnostics.unexpected_failures == []
+    assert len(diagnostics.market_data_circuit_breaker_trips) == 1
+    assert diagnostics.verdict == "GO"
+
+
 def test_high_stale_data_count_is_attention_not_go(tmp_path: Path) -> None:
     start = datetime(2026, 9, 7, tzinfo=timezone.utc)
     lines = [_line("alpha_engine_started", timestamp=_timestamps(start, 0)[0])]

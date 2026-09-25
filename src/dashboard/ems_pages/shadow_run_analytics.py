@@ -108,6 +108,8 @@ else:
     col5, col6, col7 = st.columns(3)
     col5.metric("Guardrails déclenchés", len(diagnostics.guardrail_trips))
     col6.metric("Interruptions suspectes", len(diagnostics.gaps))
+    if diagnostics.market_data_circuit_breaker_trips:
+        st.caption(f"🔌 Disjoncteur de données de marché : {len(diagnostics.market_data_circuit_breaker_trips)} déclenchement(s) réel(s) -- défense correcte, pas une anomalie (voir `scripts/analyze_shadow_run.py`).")
     if diagnostics.daily_loss_limit_configured is None:
         daily_loss_value = "❔ Indéterminé"
     elif diagnostics.daily_loss_limit_configured:

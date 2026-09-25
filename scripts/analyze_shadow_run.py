@@ -109,6 +109,23 @@ _GUARDRAIL_TRIP_EVENTS: dict[str, str] = {
     "alpha_engine_emergency_liquidate_blocked_by_kill_switch": "Emergency Liquidate bloqué par le Kill Switch global",
 }
 
+# Real market-data-freshness circuit breaker forcing AlphaMarketMakerAgent OFF after sustained
+# stale/corrupted upstream data (src/agents/alpha_engine/agent.py's _force_off call inside
+# _handle_market_data_circuit_breaker_trip). Deliberately NOT in _GUARDRAIL_TRIP_EVENTS above:
+# that list is for order/risk guardrails structurally unreachable in SHADOW (no real order exists
+# to fat-finger or rate-limit). This one reacts to the real upstream market-data feed, which is
+# live regardless of SHADOW/LIVE order mode, so it can and should fire whenever the real exchange
+# connection genuinely degrades -- seeing it is the circuit breaker doing its job, not an anomaly.
+# Real bug found and fixed running this script against the real 24h run in
+# logs/shadow_run_24h_20260923_024500: before this fix, this event fell through to the generic
+# "uncategorized critical" bucket below and single-handedly forced a false NO_GO, for the same
+# real Binance WS outage core/network/resilient_ws.py's own docstring documents (500 real
+# reconnects, one real ~112-minute feed gap) -- the exchange feed genuinely degraded, and this
+# breaker correctly tripped in response; that is not a system failure to report as one.
+_MARKET_DATA_DEFENSE_EVENTS: dict[str, str] = {
+    "alpha_engine_market_data_circuit_breaker_tripped": "Disjoncteur de données de marché déclenché (moteur mis OFF, flux amont réellement dégradé)",
+}
+
 _STALE_DATA_EVENT = "alpha_engine_stale_data_detected"
 _SIMULATED_QUOTE_EVENT = "alpha_engine_simulated_quote"
 _STARTED_EVENT = "alpha_engine_started"
@@ -135,6 +152,7 @@ class ShadowRunDiagnostics:
     event_counts: Counter[str]
     unexpected_failures: list[tuple[int, str, str]] = field(default_factory=list)
     guardrail_trips: list[tuple[int, str, str]] = field(default_factory=list)
+    market_data_circuit_breaker_trips: list[tuple[int, str, str]] = field(default_factory=list)
     unparseable_lines: list[tuple[int, str]] = field(default_factory=list)
     gaps: list[tuple[datetime, float]] = field(default_factory=list)
     verdict: Verdict = "NO_GO"
@@ -163,6 +181,7 @@ def compute_diagnostics(lines: Iterable[str]) -> ShadowRunDiagnostics:
     event_counts: Counter[str] = Counter()
     unexpected_failures: list[tuple[int, str, str]] = []
     guardrail_trips: list[tuple[int, str, str]] = []
+    market_data_circuit_breaker_trips: list[tuple[int, str, str]] = []
     stale_data_count = 0
     simulated_quote_count = 0
     daily_loss_limit_configured = True  # innocent until the startup warning says otherwise
@@ -204,8 +223,16 @@ def compute_diagnostics(lines: Iterable[str]) -> ShadowRunDiagnostics:
             unexpected_failures.append((line_number, event, _UNEXPECTED_FAILURE_EVENTS[event]))
         elif event in _GUARDRAIL_TRIP_EVENTS:
             guardrail_trips.append((line_number, event, _GUARDRAIL_TRIP_EVENTS[event]))
+        elif event in _MARKET_DATA_DEFENSE_EVENTS:
+            market_data_circuit_breaker_trips.append((line_number, event, _MARKET_DATA_DEFENSE_EVENTS[event]))
 
-        if level in ("error", "critical") and event not in _UNEXPECTED_FAILURE_EVENTS and event not in _GUARDRAIL_TRIP_EVENTS and event != _NO_DAILY_LOSS_LIMIT_EVENT:
+        if (
+            level in ("error", "critical")
+            and event not in _UNEXPECTED_FAILURE_EVENTS
+            and event not in _GUARDRAIL_TRIP_EVENTS
+            and event not in _MARKET_DATA_DEFENSE_EVENTS
+            and event != _NO_DAILY_LOSS_LIMIT_EVENT
+        ):
             # Anything else logged at error/critical this script doesn't already have a specific
             # bucket for -- caught here so a future new critical/error event in the source doesn't
             # silently fall through unclassified.
@@ -238,6 +265,7 @@ def compute_diagnostics(lines: Iterable[str]) -> ShadowRunDiagnostics:
         event_counts=event_counts,
         unexpected_failures=unexpected_failures,
         guardrail_trips=guardrail_trips,
+        market_data_circuit_breaker_trips=market_data_circuit_breaker_trips,
         unparseable_lines=unparseable_lines,
         gaps=gaps,
     )
@@ -321,6 +349,12 @@ def print_report(d: ShadowRunDiagnostics, *, source_label: str) -> None:
         print("   Aucun déclenchement -- attendu et correct pour un run en SHADOW.")
     print(f"Coupures de flux de marché détectées (staleness réelle) : {d.stale_data_count}")
     print("-" * 60)
+
+    if d.market_data_circuit_breaker_trips:
+        print(f"🔌 Disjoncteur de données de marché (défense réelle, pas une anomalie) : {len(d.market_data_circuit_breaker_trips)} déclenchement(s)")
+        for line_number, event, label in d.market_data_circuit_breaker_trips[:5]:
+            print(f"   > Ligne {line_number} [{event}] : {label}")
+        print("-" * 60)
 
     print(f"❌ ÉCHECS RÉELS NON ATTENDUS : {len(d.unexpected_failures)}")
     for line_number, event, label in d.unexpected_failures[:10]:
