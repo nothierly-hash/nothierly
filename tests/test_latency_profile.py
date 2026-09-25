@@ -407,7 +407,8 @@ def test_render_separates_entry_latency_from_every_tick_latency() -> None:
 
     assert "Recorded ticks: 8" in text
     assert "BUY 1" in text and "CLOSE 1" in text and "none 6" in text
-    assert "Tick-to-order, entry signals through the Risk Gates (T1 to T2)** (n = 1)" in text
+    assert "Tick-to-order, entry signals that went through the Risk Gates (T1 to T2)** (n = 1)" in text
+    assert "Entry signals refused before the gates, Kill Switch latched (T1 to T2, for reference)** (n = 0)" in text
     assert "Tick-to-decision, every tick (T1 to the end of the alpha step)** (n = 8)" in text
 
 
@@ -426,3 +427,18 @@ def test_the_cli_reads_the_csv_and_the_metadata(tmp_path: Path, capsys: pytest.C
 
     monkeypatch.setattr(sys, "argv", ["analyze_t2t.py", str(tmp_path / "missing.csv")])
     assert t2t.main() == 2
+
+
+def test_entries_refused_before_the_gates_are_not_mixed_into_the_gate_latency() -> None:
+    """A latched Kill Switch makes an entry cost one is_system_safe call; averaging it in would understate the gates."""
+    def row(seq: int, gate_reached: str, order_ns: int) -> dict[str, str]:
+        return {"seq": str(seq), "signal": "1", "gate_reached": gate_reached, "risk_event": "0", "ingest_lag_ns": "0", "decode_ns": "1",
+                "risk_check_ns": "1", "alpha_ns": "1", "gates_ns": str(order_ns), "tick_to_decision_ns": "3", "tick_to_order_ns": str(order_ns)}
+
+    rows = [row(0, "8", 4_000_000), row(1, "8", 6_000_000), row(2, "0", 700_000), row(3, "0", 800_000), row(4, "0", 900_000)]
+
+    text = t2t.render(rows, None)
+
+    assert "went through the Risk Gates (T1 to T2)** (n = 2)" in text
+    assert "refused before the gates, Kill Switch latched (T1 to T2, for reference)** (n = 3)" in text
+    assert "| 50th | 4,000.0 |" in text  # the gates' own median, untouched by the three cheap refusals

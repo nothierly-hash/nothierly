@@ -83,9 +83,17 @@ def percentile_table(title: str, values: list[int], *, unit: str = "us") -> list
     return lines
 
 
+def _entries(rows: list[dict[str, str]]) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    """Entry signals split into (went through the Risk Gates, refused before them because the Kill Switch was latched)."""
+    entries = [row for row in rows if row["signal"] in _ENTRY_SIGNALS]
+    return [row for row in entries if row["gate_reached"] != "0"], [row for row in entries if row["gate_reached"] == "0"]
+
+
 def stage_table(rows: list[dict[str, str]]) -> list[str]:
+    through, refused = _entries(rows)
     stages = (("decode", "decode_ns", rows), ("risk pre-check", "risk_check_ns", rows), ("alpha z-score", "alpha_ns", rows),
-              ("Risk Gates + is_system_safe (entries)", "gates_ns", [r for r in rows if r["signal"] in _ENTRY_SIGNALS]))
+              ("is_system_safe + Risk Gates (entries that went through)", "gates_ns", through),
+              ("is_system_safe alone (entries refused, Kill Switch latched)", "gates_ns", refused))
     lines = ["**Per stage**", "", "| Stage | n | p50 (us) | p99 (us) | max (us) |", "|---|---:|---:|---:|---:|"]
     for name, column, subset in stages:
         values = sorted(int(row[column]) for row in subset)
@@ -97,6 +105,7 @@ def stage_table(rows: list[dict[str, str]]) -> list[str]:
 
 def render(rows: list[dict[str, str]], meta: dict[str, Any] | None) -> str:
     entries = [row for row in rows if row["signal"] in _ENTRY_SIGNALS]
+    through, refused = _entries(rows)
     signal_counts: dict[str, int] = {}
     for row in rows:
         name = _SIGNAL_NAMES.get(row["signal"], row["signal"])
@@ -112,7 +121,8 @@ def render(rows: list[dict[str, str]], meta: dict[str, Any] | None) -> str:
              f"Ticks on which the risk pre-check raised a Kill Switch event: {risk_events:,}.", ""]
     lines += percentile_table("Queue delay before T1, every tick (publisher timestamp to T1)", [int(row["ingest_lag_ns"]) for row in rows], unit="ms")
     lines += percentile_table("Tick-to-decision, every tick (T1 to the end of the alpha step)", [int(row["tick_to_decision_ns"]) for row in rows])
-    lines += percentile_table("Tick-to-order, entry signals through the Risk Gates (T1 to T2)", [int(row["tick_to_order_ns"]) for row in entries])
+    lines += percentile_table("Tick-to-order, entry signals that went through the Risk Gates (T1 to T2)", [int(row["tick_to_order_ns"]) for row in through])
+    lines += percentile_table("Entry signals refused before the gates, Kill Switch latched (T1 to T2, for reference)", [int(row["tick_to_order_ns"]) for row in refused])
     lines += stage_table(rows)
     if meta:
         samples = meta.get("rss_mb_samples", [])
