@@ -181,6 +181,16 @@ Reading it: the default 5%/60 s does trip on a real crash of this speed, at 09:3
 
 Limits: this is the detector alone, driven with the tick timestamps, not the Kill Switch chain, so supervisor cycle time, Redis and ZMQ latency add nothing here and were not measured. It is one event on a bid-only feed, and no orders, positions or losses were modeled, so it says nothing about capital preserved.
 
+### Companion to the seventh dataset: EUR/CHF 2015-01-15, full day in 10-minute bars
+
+144 bid-side bars of 10 minutes (00:00-23:50 UTC). They are not replayed, because 10-minute bars are too coarse for a 60-second detector; they are used to cross-check the tick file and to give the shock its context.
+
+- **Cross-check.** Two independent extractions agree exactly: the low of the 09:40 bar (0.84989) is the tick file's minimum (09:49:14), and the close of the 09:50 bar (1.02542) is the tick file's last tick (09:59:12).
+- **Before the shock.** From 00:00 to 09:20 (57 bars) the total bid range is 0.0133% and the largest single 10-minute range is 0.0092%. The price is pinned to the 1.20 floor.
+- **The shock bars.** 09:30: low 0.99535, range 17.12% against the open. 09:40: low 0.84989, range 16.64%. 09:50: range 20.72%, close 1.02542. 10:00: range 6.11%. The day's low is 0.84989, -29.23% versus the pre-shock level, and the day closes at 0.99357.
+- **Rest of the day.** Volatile but without a second collapse: after 10:10 the largest 10-minute range is 2.81% (21:50), and 9 bars exceed 1%. The largest span of two adjacent 10-minute bars is 3.25% (21:40 and 21:50), below 5%, so the default 5%/60 s could not have tripped on any 60-second window lying entirely after 10:10. With bars this coarse the bound says nothing about lower thresholds.
+- **Regime note.** Before the shock the range is about 0.01% per 10 minutes, so a threshold calibrated on that regime alone would sit orders of magnitude below the volatility of the rest of the day. This is an observation about how far apart the two regimes are, not a recommendation.
+
 ### Eighth dataset: GBP/USD, 2016-10-06 12:00-13:00 UTC (the afternoon before the sterling flash crash)
 
 18,441 bid-only ticks, replayed with `--symbol GBP_USD` and an assumed 1-pip spread (0.0001). The bid goes from 1.26612 to 1.26362 (-0.20%), with a 0.27% range over the hour and a largest 60-second move of 0.106% (12:21:41 UTC). A calm hour. The flash crash itself (7 October, in Asian trading hours) is not in this file.
