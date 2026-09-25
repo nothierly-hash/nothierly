@@ -11,6 +11,7 @@ applies to its own Python-version pin.
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from typing import Any, Final
 
@@ -79,6 +80,17 @@ def decode_access_token(token: str, *, settings: JwtSettings) -> str:
 # occasionally one EXPIRE) -- reimplemented standalone here rather than imported, for the air-gap
 # reason documented in retail_gateway/db.py. Fail-closed on Redis downtime: a rate limiter that
 # lets traffic through when it can't check the count is not a rate limiter.
+#
+# The window is ``int(clock()) // window_seconds``, and the clock is always passed in by the caller
+# (see ``get_clock``) instead of being read here, so a test can pin it. A test that fires N+1 requests
+# "in one window" against the real clock straddles a window boundary now and then and fails at random.
+
+Clock = Callable[[], float]
+
+
+def get_clock() -> Clock:
+    """FastAPI dependency: the wall clock (epoch seconds) the rate limiter buckets requests by."""
+    return time.time
 
 
 async def enforce_rate_limit(
@@ -88,11 +100,12 @@ async def enforce_rate_limit(
     bucket_id: str,
     limit: int,
     window_seconds: int,
+    clock: Clock,
 ) -> None:
     """Raise HTTP 429 if ``bucket_id`` has exceeded ``limit`` requests in the current window,
     or if Redis itself could not be reached (fail-closed, not fail-open).
     """
-    current_window = int(time.time()) // window_seconds
+    current_window = int(clock()) // window_seconds
     redis_key = f"{key_prefix}{bucket_id}:{current_window}"
     try:
         current_count = await redis_client.incr(redis_key)
@@ -120,6 +133,7 @@ async def enforce_rate_limit_with_backoff(
     window_seconds: int,
     backoff_base_seconds: int,
     backoff_max_seconds: int,
+    clock: Clock,
 ) -> None:
     """Same fixed-window check as :func:`enforce_rate_limit`, plus an escalating lockout on repeat offenders.
 
@@ -151,7 +165,7 @@ async def enforce_rate_limit_with_backoff(
             headers={"Retry-After": str(lockout_ttl)},
         )
 
-    current_window = int(time.time()) // window_seconds
+    current_window = int(clock()) // window_seconds
     redis_key = f"{key_prefix}{bucket_id}:{current_window}"
     try:
         current_count = await redis_client.incr(redis_key)

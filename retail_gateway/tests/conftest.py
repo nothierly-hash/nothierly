@@ -11,6 +11,10 @@ from __future__ import annotations
 import os
 import warnings
 
+import pytest
+
+from retail_gateway.tests.fake_clock import FakeClock
+
 _KEY_PRESENT = bool(os.environ.get("RETAIL_JWT_SECRET_KEY"))
 
 collect_ignore_glob = [] if _KEY_PRESENT else ["test_*.py"]
@@ -21,3 +25,9 @@ if not _KEY_PRESENT:
         "Inject a key to run them; see TESTING.md.",
         stacklevel=1,
     )
+
+
+@pytest.fixture
+def clock() -> FakeClock:
+    """The clock the rate limiters are given, pinned so a test never depends on where in the real window it runs."""
+    return FakeClock()

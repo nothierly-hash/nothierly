@@ -21,6 +21,7 @@ from retail_gateway import main as main_module
 from retail_gateway.config import get_settings
 from retail_gateway.otp_store import _redis_key  # test-only introspection into the real Redis key shape
 from retail_gateway.repository import UserRecord
+from retail_gateway.tests.fake_clock import FakeClock
 
 
 class _FakeRepository:
@@ -55,11 +56,11 @@ def fake_redis() -> fakeredis.FakeAsyncRedis:
 
 
 @pytest.fixture
-def client(fake_redis: fakeredis.FakeAsyncRedis) -> Any:
+def client(fake_redis: fakeredis.FakeAsyncRedis, clock: FakeClock) -> Any:
     fake_repository = _FakeRepository()
 
     with patch("retail_gateway.main.get_redis", return_value=fake_redis), \
-         patch.object(main_module.app, "dependency_overrides", {main_module.get_repository: lambda: fake_repository}), \
+         patch.object(main_module.app, "dependency_overrides", {main_module.get_repository: lambda: fake_repository, main_module.get_clock: lambda: clock}), \
          patch("retail_gateway.main.send_otp_email") as mock_send_email, \
          patch("retail_gateway.main.send_otp_sms") as mock_send_sms:
         main_module.app.state.settings = get_settings()

@@ -76,12 +76,14 @@ from retail_gateway.refresh_tokens import (
 )
 from retail_gateway.repository import EmailAlreadyRegisteredError, UserRepository
 from retail_gateway.security import (
+    Clock,
     InvalidTokenError,
     client_ip,
     create_access_token,
     decode_access_token,
     enforce_rate_limit,
     enforce_rate_limit_with_backoff,
+    get_clock,
     hash_password,
     verify_password,
 )
@@ -155,7 +157,9 @@ async def require_current_user_id(
 
 
 async def _enforce_signup_rate_limit(
-    request: Request, settings: Annotated[RetailGatewaySettings, Depends(get_app_settings)]
+    request: Request,
+    settings: Annotated[RetailGatewaySettings, Depends(get_app_settings)],
+    clock: Annotated[Clock, Depends(get_clock)],
 ) -> None:
     redis_client = get_redis(settings.redis)
     await enforce_rate_limit(
@@ -164,11 +168,14 @@ async def _enforce_signup_rate_limit(
         bucket_id=client_ip(request),
         limit=settings.rate_limit.signup_per_hour_per_ip,
         window_seconds=3600,
+        clock=clock,
     )
 
 
 async def _enforce_login_rate_limit(
-    request: Request, settings: Annotated[RetailGatewaySettings, Depends(get_app_settings)]
+    request: Request,
+    settings: Annotated[RetailGatewaySettings, Depends(get_app_settings)],
+    clock: Annotated[Clock, Depends(get_clock)],
 ) -> None:
     redis_client = get_redis(settings.redis)
     await enforce_rate_limit(
@@ -177,6 +184,7 @@ async def _enforce_login_rate_limit(
         bucket_id=client_ip(request),
         limit=settings.rate_limit.login_per_minute_per_ip,
         window_seconds=60,
+        clock=clock,
     )
 
 
@@ -268,6 +276,7 @@ async def request_otp(
     payload: OtpRequest,
     request: Request,
     settings: Annotated[RetailGatewaySettings, Depends(get_app_settings)],
+    clock: Annotated[Clock, Depends(get_clock)],
 ) -> dict[str, str]:
     """Issue and dispatch one OTP over ``payload.channel``. Always 202 -- the actual send happens
     out-of-band in the Celery worker, same "respond instantly, queue the network call" contract
@@ -289,6 +298,7 @@ async def request_otp(
             window_seconds=rate_limit_settings.otp_request_window_seconds,
             backoff_base_seconds=rate_limit_settings.otp_backoff_base_seconds,
             backoff_max_seconds=rate_limit_settings.otp_backoff_max_seconds,
+            clock=clock,
         )
 
     code = generate_otp_code(length=settings.otp.length)
