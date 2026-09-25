@@ -72,15 +72,21 @@ def redis_client() -> Generator[RedisClient, None, None]:
 
 
 @pytest.fixture
-def agent(redis_client: RedisClient) -> AlertAgent:
+def agent(redis_client: RedisClient) -> Generator[AlertAgent, None, None]:
+    """Closes the REAL publisher/subscriber/context BaseAgent.__init__ opened -- see
+    tests/test_execution_agent_instrument_lock.py's identical fixture for why this is not optional."""
     instance = AlertAgent(manage_own_signals=False, manage_own_redis=False)
     instance._redis_client = redis_client
+    real_publisher = instance._publisher
     instance._publisher = _RecordingZmqPublisher()  # type: ignore[assignment]
     instance._settings.twilio = TwilioSettings(
         account_sid="ACtest", auth_token=__import__("pydantic").SecretStr("t"),
         phone_number="+15550000000", admin_phone_number="+15551111111",
     )
-    return instance
+    yield instance
+    real_publisher.close()
+    instance._subscriber.close()
+    instance._zmq_context.term()
 
 
 def _redis(agent: AlertAgent) -> RedisClient:

@@ -12,8 +12,10 @@ itself has always been correct (confirmed independently, live, against the real 
 from __future__ import annotations
 
 import time
+from typing import Generator
 
 import plotly.graph_objects as go
+import pytest
 
 from src.dashboard.ems_pages.swarm_command_center import (
     _AGENT_NODES,
@@ -22,7 +24,20 @@ from src.dashboard.ems_pages.swarm_command_center import (
     _PULSE_WINDOW_SECONDS,
     _ReceivedMessage,
     _build_network_figure,
+    _get_listener,
 )
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _stop_the_listener_the_import_started() -> Generator[None, None, None]:
+    """Importing the page module runs the whole Streamlit script, including ``_get_listener()``, which starts a
+    real background thread holding a real SUB socket. Nothing in this file needs it, and left running it outlives
+    the module for the rest of the pytest process -- so stop it (its own ``finally`` closes the socket and
+    terminates its context) and join it. ``_get_listener`` is ``st.cache_resource``, so this is the same instance."""
+    yield
+    listener = _get_listener()
+    listener.stop()
+    listener._thread.join(timeout=5.0)
 
 
 def _message(sender_id: str, *, seconds_ago: float = 0.0) -> _ReceivedMessage:

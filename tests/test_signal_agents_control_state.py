@@ -62,19 +62,30 @@ async def _seed_market_metrics(redis_client: RedisClient) -> None:
 
 
 @pytest.fixture
-def rl_agent(redis_client: RedisClient) -> RlSignalAgent:
+def rl_agent(redis_client: RedisClient) -> Generator[RlSignalAgent, None, None]:
+    """Closes the REAL publisher/subscriber/context BaseAgent.__init__ opened (the real publisher is captured
+    before the fake replaces it) -- see tests/test_execution_agent_instrument_lock.py's identical fixture."""
     instance = RlSignalAgent(_INSTRUMENT, manage_own_signals=False, manage_own_redis=False)
     instance._redis_client = redis_client
+    real_publisher = instance._publisher
     instance._publisher = _RecordingZmqPublisher()  # type: ignore[assignment]
-    return instance
+    yield instance
+    real_publisher.close()
+    instance._subscriber.close()
+    instance._zmq_context.term()
 
 
 @pytest.fixture
-def xgb_agent(redis_client: RedisClient) -> XgboostSignalAgent:
+def xgb_agent(redis_client: RedisClient) -> Generator[XgboostSignalAgent, None, None]:
+    """See rl_agent's docstring."""
     instance = XgboostSignalAgent(_INSTRUMENT, manage_own_signals=False, manage_own_redis=False)
     instance._redis_client = redis_client
+    real_publisher = instance._publisher
     instance._publisher = _RecordingZmqPublisher()  # type: ignore[assignment]
-    return instance
+    yield instance
+    real_publisher.close()
+    instance._subscriber.close()
+    instance._zmq_context.term()
 
 
 @pytest.mark.asyncio

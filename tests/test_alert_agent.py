@@ -84,16 +84,22 @@ def redis_client() -> Generator[RedisClient, None, None]:
 
 
 @pytest.fixture
-def agent(redis_client: RedisClient) -> AlertAgent:
+def agent(redis_client: RedisClient) -> Generator[AlertAgent, None, None]:
+    """Closes the REAL publisher/subscriber/context BaseAgent.__init__ opened -- see
+    tests/test_execution_agent_instrument_lock.py's identical fixture for why this is not optional."""
     instance = AlertAgent(manage_own_signals=False, manage_own_redis=False)
     instance._redis_client = redis_client
+    real_publisher = instance._publisher
     instance._publisher = _RecordingZmqPublisher()  # type: ignore[assignment]
     # Real Twilio settings (shape-only, never touches the network -- see
     # TwilioClient monkeypatching in each test that needs it) so
     # send_sms_alert's own "unconfigured, skip" short-circuit doesn't
     # mask whether _raise_alert actually fired.
     instance._settings.twilio = _configured_twilio_settings()
-    return instance
+    yield instance
+    real_publisher.close()
+    instance._subscriber.close()
+    instance._zmq_context.term()
 
 
 def _redis(agent: AlertAgent) -> RedisClient:

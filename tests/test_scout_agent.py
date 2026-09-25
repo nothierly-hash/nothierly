@@ -29,10 +29,15 @@ def redis_client() -> Generator[RedisClient, None, None]:
 
 
 @pytest.fixture
-def agent(redis_client: RedisClient) -> ScoutAgent:
+def agent(redis_client: RedisClient) -> Generator[ScoutAgent, None, None]:
+    """Closes the real publisher/subscriber/context BaseAgent.__init__ opened -- see
+    tests/test_execution_agent_instrument_lock.py's identical fixture for why this is not optional."""
     instance = ScoutAgent(manage_own_signals=False, manage_own_redis=False)
     instance._redis_client = redis_client
-    return instance
+    yield instance
+    instance._publisher.close()
+    instance._subscriber.close()
+    instance._zmq_context.term()
 
 
 async def _seed(redis_client: RedisClient, fiat: str, premiums: list[float], *, liquidity_usdt: float = 200_000.0) -> None:

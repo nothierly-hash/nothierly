@@ -27,10 +27,15 @@ def redis_client() -> Generator[RedisClient, None, None]:
 
 
 @pytest.fixture
-def agent(redis_client: RedisClient) -> RiskGateAgent:
+def agent(redis_client: RedisClient) -> Generator[RiskGateAgent, None, None]:
+    """Closes the real publisher/subscriber/context BaseAgent.__init__ opened -- see
+    tests/test_execution_agent_instrument_lock.py's identical fixture for why this is not optional."""
     instance = RiskGateAgent(manage_own_signals=False, manage_own_redis=False)
     instance._redis_client = redis_client
-    return instance
+    yield instance
+    instance._publisher.close()
+    instance._subscriber.close()
+    instance._zmq_context.term()
 
 
 async def _seed_analysis(redis_client: RedisClient, anomaly_id: str, *, status: str, crisis_score: int = 80) -> None:
@@ -106,11 +111,16 @@ async def test_approves_confirmed_crisis_with_sufficient_real_liquidity(
 @pytest.mark.asyncio
 async def test_respects_a_custom_liquidity_floor(redis_client: RedisClient) -> None:
     agent = RiskGateAgent(manage_own_signals=False, manage_own_redis=False, min_liquidity_usd=1_000_000.0)
-    agent._redis_client = redis_client
-    await _seed_analysis(redis_client, "a5", status="CRISIS_CONFIRMED")
-    await _seed_liquidity(redis_client, "ARS", 250_000.0)  # real, clears the module default, not this custom floor
+    try:
+        agent._redis_client = redis_client
+        await _seed_analysis(redis_client, "a5", status="CRISIS_CONFIRMED")
+        await _seed_liquidity(redis_client, "ARS", 250_000.0)  # real, clears the module default, not this custom floor
 
-    await agent._evaluate("a5", "ARS")
+        await agent._evaluate("a5", "ARS")
 
-    approved = await redis_client.execute("lrange", SWARM_APPROVED_OPPORTUNITIES_REDIS_KEY, 0, -1)
-    assert approved == []
+        approved = await redis_client.execute("lrange", SWARM_APPROVED_OPPORTUNITIES_REDIS_KEY, 0, -1)
+        assert approved == []
+    finally:
+        agent._publisher.close()
+        agent._subscriber.close()
+        agent._zmq_context.term()

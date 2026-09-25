@@ -92,7 +92,9 @@ def redis_client() -> Generator[RedisClient, None, None]:
 
 
 @pytest.fixture
-def agent(redis_client: RedisClient) -> MacroOrderExecutionAgent:
+def agent(redis_client: RedisClient) -> Generator[MacroOrderExecutionAgent, None, None]:
+    # Teardown closes the real publisher/subscriber/context BaseAgent.__init__ opened -- see
+    # tests/test_execution_agent_instrument_lock.py's identical fixture for why this is not optional.
     # mock_mode=False: this dev environment's real .env defaults MOCK_MODE=true (the
     # established project-wide safety default -- see execute_allocation_plan's own
     # docstring), which would silently simulate every fill regardless of this
@@ -103,7 +105,10 @@ def agent(redis_client: RedisClient) -> MacroOrderExecutionAgent:
         settings=AppSettings(mock_mode=False), manage_own_signals=False, manage_own_redis=False
     )
     instance._redis_client = redis_client
-    return instance
+    yield instance
+    instance._publisher.close()
+    instance._subscriber.close()
+    instance._zmq_context.term()
 
 
 def _order_message(
@@ -338,14 +343,19 @@ async def test_update_order_status_missing_record_does_not_crash(agent: MacroOrd
 @pytest.mark.asyncio
 async def test_on_shutdown_closes_every_connected_venue() -> None:
     instance = MacroOrderExecutionAgent(manage_own_signals=False, manage_own_redis=False)
-    venue_a = _FakeVenue("binance", bids=[(1.0, 1.0)], asks=[(1.0, 1.0)], fee_rate=0.001)
-    venue_b = _FakeVenue("okx", bids=[(1.0, 1.0)], asks=[(1.0, 1.0)], fee_rate=0.001)
-    instance._venues = [venue_a, venue_b]
+    try:
+        venue_a = _FakeVenue("binance", bids=[(1.0, 1.0)], asks=[(1.0, 1.0)], fee_rate=0.001)
+        venue_b = _FakeVenue("okx", bids=[(1.0, 1.0)], asks=[(1.0, 1.0)], fee_rate=0.001)
+        instance._venues = [venue_a, venue_b]
 
-    await instance.on_shutdown()
+        await instance.on_shutdown()
 
-    assert venue_a.closed is True
-    assert venue_b.closed is True
+        assert venue_a.closed is True
+        assert venue_b.closed is True
+    finally:
+        instance._publisher.close()
+        instance._subscriber.close()
+        instance._zmq_context.term()
 
 
 # -- TOXICITY_AVOIDANCE, real VPIN-fed AdverseFlowDefenseAgent --------------------------------

@@ -23,6 +23,7 @@ from typing import Any, Generator, Literal
 
 import fakeredis.aioredis
 import pytest
+import zmq.asyncio
 
 from core.base_agent import AgentControlState
 from core.config import RedisSettings
@@ -1012,8 +1013,17 @@ async def test_friday_unwind_does_nothing_when_already_flat(
 
 def test_unregistered_symbol_refuses_construction() -> None:
     """A real configuration gap (module docstring point 14) -- fails at construction, not deep inside a live cycle."""
-    with pytest.raises(KeyError, match="not registered"):
-        AlphaMarketMakerAgent("DOGE/USDT", exchange_id="fake", manage_own_signals=False, manage_own_redis=False)
+    # BaseAgent.__init__ has already opened real ZMQ sockets by the time the registry lookup raises, and
+    # the half-built instance is unreachable afterward -- so the test owns the context and destroys it
+    # (destroy() closes every socket still open on it, then terminates it).
+    context = zmq.asyncio.Context()
+    try:
+        with pytest.raises(KeyError, match="not registered"):
+            AlphaMarketMakerAgent(
+                "DOGE/USDT", exchange_id="fake", manage_own_signals=False, manage_own_redis=False, zmq_context=context
+            )
+    finally:
+        context.destroy(linger=0)
 
 
 # =============================================================================

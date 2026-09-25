@@ -44,16 +44,39 @@ def redis_client() -> Generator[RedisClient, None, None]:
     RedisClient._instance = None
 
 
+# BaseAgent.__init__ opens real ZMQ sockets/contexts; unclosed ones make pytest hang at exit inside
+# zmq.Context.__del__ -> term() (the recurring fixture-leak pattern of this repo's agent tests -- same
+# registry + autouse teardown as tests/test_alpha_engine.py, since several tests build agents inline).
+# Closing is idempotent, so the agent that test_full_run_lifecycle... already shuts down via run() is fine.
+_CREATED_AGENTS: list[_NoOpAgent] = []
+
+
+@pytest.fixture(autouse=True)
+def _close_real_zmq_sockets() -> Generator[None, None, None]:
+    yield
+    while _CREATED_AGENTS:
+        created = _CREATED_AGENTS.pop()
+        created._publisher.close()
+        created._subscriber.close()
+        created._zmq_context.term()
+
+
+def _new_agent(agent_id: str = _AGENT_ID) -> _NoOpAgent:
+    instance = _NoOpAgent(agent_id, manage_own_signals=False, manage_own_redis=False)
+    _CREATED_AGENTS.append(instance)
+    return instance
+
+
 @pytest.fixture
 def agent(redis_client: RedisClient) -> _NoOpAgent:
-    instance = _NoOpAgent(_AGENT_ID, manage_own_signals=False, manage_own_redis=False)
+    instance = _new_agent()
     instance._redis_client = redis_client
     return instance
 
 
 def test_default_control_state_is_live() -> None:
     """A fresh agent, before its control listener has even started, must default to LIVE -- unchanged behavior."""
-    instance = _NoOpAgent(_AGENT_ID, manage_own_signals=False, manage_own_redis=False)
+    instance = _new_agent()
     assert instance.control_state == AgentControlState.LIVE
 
 
@@ -136,9 +159,9 @@ async def test_an_invalid_pubsub_command_is_ignored(agent: _NoOpAgent, redis_cli
 @pytest.mark.asyncio
 async def test_a_command_only_affects_the_targeted_agent(redis_client: RedisClient) -> None:
     """Two agents, two independent channels -- publishing to one must never affect the other."""
-    agent_a = _NoOpAgent("agent-a", manage_own_signals=False, manage_own_redis=False)
+    agent_a = _new_agent("agent-a")
     agent_a._redis_client = redis_client
-    agent_b = _NoOpAgent("agent-b", manage_own_signals=False, manage_own_redis=False)
+    agent_b = _new_agent("agent-b")
     agent_b._redis_client = redis_client
 
     task_a = asyncio.create_task(agent_a._listen_for_control_commands())

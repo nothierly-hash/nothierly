@@ -38,10 +38,15 @@ def redis_client() -> Generator[RedisClient, None, None]:
 
 
 @pytest.fixture
-def agent(redis_client: RedisClient) -> MarketDataAgent:
+def agent(redis_client: RedisClient) -> Generator[MarketDataAgent, None, None]:
+    """Closes the real publisher/subscriber/context BaseAgent.__init__ opened -- see
+    tests/test_execution_agent_instrument_lock.py's identical fixture for why this is not optional."""
     instance = MarketDataAgent(_SYMBOL, manage_own_signals=False, manage_own_redis=False)
     instance._redis_client = redis_client
-    return instance
+    yield instance
+    instance._publisher.close()
+    instance._subscriber.close()
+    instance._zmq_context.term()
 
 
 async def _tape_entries(redis_client: RedisClient) -> list[dict[str, Any]]:

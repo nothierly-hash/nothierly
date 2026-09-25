@@ -31,10 +31,27 @@ def redis_client() -> Generator[RedisClient, None, None]:
     yield client
 
 
+# BaseAgent.__init__ opens real ZMQ sockets/contexts; unclosed ones make pytest hang at exit inside
+# zmq.Context.__del__ -> term() (the recurring fixture-leak pattern of this repo's agent tests -- same
+# registry + autouse teardown as tests/test_alpha_engine.py, since _agent() is called inline by each test).
+_CREATED_AGENTS: list[AnalystAgent] = []
+
+
+@pytest.fixture(autouse=True)
+def _close_real_zmq_sockets() -> Generator[None, None, None]:
+    yield
+    while _CREATED_AGENTS:
+        created = _CREATED_AGENTS.pop()
+        created._publisher.close()
+        created._subscriber.close()
+        created._zmq_context.term()
+
+
 def _agent(redis_client: RedisClient, *, guardian: GuardianSettings | None = None) -> AnalystAgent:
     settings = AppSettings(guardian=guardian) if guardian is not None else None
     instance = AnalystAgent(settings=settings, manage_own_signals=False, manage_own_redis=False)
     instance._redis_client = redis_client
+    _CREATED_AGENTS.append(instance)
     return instance
 
 
