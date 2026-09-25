@@ -251,4 +251,39 @@ The 1-minute bars for the full day were obtained afterwards and locate the viole
 
 Reading it: thresholds of 0.2% to 1% trip hours before the crash, in ordinary trading, so on bitcoin they are noise; 2% catches the 19:34 bar. No threshold value follows from this.
 
-Window to extract next: BTC/USD ticks from 2022-11-08 18:30 to 20:00 UTC, which would show whether the default threshold trips at the sharpest point and when.
+That window was later replayed from Binance spot BTC/USDT trades (eleventh dataset below), a different source and data type from these Dukascopy bars.
+
+### Eleventh dataset: BTC/USDT, 2022-11-08 (Binance spot trades), the FTX crash in ticks
+
+Source: `BTCUSDT-trades-2022-11-08.zip` from data.binance.vision (SHA-256 verified against the site's checksum file). 14,530,601 trades for the whole UTC day, headerless, with millisecond timestamps. These are trade prints, not bid/ask quotes, on the spot BTC/USDT pair: the same event as the Dukascopy BTC/USD bars above, from a different venue and data type. The detector was fed the trade price plus an arbitrary 0.5 (immaterial for fractional moves) and the file was streamed, not loaded in memory.
+
+The day: low 17,166.83 at 19:32:59, high 20,700.88 at 16:33:57, a 20.59% high-to-low range. The largest 60-second move of the day, and the largest inside 18:30-20:00 UTC, is **+5.451%** at 19:34:54.275 (17,329.16 to 18,273.78): a rebound after the low. The 5.99% bound derived from the Dukascopy bars was therefore not violated.
+
+Flash-crash detector, driven offline with the trade timestamps, first trip inside 18:30-20:00 UTC (reference price 18,754.26 at 18:30:00; "fall already suffered" is the price at the trip versus that reference):
+
+| Threshold (60 s) | First trip (UTC) | Direction | Fall already suffered | Trades in breach in the window |
+|---|---|---|---|---|
+| 5.0% (default) | 19:34:51.850 | rise | -3.13% | 2,258 |
+| 3.0% | 19:34:21.761 | rise | -5.41% | 32,516 |
+| 2.0% | 19:31:20.393 | fall | -6.29% | 62,224 |
+| 1.0% | 18:30:17.444 | fall | -0.28% | 193,334 |
+| 0.5% | 18:30:17.444 | fall | -0.28% | 621,072 |
+| 0.3% | already in breach at 18:30:00 | rise | 0.00% | 990,220 |
+| 0.2% | already in breach at 18:30:00 | rise | 0.00% | 1,216,550 |
+
+Reading it: the default 5%/60 s does trip on this crash, but on the rebound about two minutes after the low, not on the fall; the fall, spread over more than an hour, never moved 5% within 60 seconds. The first threshold to trip on the fall is 2%, at 19:31:20, 1 minute 39 seconds before the low. Thresholds of 1% and below trip within the first minute of the window, which is noise on bitcoin: over the whole day, 2% trips on 81,980 trades starting 04:11:41 UTC and 0.2% on 4,665,093 (32% of all trades), in ordinary trading. No threshold value follows from this.
+
+Limits: this is the detector alone, not the Kill Switch chain; one event; trade prints on a different venue than the bars; no orders, positions or losses were modeled.
+
+### Simulated backtest: ADAUSD_230630, June 2023 (Binance bookTicker, real bid/ask)
+
+Source: `ADAUSD_230630-bookTicker-2023-06.zip` from data.binance.vision (SHA-256 verified against the site's checksum file and against a checksum file supplied separately). 15,182,130 top-of-book updates (best bid and ask with quantities, millisecond times) from 2023-06-01 00:00:00.065 to 2023-06-30, top of book only and not depth. The mean spread is 0.000359 and the mid changes on 43.1% of updates.
+
+Ingester on a real book: the first 50,000 rows, read from a zip with `--timestamp-unit ms`, the real ask and the real quantities, were published and received in full (50,000 of 50,000), with 0 differences in mid price, spread, imbalance and liquidity. The whole file was not replayed through the broker (about 50 minutes at the ~4,900 messages per second measured earlier).
+
+**This is a simulation, not performance.** `scripts/zscore_backtest.py` (z-score of the mid over 100 updates, entry at +/-3.0, exit inside +/-0.5; 10,000 ADA per trade; 5 ms latency in data time; 2 USD per 10,000 ADA on each fill) and `scripts/generate_tear_sheet.py`. A toy strategy, no parameter tuned, one month, in-sample. ADAUSD_230630 is a coin-margined inverse contract, and the PnL is a linear approximation (price difference times ADA units), not the contract's true payoff.
+
+- **Result.** 72,726 round trips: gross -255,762.50, commissions 290,904.00, net -546,666.50 USD. Per round trip, gross -3.52 and net -7.52. Winners after costs: 0.0% (0.1% before commissions). All 30 days are negative (worst: 2023-06-10, -62,634). Applied entry latency: median 14 ms, p90 79 ms.
+- **Where the loss comes from.** The average gross loss per round trip (3.52) is close to the file's average full spread for this size (3.59 USD for 10,000 ADA). At the mid the strategy earns roughly nothing, and the loss is the spread plus the commission.
+- **Return.** It depends entirely on an illustrative capital. With 1,000,000 the report shows -54.67% (maximum drawdown -54.67%; annualized Sharpe -35.2 over 30 daily observations, which means nothing for this toy). With 10,000 the report refuses to build, because equity reaches zero. Nothing here is evidence of an edge.
+- **Alpha step timing.** Mean 31.0 microseconds per update over 15.2 million updates, worst single call 33 milliseconds.
