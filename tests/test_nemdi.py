@@ -20,6 +20,7 @@ from core.redis_client import RedisClient
 from core.schemas import P2P_HISTORY_ZSET_KEY_PREFIX
 from p2p_api import _P2PScanResult, app, P2PCandidate
 from nemdi import _distress_sub_score, _fetch_history_points, compute_nemdi_score
+from tests.conftest import FakeClock
 
 
 @pytest.fixture(autouse=True)
@@ -132,7 +133,9 @@ def test_nemdi_endpoint_requires_no_api_key(monkeypatch: pytest.MonkeyPatch) -> 
     assert body["components"][0]["country_fiat"] == "ARS"
 
 
-def test_nemdi_endpoint_rate_limit_blocks_after_configured_threshold(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_nemdi_endpoint_rate_limit_blocks_after_configured_threshold(
+    monkeypatch: pytest.MonkeyPatch, fake_clock: FakeClock,
+) -> None:
     monkeypatch.setenv("P2P_API_NEMDI_RATE_LIMIT_PER_SECOND", "2")
     get_settings.cache_clear()
     _patch_sources(
@@ -148,6 +151,9 @@ def test_nemdi_endpoint_rate_limit_blocks_after_configured_threshold(monkeypatch
 
     third = client.get("/api/v1/nemdi/score")
     assert third.status_code == 429
+
+    fake_clock.advance(1.0)
+    assert client.get("/api/v1/nemdi/score").status_code == 200
     get_settings.cache_clear()
 
 

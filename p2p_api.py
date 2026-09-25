@@ -480,7 +480,21 @@ _NEMDI_RATE_LIMIT_REDIS_PREFIX: Final[str] = "ratelimit:p2p:nemdi:"
 _RATE_LIMIT_WINDOW_SECONDS: Final[int] = 1  # real, per-second granularity, per the mission's own spec
 
 
-async def _enforce_rate_limit(redis_key_prefix: str, bucket_id: str, *, limit_per_second: int) -> None:
+Clock = Callable[[], float]
+
+
+def get_clock() -> Clock:
+    """FastAPI dependency: the wall clock (epoch seconds) the rate limiter buckets requests by.
+
+    Injected instead of read inside the limiter so that a test can pin it with
+    ``app.dependency_overrides[get_clock]``. The limiter's window is the real epoch second, so a test that
+    fires several requests "in the same window" against the real clock straddles a second boundary now and
+    then and fails at random.
+    """
+    return time.time
+
+
+async def _enforce_rate_limit(redis_key_prefix: str, bucket_id: str, *, limit_per_second: int, clock: Clock) -> None:
     """Real O(1) fixed 1s-window rate limit via Redis ``INCR``/``EXPIRE`` -- no new dependency
     (``fastapi-limiter``), the same native pattern ``api_middleware/gateway.py``'s own
     ``_check_rate_limit`` already established for its per-minute window, just a tighter real-time
@@ -500,12 +514,14 @@ async def _enforce_rate_limit(redis_key_prefix: str, bucket_id: str, *, limit_pe
             validated API key hash for the production tier, their real client IP for sandbox (no
             key is required there at all -- see sandbox.py's own module docstring).
         limit_per_second: Max requests this bucket may make in the current real 1s window.
+        clock: Returns the current time in epoch seconds; its integer part is the window. Always
+            supplied by the caller (see :func:`get_clock`), never read from the system here.
 
     Raises:
         HTTPException: 429 if the bucket is over its limit, or if Redis itself could not be
             reached at all (fail-closed).
     """
-    current_second = int(time.time())
+    current_second = int(clock())
     redis_key = f"{redis_key_prefix}{bucket_id}:{current_second}"
     try:
         redis_client = await RedisClient.get_instance(get_settings().redis, max_attempts=3)
@@ -571,25 +587,30 @@ async def require_production_api_key(request: Request, x_api_key: Annotated[str 
     return candidate_hash
 
 
-async def _enforce_production_rate_limit(api_key_hash: Annotated[str, Depends(require_production_api_key)]) -> None:
+async def _enforce_production_rate_limit(
+    api_key_hash: Annotated[str, Depends(require_production_api_key)],
+    clock: Annotated[Clock, Depends(get_clock)],
+) -> None:
     """Auth (401) then rate limit (429), per validated key -- see module docstring."""
     settings = get_settings().p2p_api
     await _enforce_rate_limit(
         _PRODUCTION_RATE_LIMIT_REDIS_PREFIX, api_key_hash, limit_per_second=settings.production_rate_limit_per_second,
+        clock=clock,
     )
 
 
-async def enforce_sandbox_rate_limit(request: Request) -> None:
+async def enforce_sandbox_rate_limit(request: Request, clock: Annotated[Clock, Depends(get_clock)]) -> None:
     """No auth (see sandbox.py's own module docstring) -- rate limited per real client IP instead."""
     request.state.client_id = "sandbox-public"
     client_ip = request.client.host if request.client is not None else "unknown"
     settings = get_settings().p2p_api
     await _enforce_rate_limit(
         _SANDBOX_RATE_LIMIT_REDIS_PREFIX, client_ip, limit_per_second=settings.sandbox_rate_limit_per_second,
+        clock=clock,
     )
 
 
-async def enforce_nemdi_rate_limit(request: Request) -> None:
+async def enforce_nemdi_rate_limit(request: Request, clock: Annotated[Clock, Depends(get_clock)]) -> None:
     """No auth (see nemdi.py's own module docstring -- this index is deliberately given away free
     to media/embedders) -- rate limited per real client IP, its own tier so a media outlet's real
     traffic never competes with the sandbox tier's own trial-API quota."""
@@ -598,6 +619,7 @@ async def enforce_nemdi_rate_limit(request: Request) -> None:
     settings = get_settings().p2p_api
     await _enforce_rate_limit(
         _NEMDI_RATE_LIMIT_REDIS_PREFIX, client_ip, limit_per_second=settings.nemdi_rate_limit_per_second,
+        clock=clock,
     )
 
 

@@ -10,6 +10,7 @@ the real FastAPI route wiring via :class:`~fastapi.testclient.TestClient`.
 from __future__ import annotations
 
 import hashlib
+import time
 from typing import Any, Generator
 
 import fakeredis.aioredis
@@ -20,6 +21,7 @@ import p2p_api
 from core.config import RedisSettings, get_settings
 from core.redis_client import RedisClient, RedisUnavailableError
 from p2p_api import P2PCandidate, _P2PScanResult, _run_full_scan, app
+from tests.conftest import FakeClock
 
 _VALID_API_KEY = "test-key-abc123"
 _VALID_API_KEY_SHA256 = hashlib.sha256(_VALID_API_KEY.encode("utf-8")).hexdigest()
@@ -314,10 +316,11 @@ def test_sandbox_endpoint_requires_no_api_key(monkeypatch: pytest.MonkeyPatch) -
 
 
 def test_production_rate_limit_blocks_after_configured_threshold(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, fake_clock: FakeClock,
 ) -> None:
     """Real Redis INCR/EXPIRE limiter, exercised against fakeredis -- first N requests succeed,
-    the next one is rejected with 429, all within the same real 1s window."""
+    the next one is rejected with 429. The clock is injected, so all four requests are in one window
+    by construction, not by luck."""
     monkeypatch.setenv("P2P_API_PRODUCTION_RATE_LIMIT_PER_SECOND", "3")
     get_settings.cache_clear()
     client = _client_and_data(monkeypatch)
@@ -331,7 +334,28 @@ def test_production_rate_limit_blocks_after_configured_threshold(
     assert fourth.status_code == 429
 
 
-def test_sandbox_rate_limit_blocks_after_configured_threshold(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_production_rate_limit_window_is_the_whole_second_and_rolls_over(
+    monkeypatch: pytest.MonkeyPatch, fake_clock: FakeClock,
+) -> None:
+    """Fixed 1s window: still blocked half a second later (same second), allowed again once the clock
+    crosses into the next one, and the new window has its own full budget."""
+    monkeypatch.setenv("P2P_API_PRODUCTION_RATE_LIMIT_PER_SECOND", "2")
+    get_settings.cache_clear()
+    client = _client_and_data(monkeypatch)
+    headers = {"X-API-Key": _VALID_API_KEY}
+
+    assert [client.get("/api/v1/p2p-premiums", headers=headers).status_code for _ in range(3)] == [200, 200, 429]
+
+    fake_clock.advance(0.5)
+    assert client.get("/api/v1/p2p-premiums", headers=headers).status_code == 429
+
+    fake_clock.advance(0.5)
+    assert [client.get("/api/v1/p2p-premiums", headers=headers).status_code for _ in range(3)] == [200, 200, 429]
+
+
+def test_sandbox_rate_limit_blocks_after_configured_threshold(
+    monkeypatch: pytest.MonkeyPatch, fake_clock: FakeClock,
+) -> None:
     """Same real limiter, sandbox tier -- bucketed by client IP (TestClient's own fixed testclient IP), not a key."""
     monkeypatch.setenv("P2P_API_SANDBOX_RATE_LIMIT_PER_SECOND", "2")
     get_settings.cache_clear()
@@ -343,6 +367,14 @@ def test_sandbox_rate_limit_blocks_after_configured_threshold(monkeypatch: pytes
 
     third = client.get("/api/v1/sandbox/premiums/latest")
     assert third.status_code == 429
+
+    fake_clock.advance(1.0)
+    assert client.get("/api/v1/sandbox/premiums/latest").status_code == 200
+
+
+def test_the_production_clock_dependency_is_the_wall_clock() -> None:
+    """The injection point defaults to the real clock, so production behaviour is unchanged."""
+    assert p2p_api.get_clock() is time.time
 
 
 def test_rate_limiter_fails_closed_when_redis_is_unreachable(monkeypatch: pytest.MonkeyPatch) -> None:
