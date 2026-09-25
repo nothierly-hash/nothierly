@@ -69,3 +69,24 @@ Reproduce:
 python scripts/run_zmq_broker.py
 python scripts/historical_ingester.py <file>.csv --timestamp-column Etc/UTC --bid-column Close --assumed-spread 0.0001 --speed 0
 ```
+
+### Second dataset: EUR/CHF, 2015-01-15 12:00-13:00 UTC (the hour after the SNB shock)
+
+Same format and same protocol: 5,924 bid-only ticks, replayed with `--symbol EUR_CHF`, again with an assumed 1-pip spread (the real spread is unknown; it does not affect the detector, which uses the mid price).
+
+This file does not contain the Swiss National Bank shock. The SNB announced the end of the EUR/CHF floor earlier that morning, about 09:30 UTC. The data starts about two and a half hours later, at a price of about 1.03 (the old floor was 1.20), and its largest 60-second move is 0.33%. It is the aftermath, not the event.
+
+- **Bus delivery.** 5,924 ticks published, 5,924 received, in file order, 0 value differences against the CSV (one run, `--speed 0`, local machine).
+- **Flash-crash detector**, driven offline with the file's timestamps, as above:
+
+| Threshold (60 s) | Ticks in breach | First trip (UTC) |
+|---|---|---|
+| 5.0% (default) | 0 | never |
+| 0.5% | 0 | never |
+| 0.4% | 0 | never |
+| 0.3% | 15 | 12:21:38 |
+| 0.2% | 191 | 12:01:13 |
+
+Reading it: the default correctly does not trip, because there is no crash in this window. Set against the EUR/USD hour, no single low threshold fits both: 0.4% caught the EUR/USD burst and says nothing here, while 0.3% and 0.2% trip here on moves that are not crashes, which is the false-positive cost of a low threshold. Calibration has to be per instrument and needs far more data than two hours.
+
+Not yet run: the shock window itself (about 09:00-10:30 UTC the same day). It is the check of whether the default 5% threshold trips on a real crash, and its result is unknown until it is run and recorded here.
