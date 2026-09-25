@@ -115,6 +115,7 @@ The shock window itself was run later; see the seventh dataset below.
 | GBP/USD 2016-10-07 | 27,256 | 0.43% | 3 (from 12:31:00) | 948 (from 12:13:32) |
 | USD/JPY 2019-01-03 | 3,700 | 0.085% | 0 | 0 |
 | Copper 2026-09-08 | 2,615 | 0.26% | 0 | 26 (from 12:10:05) |
+| BTC/USD 2026-09-19 (Saturday) | 1,088 | 0.083% | 0 | 0 |
 
 The default 5%/60 s threshold trips on none of them, as expected, since none is a crash. A low threshold trips in the volatile hours, including once well before the 12:30 burst (GBP/USD at 0.2%), and not at all in the quiet yen hour, so the right value depends on each instrument's volatility regime. This supports a per-instrument threshold, calibrated on far more data than a handful of hours, and does not establish any particular value.
 
@@ -198,3 +199,12 @@ The largest 60-second move is about four times larger on the second day, and the
 ### Set aside: AUD/JPY, 2019-01-02, 4-hour bars
 
 Six 4-hour bars, too coarse for a 60-second detector, so nothing was replayed. The first five are ordinary, with ranges of 0.47% to 0.82% against each bar's open. The last bar, which opens at 22:00 UTC on 2019-01-02 and covers the following four hours, contains the yen flash crash: open 76.044, low 70.406 (-7.41%), close 74.303, a rebound of +5.54% from the low. The largest adjacent-bar span is 8.80% (bars 18:00 and 22:00). Unlike the earlier bar files, that bound is above 5%, so it no longer excludes a trip of the default threshold; it does not show one either, because 4-hour bars do not say how fast the price fell. What the file does settle is the window to extract: ticks or 1-minute bars of AUD/JPY from 2019-01-02 22:00 UTC to 2019-01-03 02:00 UTC.
+
+### Ninth dataset: BTC/USD, 2026-09-19 12:00-13:00 UTC (a Saturday)
+
+1,088 bid-only ticks, replayed with `--symbol BTC_USD` and an arbitrary assumed spread of 1.0 (one dollar; the real spread is unknown, and the detector uses the mid price). The bid goes from 81,284.4 to 81,306.8 (+0.03%), with a 0.195% range over the hour and a largest 60-second move of 0.083% (12:23:50 UTC). The feed is sparse: at most 41 ticks in a minute and gaps of up to 60 s. Bitcoin trades around the clock, so this Saturday extraction has data where the FX and commodity ones for a Sunday were empty. A quiet hour.
+
+- **Bus delivery.** 1,088 published, 1,088 received, in file order, 0 value differences against the CSV.
+- **Flash-crash detector** (driven offline with the file's timestamps): none of 5.0%, 0.5%, 0.4%, 0.3% or 0.2% trips.
+
+One quiet weekend hour says nothing about a threshold for crypto, the asset class of the shadow-run instrument (BTC/USDT). No volatile crypto day is in the set yet.
