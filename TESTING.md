@@ -117,3 +117,28 @@ Not yet run: the shock window itself (about 09:00-10:30 UTC the same day). It is
 The default 5%/60 s threshold trips on none of them, as expected, since none is a crash. A low threshold trips in the volatile hours, including once well before the 12:30 burst (GBP/USD at 0.2%), and not at all in the quiet yen hour, so the right value depends on each instrument's volatility regime. This supports a per-instrument threshold, calibrated on far more data than four hours, and does not establish any particular value.
 
 Not yet run: the true-crash windows, which are the only data that would show whether the default 5% threshold trips on a real crash: the SNB shock (2015-01-15, about 09:00-10:30 UTC), the sterling flash crash (2016-10-07, Asian trading hours) and the yen flash crash (2019-01-03, Asian trading hours). Their results are unknown until they are run and recorded here.
+
+### Fifth dataset: AUD/JPY, 2020-03-09, 1-minute bars (full day)
+
+The first stress day in the set, and a different kind of data: 1,440 one-minute bars (00:00-23:59 UTC, no gaps), bid side, not ticks. Only each bar's Close is replayed (Open, High and Low are not), and a bar's timestamp is its open time. The spread is an assumed 0.01, one yen pip (the real spread is unknown). The day opens at 68.724 and closes at 68.006 (-1.04%), with a high of 69.009 and a low of 64.356, a 7.23% high-to-low range. The largest close-to-close one-minute move is 2.415% (01:49 UTC), then 1.443% (01:51) and 1.134% (01:52); the largest single-bar high-low range is 2.552% (01:49).
+
+- **Bus delivery.** 1,440 published, 1,440 received, in file order, 0 differences against the CSV closes.
+- **Flash-crash detector** (driven offline on the closes, with the file's timestamps). A trip is attributable to the bar opening at that time, not to a second:
+
+| Threshold (60 s) | Bars in breach | First trip (UTC) |
+|---|---|---|
+| 5.0% (default) | 0 | never |
+| 2.0% | 1 | 01:49 |
+| 1.0% | 3 | 01:49 |
+| 0.5% | 10 | 01:42 |
+| 0.4% | 13 | 01:42 |
+| 0.3% | 21 | 01:42 |
+| 0.2% | 43 | 01:41 |
+
+- **Bound on the default.** Any two prices in one rolling 60-second window lie inside two adjacent one-minute bars, so their difference cannot exceed the span of that pair. The largest pair span is 4.62% (bars 01:49 and 01:50), so the default 5%/60 s could not have tripped on any tick path consistent with these bars, by a margin of 1.1x. This holds for the bid series only.
+
+Reading it: even on a day with a 7% range the default does not trip, because its 60-second window only sees a near-instant collapse, and this move was spread over minutes. Thresholds of 1% to 2% catch the core of the episode (the 01:49 bar), and 0.5% flags it seven minutes earlier. This does not establish a value.
+
+### Set aside: AUD/CAD, 2020-03-18, 4-hour bars
+
+Six bars, too coarse for a 60-second detector, so nothing was replayed. The only thing it supports is the same bound: the largest adjacent-pair span is 2.41% (bars 13:00 and 17:00), so the default 5% could not have tripped, which says nothing about lower thresholds. One-minute bars or ticks are needed.
