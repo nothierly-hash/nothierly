@@ -911,19 +911,29 @@ class LeviathanDaemonManager:
 
 
 # =============================================================================
-# Streamlit wiring -- session-scoped singletons, same pattern as backend_simulator.get_state().
+# Streamlit wiring. The swarm's own state is per session, like backend_simulator.get_state(); the manager,
+# which owns the background thread, is one per server process.
 # =============================================================================
 
-_MANAGER_KEY = "ghost_daemon_manager"
 _SWARM_KEY = "ghost_daemon_swarm_state"
 
 
+@st.cache_resource(show_spinner=False)
+def _process_wide_manager() -> LeviathanDaemonManager:
+    """One manager, and so one detached swarm thread, for the whole Streamlit server process.
+
+    It used to live in ``st.session_state``, which is per browser session. Every session then started its own
+    ``ghost-daemon-swarm`` thread. Those threads share the process-wide ``RedisClient`` singleton, whose
+    ``asyncio.Lock`` is bound to one event loop, so the extra ones died with "bound to a different event loop"
+    the moment two of them met on it, and were started again on the next rerun of their session (reproduced:
+    11 of 17 threads died). ``ensure_background_running`` is only idempotent per manager, so per-session
+    managers defeated the "started exactly once" this module's docstring promises.
+    """
+    return LeviathanDaemonManager()
+
+
 def get_manager() -> LeviathanDaemonManager:
-    manager = st.session_state.get(_MANAGER_KEY)
-    if not isinstance(manager, LeviathanDaemonManager):
-        manager = LeviathanDaemonManager()
-        st.session_state[_MANAGER_KEY] = manager
-    return manager
+    return _process_wide_manager()
 
 
 def get_swarm_state() -> DaemonSwarmState:
