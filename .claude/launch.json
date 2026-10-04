@@ -25,6 +25,12 @@
       "runtimeExecutable": ".venv/Scripts/python.exe",
       "runtimeArgs": ["-m", "http.server", "8090", "--directory", "nothierly_genesis"],
       "port": 8090
+    },
+    {
+      "name": "arbitrage-dashboard-dev",
+      "runtimeExecutable": "powershell.exe",
+      "runtimeArgs": ["-NoProfile", "-Command", "$env:PATH = 'C:/Program Files/nodejs;' + $env:PATH; Set-Location 'C:/Users/DELL/projet arbitrage/frontend'; & 'C:/Program Files/nodejs/npm.cmd' run dev"],
+      "port": 5173
     }
   ]
 }
