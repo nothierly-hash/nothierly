@@ -608,3 +608,132 @@ def test_cli_defaults_to_dry_run_testnet_with_copy_trading_required(monkeypatch:
         worker_module.main(["--address", "tcp://x:1"])
     assert seen["network"] is BybitNetwork.TESTNET
     assert seen["config"].dry_run is True and seen["config"].require_copy_trading is True and seen["config"].max_equity_usd is None
+
+
+# --- Homme mort : sortie d'urgence -----------------------------------------------------------
+
+
+def _flatten(worker: BybitWorker, asset: str = "BTCUSDT", attempt: int = 1) -> str:
+    return asyncio.run(worker.emergency_flatten(asset, attempt=attempt, now_ms=T0))
+
+
+def test_emergency_flatten_sells_a_long_with_a_reduce_only_ioc_rounded_down_to_the_tick(tmp_path: Path) -> None:
+    client = FakeBybit(positions={"BTCUSDT": "0.01"})
+    w = _worker(tmp_path, client)
+    assert _flatten(w) == "accepted"
+    (req,) = client.orders
+    assert (req.symbol, req.is_buy, req.size, req.limit_px, req.tif, req.reduce_only) == ("BTCUSDT", False, D("0.01"), D("48500.0"), "IOC", True)  # 50 000 x (1 - 3 %)
+    assert client.positions["BTCUSDT"] == 0 and len(req.order_link_id) == 33
+    (rec,) = w.state.executions()
+    assert (rec.status, rec.side, rec.signal_id) == ("dead_man_flatten:accepted", "SELL", "dead-man:BTCUSDT")
+
+
+def test_emergency_flatten_buys_back_a_short_rounding_up_so_the_order_always_crosses(tmp_path: Path) -> None:
+    client = FakeBybit(positions={"BTCUSDT": "-0.02"})
+    client.prices["BTCUSDT"] = D("50123.45")
+    assert _flatten(_worker(tmp_path, client)) == "accepted"
+    (req,) = client.orders
+    assert (req.is_buy, req.size, req.limit_px, req.reduce_only) == (True, D("0.02"), D("51627.2"), True)  # 50 123,45 x 1,03 = 51 627,1535, arrondi au tick supérieur
+    client2 = FakeBybit(positions={"BTCUSDT": "0.01"})
+    client2.prices["BTCUSDT"] = D("50123.45")
+    _flatten(_worker(tmp_path, client2, db_path=tmp_path / "b.sqlite3"))
+    assert client2.orders[0].limit_px == D("48619.7")  # 48 619,7465 arrondi au tick inférieur
+
+
+def test_emergency_slippage_widens_and_the_link_id_changes_with_each_attempt(tmp_path: Path) -> None:
+    client = FakeBybit(positions={"BTCUSDT": "0.01"})
+    w = _worker(tmp_path, client)
+    for attempt in (1, 2, 3, 4):
+        client.positions["BTCUSDT"] = D("0.01")
+        _flatten(w, attempt=attempt)
+    assert [o.limit_px for o in client.orders] == [D("48500.0"), D("47000.0"), D("44000.0"), D("40000.0")]
+    assert len({o.order_link_id for o in client.orders}) == 4  # un identifiant distinct par tentative
+
+
+def test_emergency_flatten_does_nothing_on_a_flat_account_and_reports_failures(tmp_path: Path) -> None:
+    client = FakeBybit()
+    w = _worker(tmp_path, client)
+    assert _flatten(w) == "no_position" and client.place_calls == 0
+    client.positions["BTCUSDT"] = D("0.01")
+    assert _flatten(w, asset="XRPUSDT") == "unknown_symbol"
+    client.fail_read = True
+    assert _flatten(w) == "read_error"
+    client.fail_read, client.hedge = False, True
+    assert _flatten(w) == "hedge_mode_unsupported" and client.place_calls == 0  # ne s'envoie pas : on le dit fort, on réessaie
+    client.hedge, client.fail_place = False, True
+    assert _flatten(w) == "error"
+    client.fail_place, client.reject = False, True
+    assert _flatten(w) == "rejected"
+    assert client.positions["BTCUSDT"] == D("0.01")
+
+
+def test_emergency_flatten_in_dry_run_sends_nothing(tmp_path: Path) -> None:
+    client = FakeBybit(positions={"BTCUSDT": "0.01"})
+    w = _worker(tmp_path, client, dry_run=True)
+    assert _flatten(w) == "dry_run" and client.place_calls == 0
+    (rec,) = w.state.executions()
+    assert (rec.status, rec.px) == ("dead_man_flatten:dry_run", "48500.0")
+
+
+def test_a_silent_engine_closes_every_bybit_position_then_locks_the_worker(tmp_path: Path) -> None:
+    client = FakeBybit(positions={"BTCUSDT": "0.01", "ETHUSDT": "-2"})
+    w = _worker(tmp_path, client, dead_man_timeout_s=300.0, dead_man_startup_grace_s=0.0)
+    w._started_ms = T0 - 10_000_000
+    assert w.handle_frames(_frames(_signal()), now_ms=T0 + 100) == "queued"
+    assert w.handle_frames(_frames(_signal(symbol="CRYPTO_ETH_USD", timestamp_ms=T0 + 280_000)), now_ms=T0 + 280_100) == "queued"
+    assert asyncio.run(w.check_dead_man(T0 + 100 + 300_001)) == "tripped"
+    assert client.positions == {"BTCUSDT": D(0), "ETHUSDT": D(0)}  # ETH parlait encore, mais plus aucun signal ne sera traité
+    assert sorted((o.symbol, o.is_buy, o.reduce_only) for o in client.orders) == [("BTCUSDT", False, True), ("ETHUSDT", True, True)]
+    assert w.handle_frames(_frames(_signal(timestamp_ms=T0 + 500_000)), now_ms=T0 + 500_100) == "dead_man_halted"
+
+
+def test_bybit_supports_the_dead_man_switch_option(tmp_path: Path) -> None:
+    assert BybitWorker.supports_dead_man
+
+
+def test_cli_clear_halt_needs_no_key_no_secret_and_no_network(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    _env(monkeypatch)  # aucune variable
+
+    def forbidden(**_: Any) -> None:
+        raise AssertionError("aucun client réseau ne doit être créé pour lever un verrou")
+
+    monkeypatch.setattr(worker_module, "BybitRestClient", forbidden)
+    from workers.common.state import ExecutionState
+
+    db = tmp_path / "locked.sqlite3"
+    state = ExecutionState(db)
+    state.set("halted", "1")
+    state.set("dead_man_tripped", "123")
+    state.set("dead_man_pending", '["BTCUSDT"]')
+    state.set("last_signal:BTCUSDT", "1")
+    state.close()
+    assert worker_module.main(["--clear-halt", "--db", str(db)]) == 0
+    after = ExecutionState(db)
+    assert after.get("halted") is None and after.get("dead_man_tripped") is None and after.get("dead_man_pending") is None
+    assert int(after.get("last_signal:BTCUSDT") or 0) > 1
+
+
+def test_cli_dead_man_timeout_defaults_to_300_and_zero_is_refused_on_mainnet_live(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[Any] = []
+    ok = KeyInfo(read_only=False, permissions={"ContractTrade": ["Order", "Position"], "Wallet": []})
+
+    class _Stop(Exception):
+        pass
+
+    def worker_factory(config: BybitWorkerConfig, client: Any) -> None:
+        seen.append(config.dead_man_timeout_s)
+        raise _Stop
+
+    monkeypatch.setattr(worker_module, "BybitRestClient", lambda **_: _KeyOnly(ok))
+    monkeypatch.setattr(worker_module, "BybitWorker", worker_factory)
+    for args, expected in ((["--address", "tcp://x:1"], 300.0), (["--address", "tcp://x:1", "--dead-man-timeout", "45"], 45.0),
+                           (["--address", "tcp://x:1", "--dead-man-timeout", "0"], None)):
+        _env(monkeypatch, BYBIT_API_KEY="k", BYBIT_API_SECRET="s", NOTHIERLY_ZMQ_SECRET=SECRET)
+        with pytest.raises(_Stop):
+            worker_module.main(args)
+        assert seen[-1] == expected
+    _env(monkeypatch, BYBIT_API_KEY="k", BYBIT_API_SECRET="s", NOTHIERLY_ZMQ_SECRET=SECRET)
+    with pytest.raises(SystemExit):
+        worker_module.main(["--address", "tcp://x:1", "--live", "--network", "mainnet", "--i-understand-real-funds", "--dead-man-timeout", "0"])
+    with pytest.raises(SystemExit):
+        worker_module.main(["--address", "tcp://x:1", "--dead-man-timeout", "-5"])

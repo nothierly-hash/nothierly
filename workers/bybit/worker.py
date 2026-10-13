@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import logging
 import os
 import time
@@ -42,8 +43,9 @@ from workers.bybit.client import (
     HedgeModeError,
     check_key_info,
 )
-from workers.bybit.planner import ZERO, OrderPlan, bybit_symbol, plan_order, size_for_pct_step
-from workers.common.base import ExposureWorkerBase, ExposureWorkerConfig
+from workers.bybit.planner import ZERO, OrderPlan, bybit_symbol, plan_order, round_price, size_for_pct_step
+from workers.common.base import EmergencyOrder, ExposureWorkerBase, ExposureWorkerConfig, clear_execution_halt
+from workers.common.exposure import emergency_slippage_bps
 from workers.common.state import ExecutionState
 
 _log = logging.getLogger(__name__)
@@ -61,6 +63,7 @@ class BybitWorkerConfig(ExposureWorkerConfig):
 class BybitWorker(ExposureWorkerBase):
     venue: ClassVar[TargetVenue] = TargetVenue.BYBIT
     _tag: ClassVar[str] = "bybit"
+    supports_dead_man: ClassVar[bool] = True
 
     def __init__(self, config: BybitWorkerConfig, client: BybitClient, state: ExecutionState | None = None) -> None:
         super().__init__(config, state)
@@ -155,6 +158,51 @@ class BybitWorker(ExposureWorkerBase):
         self._record(signal, asset, outcome.status, now, plan, outcome.detail or f"orderId={outcome.order_id}")
         return outcome.status
 
+    async def emergency_flatten(self, asset: str, *, attempt: int, now_ms: int) -> str:
+        """Ferme la position de ``asset`` : limite IOC ``reduceOnly`` à ``mid`` +/- un écart qui double à chaque tentative."""
+        try:
+            specs = await asyncio.to_thread(self._client.instruments)
+            spec = specs.get(asset)
+            if spec is None:
+                self._record_emergency(asset, "unknown_symbol", now_ms, None)
+                return "unknown_symbol"
+            snapshot, mid = await asyncio.gather(
+                asyncio.to_thread(self._client.snapshot), asyncio.to_thread(self._client.mid, asset)
+            )
+        except HedgeModeError as exc:
+            # Un mode hedge ne se ferme pas avec un ordre one-way : on le dit fort et on réessaie, sans rien envoyer.
+            _log.critical("bybit_dead_man_hedge_mode_unsupported %s : FERMER LA POSITION À LA MAIN", exc)
+            self._record_emergency(asset, "hedge_mode_unsupported", now_ms, None, str(exc)[:200])
+            return "hedge_mode_unsupported"
+        except Exception as exc:  # noqa: BLE001 -- lecture réseau : on réessaiera au prochain cycle
+            _log.exception("bybit_dead_man_read_failed")
+            self._record_emergency(asset, "read_error", now_ms, None, repr(exc)[:200])
+            return "read_error"
+        position = snapshot.positions.get(asset)
+        if position is None or position.size == 0:
+            return "no_position"
+        if mid is None:
+            self._record_emergency(asset, "no_price", now_ms, None)
+            return "no_price"
+        slippage = emergency_slippage_bps(self._cfg.emergency_slippage_bps, attempt) / Decimal(10_000)
+        is_buy = position.size < 0  # une position courte se ferme en achetant
+        raw = mid * (1 + slippage) if is_buy else mid * (1 - slippage)
+        order = EmergencyOrder(is_buy, abs(position.size), round_price(raw, spec.tick_size, up=is_buy))
+        if self._cfg.dry_run:
+            self._record_emergency(asset, "dry_run", now_ms, order)
+            _log.warning("bybit_dead_man_dry_run %s %s qty=%s px=%s (aucun ordre envoyé)", asset, "BUY" if is_buy else "SELL", order.size, order.limit_px)
+            return "dry_run"
+        link_id = "n" + hashlib.sha256(f"deadman:{asset}:{now_ms}:{attempt}".encode()).hexdigest()[:32]
+        request = BybitOrderRequest(asset, is_buy, order.size, order.limit_px, "IOC", True, link_id)
+        try:
+            outcome = await asyncio.to_thread(self._client.place_order, request)
+        except Exception as exc:  # noqa: BLE001 -- ambigu : la position est relue au prochain cycle, qui décide
+            _log.exception("bybit_dead_man_place_order_failed")
+            self._record_emergency(asset, "error", now_ms, order, repr(exc)[:200])
+            return "error"
+        self._record_emergency(asset, outcome.status, now_ms, order, outcome.detail or f"orderId={outcome.order_id}")
+        return outcome.status
+
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Worker Bybit copy trading (dry-run testnet par défaut).")
@@ -163,15 +211,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--network", choices=[n.value for n in BybitNetwork], default=BybitNetwork.TESTNET.value)
     parser.add_argument("--live", action="store_true", help="envoie réellement les ordres ; sinon dry-run")
     parser.add_argument("--i-understand-real-funds", action="store_true", help="requis pour --live sur mainnet")
-    parser.add_argument("--clear-halt", action="store_true", help="lève le mode réduction seule puis quitte")
+    parser.add_argument("--clear-halt", action="store_true", help="lève les verrous (drawdown et homme mort) puis quitte")
+    parser.add_argument("--dead-man-timeout", type=float, default=300.0, metavar="SECONDES",
+                        help="ferme toutes les positions puis se verrouille après ce délai sans signal valide (0 = désactivé)")
     parser.add_argument("--allow-non-copy-symbols", action="store_true", help="n'exige pas copyTrading != none")
     parser.add_argument("--max-equity-usd", type=Decimal, default=None, help="plafond d'equity utilisée pour dimensionner")
     args = parser.parse_args(argv)
+    if args.clear_halt:  # ne touche que la base locale : ni réseau, ni clé, ni secret du bus
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+        clear_execution_halt(ExecutionState(args.db))
+        _log.info("bybit_halt_cleared")
+        return 0
+    if args.dead_man_timeout < 0:
+        parser.error("--dead-man-timeout doit être >= 0")
     if not args.address:
         parser.error("--address ou NOTHIERLY_ZMQ_ADDRESS requis")
     network = BybitNetwork(args.network)
     if args.live and network is BybitNetwork.MAINNET and not args.i_understand_real_funds:
         parser.error("--live sur mainnet exige --i-understand-real-funds")
+    if args.live and network is BybitNetwork.MAINNET and args.dead_man_timeout == 0:
+        parser.error("--live sur mainnet exige l'homme mort : --dead-man-timeout doit être > 0")
     key, secret = os.environ.get("BYBIT_API_KEY"), os.environ.get("BYBIT_API_SECRET")
     if not key or not secret:
         parser.error("BYBIT_API_KEY et BYBIT_API_SECRET requis (même en dry-run : solde et positions sont privés ; clé en lecture seule conseillée)")
@@ -189,12 +248,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         dry_run=not args.live,
         require_copy_trading=not args.allow_non_copy_symbols,
         max_equity_usd=args.max_equity_usd,
+        dead_man_timeout_s=args.dead_man_timeout or None,
     )
     worker = BybitWorker(config, client)
-    if args.clear_halt:
-        worker.clear_halt()
-        _log.info("bybit_halt_cleared")
-        return 0
     _log.info("bybit_worker_start network=%s mode=%s", network.value, "LIVE" if args.live else "DRY-RUN")
     try:
         # Boucle Selector explicite : sous Windows, la boucle Proactor par défaut est incompatible avec zmq.asyncio.

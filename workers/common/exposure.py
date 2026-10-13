@@ -51,6 +51,20 @@ class ExposureDecision:
     current_size: Decimal
 
 
+EMERGENCY_SLIPPAGE_CAP_BPS: Final[Decimal] = Decimal("2000")
+
+
+def emergency_slippage_bps(base_bps: Decimal, attempt: int) -> Decimal:
+    """Écart de prix toléré pour la sortie d'urgence : double à chaque tentative, plafonné à 20 %.
+
+    Un IOC trop serré peut ne pas se remplir sur un marché rapide ; réessayer sans élargir laisserait la position
+    ouverte. La tentative 1 vaut ``base_bps`` ; 2 -> x2 ; 3 -> x4 ; etc. jusqu'au plafond.
+    """
+    if attempt < 1:
+        raise ValueError("attempt commence à 1.")
+    return min(base_bps * Decimal(2) ** (attempt - 1), EMERGENCY_SLIPPAGE_CAP_BPS)
+
+
 def floor_to_step(value: Decimal, step: Decimal) -> Decimal:
     """Arrondit ``value`` vers zéro au multiple de ``step`` : on n'envoie jamais plus que la cible."""
     if step <= 0:

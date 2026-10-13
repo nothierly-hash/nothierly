@@ -32,8 +32,8 @@ visible, la magnitude de la conviction fuiterait l'alpha). Voir ``contracts.plat
   tradera de l'argent réel d'après des décisions simulées. Garder les workers en dry-run/testnet/démo dans ce cas.
 - Un worker ramène le compte à la cible pour CHAQUE symbole suivi, y compris ``FLAT`` : une position ouverte à la
   main sur ce symbole serait fermée. Utiliser des comptes dédiés.
-- Si le pont meurt, les workers gardent leur dernière position (absence de signal = pas d'ordre). Un « homme
-  mort » côté worker (aplatir après N secondes sans signal) reste à écrire.
+- Si le pont meurt, ce sont les workers qui protègent : leur homme mort (``--dead-man-timeout``, 300 s par défaut)
+  ferme toutes leurs positions après N secondes sans signal valide, puis les verrouille (``workers/common/base.py``).
 """
 
 from __future__ import annotations

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import logging
 import os
 import time
@@ -25,9 +26,16 @@ from typing import ClassVar
 
 from contracts.platform_signal import PlatformSignal, TargetVenue
 from contracts.secure_signal_bus import load_secret_from_env
-from workers.common.base import DEFAULT_MAX_AGE_MS, ExposureWorkerBase, ExposureWorkerConfig
+from workers.common.base import (
+    DEFAULT_MAX_AGE_MS,
+    EmergencyOrder,
+    ExposureWorkerBase,
+    ExposureWorkerConfig,
+    clear_execution_halt,
+)
+from workers.common.exposure import emergency_slippage_bps
 from workers.hyperliquid.client import AccountSnapshot, HyperliquidClient, Network, OrderRequest, SdkHyperliquidClient
-from workers.hyperliquid.planner import ZERO, OrderPlan, hl_asset, plan_order, size_for_pct
+from workers.hyperliquid.planner import ZERO, OrderPlan, hl_asset, plan_order, round_price, size_for_pct
 from workers.hyperliquid.state import HlState
 
 _log = logging.getLogger(__name__)
@@ -43,6 +51,7 @@ class HyperliquidWorkerConfig(ExposureWorkerConfig):
 class HyperliquidWorker(ExposureWorkerBase):
     venue: ClassVar[TargetVenue] = TargetVenue.HYPERLIQUID
     _tag: ClassVar[str] = "hl"
+    supports_dead_man: ClassVar[bool] = True
 
     def __init__(self, config: HyperliquidWorkerConfig, client: HyperliquidClient, state: HlState | None = None) -> None:
         super().__init__(config, state)
@@ -122,6 +131,46 @@ class HyperliquidWorker(ExposureWorkerBase):
         self._record(signal, asset, outcome.status, now, plan, outcome.detail or f"oid={outcome.oid} filled={outcome.filled_size}")
         return outcome.status
 
+    async def emergency_flatten(self, asset: str, *, attempt: int, now_ms: int) -> str:
+        """Ferme la position de ``asset`` : ordre ``reduce_only`` IOC, prix à ``mid`` +/- un écart qui double à chaque tentative."""
+        try:
+            decimals_map = await asyncio.to_thread(self._client.asset_decimals)
+            if asset not in decimals_map:
+                self._record_emergency(asset, "unknown_asset", now_ms, None)
+                return "unknown_asset"
+            snapshot, mids = await asyncio.gather(
+                asyncio.to_thread(self._client.snapshot), asyncio.to_thread(self._client.mids)
+            )
+        except Exception as exc:  # noqa: BLE001 -- lecture réseau : on réessaiera au prochain cycle
+            _log.exception("hl_dead_man_read_failed")
+            self._record_emergency(asset, "read_error", now_ms, None, repr(exc)[:200])
+            return "read_error"
+        position = snapshot.positions.get(asset, ZERO)
+        if position == 0:
+            return "no_position"
+        mid = mids.get(asset)
+        if mid is None:
+            self._record_emergency(asset, "no_price", now_ms, None)
+            return "no_price"
+        slippage = emergency_slippage_bps(self._cfg.emergency_slippage_bps, attempt) / Decimal(10_000)
+        is_buy = position < 0  # une position courte se ferme en achetant
+        raw = mid * (1 + slippage) if is_buy else mid * (1 - slippage)
+        order = EmergencyOrder(is_buy, abs(position), round_price(raw, decimals_map[asset]))
+        if self._cfg.dry_run:
+            self._record_emergency(asset, "dry_run", now_ms, order)
+            _log.warning("hl_dead_man_dry_run %s %s sz=%s px=%s (aucun ordre envoyé)", asset, "BUY" if is_buy else "SELL", order.size, order.limit_px)
+            return "dry_run"
+        cloid = "0x" + hashlib.sha256(f"deadman:{asset}:{now_ms}:{attempt}".encode()).hexdigest()[:32]
+        request = OrderRequest(asset, is_buy, order.size, order.limit_px, "Ioc", True, cloid)
+        try:
+            outcome = await asyncio.to_thread(self._client.place_order, request)
+        except Exception as exc:  # noqa: BLE001 -- ambigu : la position est relue au prochain cycle, qui décide
+            _log.exception("hl_dead_man_place_order_failed")
+            self._record_emergency(asset, "error", now_ms, order, repr(exc)[:200])
+            return "error"
+        self._record_emergency(asset, outcome.status, now_ms, order, outcome.detail or f"oid={outcome.oid} filled={outcome.filled_size}")
+        return outcome.status
+
 
 def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Worker Hyperliquid (dry-run testnet par défaut).")
@@ -130,13 +179,24 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--network", choices=[n.value for n in Network], default=Network.TESTNET.value)
     parser.add_argument("--live", action="store_true", help="envoie réellement les ordres ; sinon dry-run (lecture seule)")
     parser.add_argument("--i-understand-real-funds", action="store_true", help="requis pour --live sur mainnet")
-    parser.add_argument("--clear-halt", action="store_true", help="lève le mode réduction seule puis quitte")
+    parser.add_argument("--clear-halt", action="store_true", help="lève les verrous (drawdown et homme mort) puis quitte")
+    parser.add_argument("--dead-man-timeout", type=float, default=300.0, metavar="SECONDES",
+                        help="ferme toutes les positions puis se verrouille après ce délai sans signal valide (0 = désactivé)")
     args = parser.parse_args(argv)
+    if args.clear_halt:  # ne touche que la base locale : ni réseau, ni SDK, ni clé
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+        clear_execution_halt(HlState(args.db))
+        _log.info("hl_halt_cleared")
+        return
+    if args.dead_man_timeout < 0:
+        parser.error("--dead-man-timeout doit être >= 0")
     if not args.address:
         parser.error("--address ou NOTHIERLY_ZMQ_ADDRESS requis")
     network = Network(args.network)
     if args.live and network is Network.MAINNET and not args.i_understand_real_funds:
         parser.error("--live sur mainnet exige --i-understand-real-funds")
+    if args.live and network is Network.MAINNET and args.dead_man_timeout == 0:
+        parser.error("--live sur mainnet exige l'homme mort : --dead-man-timeout doit être > 0")
     account = os.environ.get("HL_ACCOUNT_ADDRESS")
     if not account:
         parser.error("HL_ACCOUNT_ADDRESS requis (compte principal dont l'equity sert de base)")
@@ -148,13 +208,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         network=network, account_address=account, agent_secret=secret, vault_address=os.environ.get("HL_VAULT_ADDRESS")
     )
     config = HyperliquidWorkerConfig(
-        address=args.address, secret_key=load_secret_from_env(), db_path=args.db, dry_run=not args.live
+        address=args.address, secret_key=load_secret_from_env(), db_path=args.db, dry_run=not args.live,
+        dead_man_timeout_s=args.dead_man_timeout or None,
     )
     worker = HyperliquidWorker(config, client)
-    if args.clear_halt:
-        worker.clear_halt()
-        _log.info("hl_halt_cleared")
-        return
     _log.info("hl_worker_start network=%s mode=%s", network.value, "LIVE" if args.live else "DRY-RUN")
     try:
         # Boucle Selector explicite : sous Windows, la boucle Proactor par défaut est incompatible avec zmq.asyncio.

@@ -579,3 +579,127 @@ def test_live_requires_an_agent_key_and_dry_run_never_receives_one(monkeypatch: 
     with pytest.raises(RuntimeError, match="stop"):
         worker_module.main(["--address", "tcp://x:1"])  # dry-run : la clé présente dans l'environnement est ignorée
     assert seen["agent_secret"] is None and seen["network"] is Network.TESTNET
+
+
+# --- Homme mort : sortie d'urgence -----------------------------------------------------------
+
+
+def _flatten(worker: HyperliquidWorker, asset: str = "BTC", attempt: int = 1) -> str:
+    return asyncio.run(worker.emergency_flatten(asset, attempt=attempt, now_ms=T0))
+
+
+def test_emergency_flatten_sells_a_long_with_a_reduce_only_ioc_below_the_mid(tmp_path: Path) -> None:
+    client = FakeHl(positions={"BTC": "0.01"})
+    w = _worker(tmp_path, client)
+    assert _flatten(w) == "filled"
+    (req,) = client.orders
+    assert (req.asset, req.is_buy, req.size, req.limit_px, req.tif, req.reduce_only) == ("BTC", False, D("0.01"), D(48500), "Ioc", True)  # 50 000 x (1 - 3 %)
+    assert client.positions["BTC"] == 0
+    (rec,) = w.state.executions()
+    assert (rec.status, rec.side, rec.signal_id) == ("dead_man_flatten:filled", "SELL", "dead-man:BTC")
+
+
+def test_emergency_flatten_buys_back_a_short_above_the_mid(tmp_path: Path) -> None:
+    client = FakeHl(positions={"BTC": "-0.02"})
+    assert _flatten(_worker(tmp_path, client)) == "filled"
+    (req,) = client.orders
+    assert (req.is_buy, req.size, req.limit_px, req.reduce_only) == (True, D("0.02"), D(51500), True)  # 50 000 x (1 + 3 %)
+
+
+def test_emergency_slippage_widens_with_each_attempt(tmp_path: Path) -> None:
+    client = FakeHl(positions={"BTC": "0.01"})
+    w = _worker(tmp_path, client)
+    client.reject = True  # l'ordre n'est jamais accepté : on regarde seulement le prix demandé
+    sent = []
+    for attempt in (1, 2, 3, 4, 5):
+        client.reject = False
+        client.positions["BTC"] = D("0.01")
+        _flatten(w, attempt=attempt)
+        sent.append(client.orders[-1].limit_px)
+    assert sent == [D(48500), D(47000), D(44000), D(40000), D(40000)]  # 3 %, 6 %, 12 %, puis plafond 20 %
+
+
+def test_emergency_flatten_does_nothing_on_a_flat_account_and_reports_failures(tmp_path: Path) -> None:
+    client = FakeHl()
+    w = _worker(tmp_path, client)
+    assert _flatten(w) == "no_position" and client.place_calls == 0
+    client.positions["BTC"] = D("0.01")
+    assert _flatten(w, asset="DOGE") == "unknown_asset"
+    client.fail_read = True
+    assert _flatten(w) == "read_error"
+    client.fail_read, client.fail_place = False, True
+    assert _flatten(w) == "error"
+    client.fail_place, client.reject = False, True
+    assert _flatten(w) == "rejected"
+    assert client.positions["BTC"] == D("0.01")  # rien n'a fermé : le worker réessaiera
+
+
+def test_emergency_flatten_in_dry_run_sends_nothing(tmp_path: Path) -> None:
+    client = FakeHl(positions={"BTC": "0.01"})
+    w = _worker(tmp_path, client, dry_run=True)
+    assert _flatten(w) == "dry_run" and client.place_calls == 0
+    (rec,) = w.state.executions()
+    assert (rec.status, rec.side, rec.size, rec.px) == ("dead_man_flatten:dry_run", "SELL", "0.01", "48500")
+
+
+def test_a_silent_engine_closes_the_hyperliquid_position_then_locks_the_worker(tmp_path: Path) -> None:
+    client = FakeHl(positions={"BTC": "0.01"})
+    w = _worker(tmp_path, client, dead_man_timeout_s=300.0, dead_man_startup_grace_s=0.0)
+    w._started_ms = T0 - 10_000_000
+    assert w.handle_frames(_frames(_signal()), now_ms=T0 + 100) == "queued"
+    assert asyncio.run(w.check_dead_man(T0 + 100 + 300_000)) == "ok"
+    assert asyncio.run(w.check_dead_man(T0 + 100 + 300_001)) == "tripped"
+    assert client.positions["BTC"] == 0
+    assert (client.orders[0].is_buy, client.orders[0].reduce_only) == (False, True)  # vente en sortie seule
+    assert w.handle_frames(_frames(_signal(timestamp_ms=T0 + 400_000)), now_ms=T0 + 400_100) == "dead_man_halted"
+    assert asyncio.run(w.check_dead_man(T0 + 100 + 300_002)) == "halted_flat"
+
+
+def test_hyperliquid_supports_the_dead_man_switch_option(tmp_path: Path) -> None:
+    assert HyperliquidWorker.supports_dead_man
+    assert _worker(tmp_path, FakeHl(), dead_man_timeout_s=300.0).dead_man_tripped is False
+
+
+def test_cli_clear_halt_needs_no_sdk_no_key_and_no_bus_secret(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    _cli_env(monkeypatch)  # aucune variable : ni compte, ni clé, ni secret de bus
+
+    def forbidden(**_: Any) -> None:
+        raise AssertionError("aucun client réseau ne doit être créé pour lever un verrou")
+
+    monkeypatch.setattr(worker_module, "SdkHyperliquidClient", forbidden)
+    db = tmp_path / "locked.sqlite3"
+    state = HlState(db)
+    state.set("halted", "1")
+    state.set("dead_man_tripped", "123")
+    state.set("dead_man_pending", '["BTC"]')
+    state.set("last_signal:BTC", "1")
+    state.close()
+    worker_module.main(["--clear-halt", "--db", str(db)])
+    after = HlState(db)
+    assert after.get("halted") is None and after.get("dead_man_tripped") is None and after.get("dead_man_pending") is None
+    assert int(after.get("last_signal:BTC") or 0) > 1  # l'horloge repart de maintenant
+
+
+def test_cli_dead_man_timeout_defaults_to_300_and_zero_is_refused_on_mainnet_live(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[Any] = []
+
+    class _Stop(Exception):
+        pass
+
+    def worker_factory(config: Any, client: Any) -> None:
+        seen.append(config.dead_man_timeout_s)
+        raise _Stop
+
+    monkeypatch.setattr(worker_module, "SdkHyperliquidClient", lambda **_: object())
+    monkeypatch.setattr(worker_module, "HyperliquidWorker", worker_factory)
+    for args, expected in ((["--address", "tcp://x:1"], 300.0), (["--address", "tcp://x:1", "--dead-man-timeout", "45"], 45.0),
+                           (["--address", "tcp://x:1", "--dead-man-timeout", "0"], None)):
+        _cli_env(monkeypatch, HL_ACCOUNT_ADDRESS=ACCOUNT, NOTHIERLY_ZMQ_SECRET=SECRET)
+        with pytest.raises(_Stop):
+            worker_module.main(args)
+        assert seen[-1] == expected
+    _cli_env(monkeypatch, HL_ACCOUNT_ADDRESS=ACCOUNT, HL_AGENT_SECRET=FAKE_KEY, NOTHIERLY_ZMQ_SECRET=SECRET)
+    with pytest.raises(SystemExit):  # mainnet live sans homme mort : refusé
+        worker_module.main(["--address", "tcp://x:1", "--live", "--network", "mainnet", "--i-understand-real-funds", "--dead-man-timeout", "0"])
+    with pytest.raises(SystemExit):
+        worker_module.main(["--address", "tcp://x:1", "--dead-man-timeout", "-5"])

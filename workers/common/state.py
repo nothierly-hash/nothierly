@@ -86,6 +86,14 @@ class ExecutionState:
         with self._lock:
             self._db.execute("DELETE FROM kv WHERE key = ?", (key,))
 
+    def items_with_prefix(self, prefix: str) -> dict[str, str]:
+        """Toutes les paires ``kv`` dont la clé commence par ``prefix`` (comparaison exacte, sans joker SQL)."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT key, value FROM kv WHERE substr(key, 1, ?) = ?", (len(prefix), prefix)
+            ).fetchall()
+        return {str(k): str(v) for k, v in rows}
+
     def log_execution(self, record: ExecutionRecord) -> None:
         with self._lock:
             self._db.execute(
