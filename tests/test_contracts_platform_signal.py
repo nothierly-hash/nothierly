@@ -327,13 +327,13 @@ def test_json_schema_pins_the_documented_bounds_and_enums() -> None:
     assert "confidence_score" not in json_schema()["required"]
     assert props["position_size_pct"]["minimum"] == 0.0 and props["position_size_pct"]["maximum"] == 100.0
     assert json_schema()["additionalProperties"] is False
-    assert json_schema()["$defs"]["TargetVenue"]["enum"] == ["HYPERLIQUID", "BINANCE", "BYBIT", "ZIGNALY", "ENZYME", "NUMERAI_SIGNALS", "AXI_SELECT", "DARWINEX_ZERO", "ALL"]
+    assert json_schema()["$defs"]["TargetVenue"]["enum"] == ["HYPERLIQUID", "BINANCE", "BYBIT", "ENZYME", "NUMERAI_SIGNALS", "DARWINEX_ZERO", "ALL"]
 
 
-# --- Les 8 plateformes ------------------------------------------------------------------------
+# --- Les 6 plateformes ------------------------------------------------------------------------
 
-_CRYPTO_VENUES = [TargetVenue.HYPERLIQUID, TargetVenue.BINANCE, TargetVenue.BYBIT, TargetVenue.ZIGNALY, TargetVenue.ENZYME]
-_FOREX_VENUES = [TargetVenue.AXI_SELECT, TargetVenue.DARWINEX_ZERO]
+_CRYPTO_VENUES = [TargetVenue.HYPERLIQUID, TargetVenue.BINANCE, TargetVenue.BYBIT, TargetVenue.ENZYME]
+_FOREX_VENUES = [TargetVenue.DARWINEX_ZERO]
 _NON_NUMERAI = _CRYPTO_VENUES + _FOREX_VENUES
 
 
@@ -346,9 +346,9 @@ def _for_venue(venue: TargetVenue, **overrides: Any) -> PlatformSignal:
     return _hyperliquid(target_venue=venue, **overrides)
 
 
-def test_target_venue_is_exactly_the_eight_platforms_plus_all() -> None:
+def test_target_venue_is_exactly_the_six_platforms_plus_all() -> None:
     assert {v.value for v in TargetVenue} == {
-        "HYPERLIQUID", "BINANCE", "BYBIT", "ZIGNALY", "ENZYME", "NUMERAI_SIGNALS", "AXI_SELECT", "DARWINEX_ZERO", "ALL",
+        "HYPERLIQUID", "BINANCE", "BYBIT", "ENZYME", "NUMERAI_SIGNALS", "DARWINEX_ZERO", "ALL",
     }
 
 
@@ -372,9 +372,7 @@ def test_a_valid_signal_exists_for_every_platform(venue: TargetVenue) -> None:
     [
         (TargetVenue.BINANCE, AssetClass.EQUITY, "EQUITY_US_AAPL"),
         (TargetVenue.BYBIT, AssetClass.FOREX, "FOREX_EUR_USD"),
-        (TargetVenue.ZIGNALY, AssetClass.FOREX, "FOREX_EUR_USD"),
         (TargetVenue.ENZYME, AssetClass.EQUITY, "EQUITY_US_AAPL"),
-        (TargetVenue.AXI_SELECT, AssetClass.CRYPTO, "CRYPTO_BTC_USD"),
         (TargetVenue.DARWINEX_ZERO, AssetClass.CRYPTO, "CRYPTO_BTC_USD"),
         (TargetVenue.NUMERAI_SIGNALS, AssetClass.FOREX, "FOREX_EUR_USD"),
     ],
@@ -415,9 +413,8 @@ def test_a_targeted_platform_is_the_only_one_that_matches() -> None:
     assert not any(binance.targets(v) for v in TargetVenue if v is not TargetVenue.BINANCE)
 
 
-def test_stop_loss_is_required_for_darwinex_zero_but_no_rule_is_invented_for_axi_select() -> None:
+def test_stop_loss_is_required_for_darwinex_zero_including_through_all() -> None:
     with pytest.raises(ValidationError, match="stop_loss_price"):
         _darwinex(target_venue=TargetVenue.DARWINEX_ZERO, metadata={})
-    assert _darwinex(target_venue=TargetVenue.AXI_SELECT, metadata={}).target_venue is TargetVenue.AXI_SELECT
     with pytest.raises(ValidationError, match="stop_loss_price"):  # ALL couvre aussi Darwinex Zero
         _darwinex(target_venue=TargetVenue.ALL, metadata={})

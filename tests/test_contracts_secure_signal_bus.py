@@ -379,11 +379,11 @@ def test_from_env_builds_a_working_publisher(monkeypatch: pytest.MonkeyPatch, zm
 
 
 def test_each_crypto_worker_accepts_all_crypto_but_a_targeted_signal_only_its_own() -> None:
-    crypto_venues = [TargetVenue.HYPERLIQUID, TargetVenue.BINANCE, TargetVenue.BYBIT, TargetVenue.ZIGNALY, TargetVenue.ENZYME]
+    crypto_venues = [TargetVenue.HYPERLIQUID, TargetVenue.BINANCE, TargetVenue.BYBIT, TargetVenue.ENZYME]
     fan_out = build_envelope(_crypto(target_venue=TargetVenue.ALL), SECRET)
     binance_only = build_envelope(_crypto(target_venue=TargetVenue.BINANCE), SECRET)
     for venue in crypto_venues:
         assert open_envelope(fan_out, SECRET, venue=venue).accepted
         assert open_envelope(binance_only, SECRET, venue=venue).accepted is (venue is TargetVenue.BINANCE)
-    assert open_envelope(fan_out, SECRET, venue=TargetVenue.AXI_SELECT).reject_reason == "wrong_venue"
+    assert open_envelope(fan_out, SECRET, venue=TargetVenue.DARWINEX_ZERO).reject_reason == "wrong_venue"
     assert open_envelope(fan_out, SECRET, venue=TargetVenue.NUMERAI_SIGNALS).reject_reason == "wrong_venue"

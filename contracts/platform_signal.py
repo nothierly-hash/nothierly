@@ -39,18 +39,16 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class TargetVenue(str, Enum):
-    """Les 8 plateformes cibles, par pôle, plus ``ALL``. Pas de 9e : ajouter une plateforme est un choix explicite."""
+    """Les 6 plateformes cibles, par pôle, plus ``ALL``. Pas de 9e : ajouter une plateforme est un choix explicite."""
 
     # Pôle crypto (temps réel)
     HYPERLIQUID = "HYPERLIQUID"
     BINANCE = "BINANCE"
     BYBIT = "BYBIT"
-    ZIGNALY = "ZIGNALY"
     ENZYME = "ENZYME"
     # Pôle actions (batch)
     NUMERAI_SIGNALS = "NUMERAI_SIGNALS"
     # Pôle forex / CFD (pont MT4/MT5)
-    AXI_SELECT = "AXI_SELECT"
     DARWINEX_ZERO = "DARWINEX_ZERO"
     ALL = "ALL"
 
@@ -74,15 +72,13 @@ class OrderType(str, Enum):
 
 
 # Classe d'actif que traite chaque plateforme (une seule). ``target_venue=ALL`` signifie « toutes les
-# plateformes de la classe d'actif du signal » : 5 pour CRYPTO, 2 pour FOREX, 1 pour EQUITY.
+# plateformes de la classe d'actif du signal » : 4 pour CRYPTO, 1 pour FOREX, 1 pour EQUITY.
 _ASSET_CLASS_BY_VENUE: Final[dict[TargetVenue, AssetClass]] = {
     TargetVenue.HYPERLIQUID: AssetClass.CRYPTO,
     TargetVenue.BINANCE: AssetClass.CRYPTO,
     TargetVenue.BYBIT: AssetClass.CRYPTO,
-    TargetVenue.ZIGNALY: AssetClass.CRYPTO,
     TargetVenue.ENZYME: AssetClass.CRYPTO,
     TargetVenue.NUMERAI_SIGNALS: AssetClass.EQUITY,
-    TargetVenue.AXI_SELECT: AssetClass.FOREX,
     TargetVenue.DARWINEX_ZERO: AssetClass.FOREX,
 }
 

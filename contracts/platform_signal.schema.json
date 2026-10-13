@@ -30,15 +30,13 @@
       "type": "string"
     },
     "TargetVenue": {
-      "description": "Les 8 plateformes cibles, par pôle, plus ``ALL``. Pas de 9e : ajouter une plateforme est un choix explicite.",
+      "description": "Les 6 plateformes cibles, par pôle, plus ``ALL``. Pas de 9e : ajouter une plateforme est un choix explicite.",
       "enum": [
         "HYPERLIQUID",
         "BINANCE",
         "BYBIT",
-        "ZIGNALY",
         "ENZYME",
         "NUMERAI_SIGNALS",
-        "AXI_SELECT",
         "DARWINEX_ZERO",
         "ALL"
       ],

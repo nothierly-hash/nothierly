@@ -1,14 +1,14 @@
-# Architecture Hub-and-Spoke : Cerveau Alpha vers 8 plateformes de capital externe, en 3 pôles
+# Architecture Hub-and-Spoke : Cerveau Alpha vers 6 plateformes de capital externe, en 3 pôles
 
-Statut : le **contrat** (`contracts/platform_signal.py`), le **transport signé** (`contracts/secure_signal_bus.py`) et deux workers (`workers/numerai`, `workers/hyperliquid`) sont implémentés et testés, mais **jamais exécutés contre les vraies plateformes**. Les 6 autres plateformes ont leur nom réservé dans le contrat et **aucun worker**. Les faits sur les plateformes viennent de recherches web et sont marqués **[à vérifier]** quand les sources divergent ou manquent. Les éléments du repo cités existent réellement (chemins indiqués).
+Statut : le **contrat** (`contracts/platform_signal.py`), le **transport signé** (`contracts/secure_signal_bus.py`) et deux workers (`workers/numerai`, `workers/hyperliquid`) sont implémentés et testés, mais **jamais exécutés contre les vraies plateformes**. Les 4 autres plateformes ont leur nom réservé dans le contrat et **aucun worker**. Les faits sur les plateformes viennent de recherches web et sont marqués **[à vérifier]** quand les sources divergent ou manquent. Les éléments du repo cités existent réellement (chemins indiqués).
 
-Périmètre : exactement 8 plateformes, celles du tableau ci-dessous.
+Périmètre : exactement 6 plateformes, celles du tableau ci-dessous.
 
 | Pôle | Plateformes | Exécution | Worker |
 |---|---|---|---|
-| Crypto | `HYPERLIQUID`, `BINANCE`, `BYBIT`, `ZIGNALY`, `ENZYME` | temps réel | Hyperliquid écrit (dry-run) ; les 4 autres non écrits |
+| Crypto | `HYPERLIQUID`, `BINANCE`, `BYBIT`, `ENZYME` | temps réel | Hyperliquid écrit (dry-run) ; les 3 autres non écrits |
 | Actions | `NUMERAI_SIGNALS` | batch quotidien | écrit (dry-run) |
-| Forex / CFD | `AXI_SELECT`, `DARWINEX_ZERO` | pont MT4/MT5 | non écrits |
+| Forex / CFD | `DARWINEX_ZERO` | pont MT5 | non écrit |
 
 ---
 
@@ -16,7 +16,7 @@ Périmètre : exactement 8 plateformes, celles du tableau ci-dessous.
 
 Le brief pose "zéro capital propre, zéro frais, zéro fuite d'IP". Les trois contraintes ne tiennent pas telles quelles. Mieux vaut le savoir avant de dessiner.
 
-### 0.1 "Zéro capital, zéro frais" : tenable pour une seule plateforme sur huit
+### 0.1 "Zéro capital, zéro frais" : tenable pour une seule plateforme sur six
 
 | Plateforme | Coût réel d'entrée | Source |
 |---|---|---|
@@ -25,11 +25,9 @@ Le brief pose "zéro capital propre, zéro frais, zéro fuite d'IP". Les trois c
 | Darwinex Zero | Abonnement mensuel payant. Pas de "challenge fee" au sens prop-firm, mais ce n'est pas gratuit. Prix divergents selon les sources (95 EUR d'inscription + 38 EUR/mois cité à l'époque du lancement) **[à vérifier sur darwinex.com]**. Le leader touche 15 % du profit sur capital alloué. | [Darwinex blog](https://blog.darwinex.com/darwinex-zero-new-subscription-service-what-is-it-and-how-it-works), [MQL5](https://www.mql5.com/en/blogs/post/773634) |
 | Binance (lead trading) | Copy trading spot : portefeuille de lead entre 500 et 250 000 USDT (annonce de 2024) donc **capital propre requis** ; partage de profit de 10 % au lancement du spot. Critères actuels d'éligibilité pour le futures et disponibilité régionale **non trouvés** **[à vérifier]**. | [The Block](https://www.theblock.co/news/markets/2024-04-23-binance-spot-copy-trading-290345), [Binance dev docs](https://developers.binance.com/docs/copy_trading/future-copy-trading/Get-Futures-Lead-Trader-Status) |
 | Bybit (master trader) | Critères officiels actuels **introuvables**. Une revue de 2024 décrit des niveaux (Cadet à Gold) avec des minimums d'actifs, de profits des followers sur 7 jours et de drawdown ; partage de profit de 10 à 15 %. **[à vérifier sur la page de candidature]** | [Coin Bureau (mars 2024)](https://coinbureau.com/review/bybit-copy-trading-review), [Bybit V5](https://bybit-exchange.github.io/docs/v5/copytrade) |
-| Zignaly | **Statut non confirmé.** Des sources tierces décrivent un modèle de partage de profit ("PAMM") et une API pour institutions, sans documentation officielle trouvée ni confirmation 2026. **[demander à Zignaly, par écrit]** | [Tangem](https://tangem.com/en/cryptocurrencies/zignaly/), [Quicknode (listing tiers)](https://www.quicknode.com/de/builders-guide/tools/zignaly-by-zignaly) |
 | Enzyme (vault EVM) | Création d'un vault via l'app (Ethereum ou Polygon). Aucun frais de création trouvé ; le coût documenté est le **gas** (créer et reconfigurer). Une modification des réglages d'un vault ne s'applique qu'après **7 jours**. Capital propre : non requis par la doc consultée, mais des déposants sont nécessaires pour avoir des fonds à gérer. | [Enzyme FAQ](https://docs.enzyme.finance/what-is-enzyme/faq), [reconfigurer un vault](https://docs.enzyme.finance/getting-started/customise-your-settings/reconfigure-your-vault) |
-| Axi Select | Il faut un compte **live Axi avec argent réel** : dépôt de 500 USD, au moins 20 trades distincts fermés et un Edge Score de 50 pour entrer (source tierce). Les paliers Axi vont de 5 000 USD de financement max (partage 0 %) jusqu'à 1 M USD (partage 80 %). **[reconfirmer dans les règles du programme]** | [Axi](https://www.axi.com/int/our-edge/funding-talented-traders), [Myfxbook](https://www.myfxbook.com/prop-firms/axiselect) |
 
-Conséquence : un budget minimal incompressible existe : environ 200 USDC pour Hyperliquid, l'abonnement Darwinex Zero, 500 USD sur un compte live Axi, du gas pour Enzyme, et du capital propre pour Binance (et probablement Bybit). Seul Numerai est à coût nul pour entrer. Le plan ci-dessous le suppose.
+Conséquence : un budget minimal incompressible existe : environ 200 USDC pour Hyperliquid, l'abonnement Darwinex Zero, du gas pour Enzyme, et du capital propre pour Binance (et probablement Bybit). Seul Numerai est à coût nul pour entrer. Le plan ci-dessous le suppose.
 
 ### 0.2 "Zéro fuite d'IP" : vrai pour le code et les poids, faux pour l'alpha observable
 
@@ -43,7 +41,7 @@ Ces plateformes évaluent la performance réelle. Le dernier run 24 h en shadow 
 
 ### 0.4 Le délai "1 à 3 mois" n'est confirmé par aucune source
 
-La stratégie suppose un financement en 1 à 3 mois. Les sources trouvées ne le garantissent pour aucune plateforme : Darwinex Zero impose un entraînement de **90 jours maximum** avant que le DARWIN existe (le financement vient après) ; Axi Select n'a **pas de délai fixe** (la progression dépend de la performance) ; pour Binance, Bybit, Zignaly et Enzyme, aucun délai n'a été trouvé. Prendre ce chiffre comme un objectif, pas comme un fait.
+La stratégie suppose un financement en 1 à 3 mois. Les sources trouvées ne le garantissent pour aucune plateforme : Darwinex Zero impose un entraînement de **90 jours maximum** avant que le DARWIN existe (le financement vient après)  ; pour Binance, Bybit et Enzyme, aucun délai n'a été trouvé. Prendre ce chiffre comme un objectif, pas comme un fait.
 
 ---
 
@@ -64,11 +62,11 @@ Le Cerveau ne connaît aucune plateforme. Il publie une **intention** (jamais un
  ┌───────────────────────────────────────────────▼──────────────────┐
  │ net_bus (internal:true) : ZMQ PUB/XPUB + CURVE                   │
  └───┬──────────────────────────┬───────────────────────┬───────────┘
-     │ pôle CRYPTO (temps réel) │ pôle ACTIONS (batch)  │ pôle FOREX (pont MT4/MT5)
+     │ pôle CRYPTO (temps réel) │ pôle ACTIONS (batch)  │ pôle FOREX (pont MT5)    
  ┌───▼──────────────────────┐ ┌─▼────────────────┐ ┌────▼─────────────────────┐
- │ w-hyper  w-binance       │ │ w-numerai        │ │ w-axi    w-darwin        │
- │ w-bybit  w-zignaly       │ │ egress: numer.ai │ │ HÔTE WINDOWS (terminal   │
- │ w-enzyme (on-chain)      │ │                  │ │ MT4/MT5 requis)          │
+ │ w-hyper  w-binance       │ │ w-numerai        │ │ w-darwin                 │
+ │ w-bybit  w-enzyme        │ │ egress: numer.ai │ │ HÔTE WINDOWS (terminal   │
+ │ (enzyme : on-chain)      │ │                  │ │ MT5 requis)              │
  │ egress : sa plateforme   │ │                  │ │ egress : son courtier    │
  └───┬──────────────────────┘ └─┬────────────────┘ └────┬─────────────────────┘
      │ PUSH acks                │ PUSH acks             │ PUSH acks
@@ -310,27 +308,14 @@ Rust ou C++ n'apportent rien ici. La latence est dominée par l'API de la venue 
 - Critères pour devenir master : introuvables officiellement (voir §0.1) ; passer par la page de candidature de Bybit.
 - C'est, avec Hyperliquid, le chemin d'ordre le mieux **documenté** des plateformes crypto restantes, donc le plus simple à écrire en premier.
 
-### 4.7 Worker Zignaly : non écrit, **ne pas coder avant confirmation**
-
-- Existence actuelle du produit de partage de profit et d'une API pour institutions : **non confirmée** par une source officielle (voir §0.1).
-- À obtenir par écrit avant tout développement : l'existence et la documentation de l'API, les conditions d'entrée, les frais, la garde des fonds (les sources tierces se contredisent : Fireblocks ou Binance).
-
-### 4.8 Worker Enzyme (vault EVM) : non écrit
+### 4.7 Worker Enzyme (vault EVM) : non écrit
 
 - **Nature différente des autres** : transactions on-chain (gas, confirmation en blocs, slippage, exposition au MEV). Pas de temps réel type Hyperliquid. Le repo a déjà un relais protégé contre le MEV (commit `c0d6026`) à évaluer.
 - **Intégrations** : le trading passe par des adaptateurs DeFi (Uniswap, Aave, Compound, GMX, Balancer, Curve...). Un manager peut restreindre les adaptateurs autorisés. La doc décrit aussi un mode de **trading délégué** (équivalent d'un wallet agent) **[à lire avant de concevoir l'authentification]**.
 - **Vault spot** : un `SHORT` n'est pas exécutable sur du spot. Le worker devra traiter `SHORT` comme `FLAT` (ne pas shorter), sauf intégration de perpétuels (GMX) confirmée.
 - **Réglages** : toute modification du vault est soumise à un délai de 7 jours, donc les paramètres de risque se fixent à la création, pas au fil de l'eau.
 
-### 4.9 Worker Axi Select : non écrit
-
-- **Pas d'API trouvée.** Le brief parle d'évaluation « via API/Bridge » ; je n'ai trouvé que le chemin **compte live MT4/MT5** : on trade comme d'habitude sur un compte Axi réel, et l'**Edge Score** (compétence, risque, régularité, pondérés par l'expérience ; formule non publiée) s'en déduit. Le pont est donc le même type que pour Darwinex Zero (§4.3), sur l'hôte Windows.
-- **Argent réel** : spreads et commissions réels dès le premier jour ; dépôt de 500 USD, 20 trades distincts fermés, KYC (source tierce).
-- **Règles à lire avant de coder** : une source tierce indique que les EA sont autorisés mais que le **scalping** et le **copy trading automatisé** sont **interdits**. Un moteur à haute fréquence est donc probablement incompatible ; à vérifier dans le règlement du programme.
-- Perte maximale par palier : -7 % (-10 % au palier Pro M), d'après la table Axi ; une source tierce donne -7 % partout. Le coupe-circuit local du worker doit être **plus strict** que cette limite.
-- Aucune règle supplémentaire n'est imposée par le contrat à `AXI_SELECT` (pas de `stop_loss_price` obligatoire, contrairement à `DARWINEX_ZERO`) : elle serait inventée.
-
-### 4.10 Gestion des secrets (commun)
+### 4.8 Gestion des secrets (commun)
 
 1. Aucun secret dans l'image ni dans git (`real_keys.env` à la racine du repo est à sortir du dossier de travail et à auditer).
 2. Docker secrets (fichiers montés en tmpfs) ou `security_vault.py`.
@@ -350,9 +335,7 @@ Rust ou C++ n'apportent rien ici. La latence est dominée par l'API de la venue 
 | Hyperliquid | ordres + positions publiques on-chain | **élevée** : copiable, partiellement déductible |
 | Darwinex Zero | trades du compte, copiés aux investisseurs | moyenne |
 | Binance, Bybit | trades du compte lead, **visibles et copiés par les followers** | élevée : le copy trading est de la copie par construction |
-| Zignaly | à confirmer | inconnue |
 | Enzyme | transactions et positions **publiques on-chain** | élevée |
-| Axi Select | trades du compte, vus par Axi | moyenne |
 
 ### 5.2 Règles
 
@@ -444,9 +427,9 @@ Le worker tombe seul, le Cerveau n'en sait rien.
 | 2 | **Numerai Signals** : worker + validations (aucune exécution) | **fait** (dry-run) ; soumission réelle non testée ; 0 |
 | 3 | **Hyperliquid** : worker temps réel, clé agent sans retrait | **fait** (dry-run) ; testnet à faire ; ≈200 USDC + stake pour un vault |
 | 4 | **Bybit** : chemin d'ordre documenté (V5), perp USDT | à écrire ; critères master à confirmer |
-| 5 | **Darwinex Zero** puis **Axi Select** : pont MT5 Windows, SL serveur, calendrier, idempotence | à écrire ; abonnement ; 500 USD sur compte live Axi |
+| 5 | **Darwinex Zero** : pont MT5 Windows, SL serveur, calendrier, idempotence | à écrire ; abonnement |
 | 6 | **Enzyme** : vault EVM, relais anti-MEV | à écrire ; gas |
-| 7 | **Binance** et **Zignaly** : seulement après confirmation écrite des conditions et de l'API d'ordres | bloqué par des inconnues |
+| 7 | **Binance** : seulement après confirmation écrite des conditions et de l'API d'ordres | bloqué par des inconnues |
 
 Ordre = choix de risque et d'information disponible (API documentée d'abord, inconnues en dernier), pas une promesse de délai (§0.4).
 
@@ -461,6 +444,4 @@ Chaque phase se termine par un test de chaos (kill du worker, coupure WS, rejet 
 - [Darwinex Zero, fonctionnement](https://blog.darwinex.com/darwinex-zero-new-subscription-service-what-is-it-and-how-it-works) · [MQL5, retour d'expérience](https://www.mql5.com/en/blogs/post/773634)
 - [Binance, statut lead trader futures](https://developers.binance.com/docs/copy_trading/future-copy-trading/Get-Futures-Lead-Trader-Status) · [The Block, spot copy trading](https://www.theblock.co/news/markets/2024-04-23-binance-spot-copy-trading-290345)
 - [Bybit V5, copy trading](https://bybit-exchange.github.io/docs/v5/copytrade) · [Coin Bureau, revue (2024)](https://coinbureau.com/review/bybit-copy-trading-review)
-- Zignaly (sources tierces, aucune officielle trouvée) : [Tangem](https://tangem.com/en/cryptocurrencies/zignaly/) · [Quicknode](https://www.quicknode.com/de/builders-guide/tools/zignaly-by-zignaly)
 - [Enzyme, FAQ](https://docs.enzyme.finance/what-is-enzyme/faq) · [reconfigurer un vault](https://docs.enzyme.finance/getting-started/customise-your-settings/reconfigure-your-vault) · [trading délégué](https://docs.enzyme.finance/getting-started/customise-your-settings/delegate-trading)
-- [Axi, financement des traders](https://www.axi.com/int/our-edge/funding-talented-traders) · [Myfxbook, Axi Select](https://www.myfxbook.com/prop-firms/axiselect)
