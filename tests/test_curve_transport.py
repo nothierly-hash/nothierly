@@ -25,6 +25,7 @@ import zmq
 
 from contracts.curve_transport import (
     ENV_CLIENT_KEYS,
+    ENV_ENCRYPTION,
     ENV_CLIENT_PUBLIC,
     ENV_CLIENT_SECRET,
     ENV_SERVER_PUBLIC,
@@ -192,6 +193,27 @@ def test_from_env_returns_none_when_unset_and_rejects_partial_configuration(keys
     assert server is not None and server.authorized_clients == {keys.client.public, keys.intruder.public}
     client = CurveClientConfig.from_env({ENV_SERVER_PUBLIC: keys.server.public, ENV_CLIENT_PUBLIC: keys.client.public, ENV_CLIENT_SECRET: keys.client.secret})
     assert client == keys.client_cfg
+
+
+def test_the_encryption_switch_forces_disables_or_leaves_curve_to_the_keys(keys: Keys) -> None:
+    server_env = {ENV_SERVER_SECRET: keys.server.secret, ENV_CLIENT_KEYS: keys.client.public}
+    client_env = {ENV_SERVER_PUBLIC: keys.server.public, ENV_CLIENT_PUBLIC: keys.client.public, ENV_CLIENT_SECRET: keys.client.secret}
+    for value in ("false", "0", "OFF"):  # désactivé : les clés présentes sont ignorées
+        assert CurveServerConfig.from_env({**server_env, ENV_ENCRYPTION: value}) is None
+        assert CurveClientConfig.from_env({**client_env, ENV_ENCRYPTION: value}) is None
+    for value in ("", "auto", "AUTO"):  # auto : selon les clés
+        assert CurveServerConfig.from_env({**server_env, ENV_ENCRYPTION: value}) is not None
+        assert CurveClientConfig.from_env({ENV_ENCRYPTION: value}) is None
+    for value in ("true", "1", "required"):  # obligatoire : des clés absentes sont une erreur, pas un repli en clair
+        assert CurveClientConfig.from_env({**client_env, ENV_ENCRYPTION: value}) == keys.client_cfg
+        with pytest.raises(CurveConfigError, match="ne sont pas définis"):
+            CurveServerConfig.from_env({ENV_ENCRYPTION: value})
+        with pytest.raises(CurveConfigError, match="ne sont pas définis"):
+            CurveClientConfig.from_env({ENV_ENCRYPTION: value})
+    with pytest.raises(CurveConfigError, match="true, false ou auto"):
+        CurveServerConfig.from_env({**server_env, ENV_ENCRYPTION: "peut-etre"})  # une faute de frappe ne coupe pas le chiffrement
+    # `false` n'ouvre pas le réseau : un endpoint non local reste refusé sans --allow-plaintext-remote
+    assert transport_refusal("tcp://bridge:25570", curve_enabled=False, allow_plaintext_remote=False) is not None
 
 
 def test_endpoint_policy() -> None:

@@ -1,0 +1,60 @@
+# Image for the platform chain: the bridge (engine state -> signed PlatformSignals) and the execution workers
+# (Hyperliquid, Bybit; Numerai is the same image with its own command). One image, the component is chosen by the
+# command (see docker-compose.platform.yml):
+#
+#   python scripts/run_platform_bridge.py ...        the bridge
+#   python -m workers.hyperliquid.worker ...         Hyperliquid worker
+#   python -m workers.bybit.worker ...               Bybit worker
+#
+# Separate from the engine's Dockerfile on purpose: that image carries torch/xgboost and the whole engine tree
+# (research data included); none of that belongs next to code that holds exchange keys. Build context is restricted
+# by Dockerfile.platform.dockerignore (allow-list).
+#
+# NOT built here: Docker is not installed on the machine this was written on. The dependency set was checked by
+# importing the bridge and the workers in a clean virtualenv from requirements-platform.txt only, not by `docker build`.
+#
+# Not in this image: the Darwinex worker (needs the Windows-only MetaTrader5 package and a running MT5 terminal; it runs
+# on a Windows host and connects to the bridge over the CURVE-encrypted bus).
+FROM python:3.12-slim AS builder
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements-platform.txt .
+RUN pip install --no-cache-dir --user -r requirements-platform.txt
+
+
+FROM python:3.12-slim AS platform-runtime
+
+WORKDIR /app
+
+COPY --from=builder /root/.local /root/.local
+ENV PATH=/root/.local/bin:$PATH \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+# Only what the chain imports: contracts/ and workers/ never import core/ or src/ (enforced by an AST test); the bridge
+# imports core/ (config, redis, kill switch) and src/bridge/ only.
+COPY contracts/ ./contracts/
+COPY workers/ ./workers/
+COPY core/ ./core/
+COPY src/__init__.py ./src/__init__.py
+COPY src/bridge/ ./src/bridge/
+COPY scripts/run_platform_bridge.py scripts/generate_curve_keys.py scripts/inject_test_signal.py ./scripts/
+COPY pyproject.toml .
+
+# Workers keep their SQLite state (idempotence, dead man's switch, drawdown) in /data: mount a volume there.
+# Same non-root user pattern as the engine's Dockerfile (chmod o+x /root: the user must traverse /root to reach .local).
+RUN groupadd --system nothierly \
+    && useradd --system --gid nothierly --home-dir /app --no-create-home --shell /usr/sbin/nologin nothierly \
+    && mkdir /data \
+    && chown -R nothierly:nothierly /app /data /root/.local \
+    && chmod o+x /root
+USER nothierly
+VOLUME ["/data"]
+
+# Default: the bridge in --dry-run (logs signals, publishes nothing). Real components are selected by compose.
+CMD ["python", "scripts/run_platform_bridge.py", "--dry-run"]

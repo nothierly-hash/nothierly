@@ -23,6 +23,14 @@ ZeroMQ : le gestionnaire ZAP est lié au contexte.
 compromis (les clés sont en mémoire sur chaque machine), et n'apporte pas de secret persistant « avant » : la
 rotation des clés se fait en les régénérant et en redéployant.
 
+**Interrupteur ``NOTHIERLY_ZMQ_ENCRYPTION``** (préfixe ``NOTHIERLY_`` et non ``ZMQ_`` : ce dernier est celui de ``core.config.ZmqSettings``) :
+
+- absent ou ``auto`` : CURVE si les clés sont dans l'environnement, sinon rien (comportement historique) ;
+- ``true`` : CURVE **obligatoire**, des clés manquantes sont une erreur de démarrage (à mettre en conteneur : pas de
+  démarrage en clair par oubli d'un fichier ``.env``) ;
+- ``false`` : les clés éventuelles sont ignorées, canal en clair (tests locaux). Ne contourne pas ``transport_refusal`` :
+  un endpoint non local reste refusé sans ``--allow-plaintext-remote``.
+
 Ce module n'importe que la stdlib, ``zmq`` et ne dépend ni de ``core`` ni de ``src``.
 """
 
@@ -46,12 +54,30 @@ ENV_CLIENT_KEYS: Final[str] = "NOTHIERLY_CURVE_CLIENT_KEYS"
 ENV_SERVER_PUBLIC: Final[str] = "NOTHIERLY_CURVE_SERVER_PUBLIC"
 ENV_CLIENT_PUBLIC: Final[str] = "NOTHIERLY_CURVE_CLIENT_PUBLIC"
 ENV_CLIENT_SECRET: Final[str] = "NOTHIERLY_CURVE_CLIENT_SECRET"
+ENV_ENCRYPTION: Final[str] = "NOTHIERLY_ZMQ_ENCRYPTION"
 
 _LOCAL_PREFIXES: Final[tuple[str, ...]] = ("tcp://127.0.0.1:", "tcp://localhost:", "tcp://[::1]:", "inproc://", "ipc://")
 
 
 class CurveConfigError(ValueError):
     """Configuration CURVE absente, partielle ou incohérente : erreur de déploiement, volontairement bruyante."""
+
+
+_TRUE: Final[frozenset[str]] = frozenset({"true", "1", "yes", "on", "required"})
+_FALSE: Final[frozenset[str]] = frozenset({"false", "0", "no", "off"})
+
+
+def encryption_mode(environ: Mapping[str, str] | None = None) -> bool | None:
+    """``True`` : CURVE obligatoire ; ``False`` : désactivé ; ``None`` : selon la présence des clés (``auto``)."""
+    env = os.environ if environ is None else environ
+    raw = env.get(ENV_ENCRYPTION, "").strip().lower()
+    if raw in ("", "auto"):
+        return None
+    if raw in _TRUE:
+        return True
+    if raw in _FALSE:
+        return False
+    raise CurveConfigError(f"{ENV_ENCRYPTION} doit valoir true, false ou auto (reçu : {raw!r}).")
 
 
 def _check_key(name: str, value: str) -> str:
@@ -99,10 +125,15 @@ class CurveServerConfig:
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> CurveServerConfig | None:
-        """``None`` si aucune variable n'est définie (pas de CURVE) ; erreur si la configuration est partielle."""
+        """``None`` si aucune variable n'est définie (pas de CURVE) ou si ``NOTHIERLY_ZMQ_ENCRYPTION=false`` ; erreur si partielle."""
         env = os.environ if environ is None else environ
+        mode = encryption_mode(env)
+        if mode is False:
+            return None
         secret, clients = env.get(ENV_SERVER_SECRET), env.get(ENV_CLIENT_KEYS)
         if not secret and not clients:
+            if mode:
+                raise CurveConfigError(f"{ENV_ENCRYPTION}=true mais {ENV_SERVER_SECRET} et {ENV_CLIENT_KEYS} ne sont pas définis.")
             return None
         if not secret or not clients:
             raise CurveConfigError(f"Configuration CURVE serveur partielle : {ENV_SERVER_SECRET} et {ENV_CLIENT_KEYS} vont ensemble.")
@@ -125,11 +156,16 @@ class CurveClientConfig:
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> CurveClientConfig | None:
-        """``None`` si aucune variable n'est définie (pas de CURVE) ; erreur si la configuration est partielle."""
+        """``None`` si aucune variable n'est définie (pas de CURVE) ou si ``NOTHIERLY_ZMQ_ENCRYPTION=false`` ; erreur si partielle."""
         env = os.environ if environ is None else environ
+        mode = encryption_mode(env)
+        if mode is False:
+            return None
         names = (ENV_SERVER_PUBLIC, ENV_CLIENT_PUBLIC, ENV_CLIENT_SECRET)
         values = [env.get(n) for n in names]
         if not any(values):
+            if mode:
+                raise CurveConfigError(f"{ENV_ENCRYPTION}=true mais {', '.join(names)} ne sont pas définis.")
             return None
         if not all(values):
             raise CurveConfigError(f"Configuration CURVE client partielle : {', '.join(names)} vont ensemble.")

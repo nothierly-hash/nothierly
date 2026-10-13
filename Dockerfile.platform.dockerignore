@@ -1,0 +1,16 @@
+# Allow-list: BuildKit reads <Dockerfile>.dockerignore in preference to .dockerignore. Nothing enters the build
+# context unless it is named here (research/ alone is ~1 GB; .env and secrets/ must never be baked into an image).
+*
+!requirements-platform.txt
+!pyproject.toml
+!contracts
+!workers
+!core
+!src/__init__.py
+!src/bridge
+!scripts/run_platform_bridge.py
+!scripts/generate_curve_keys.py
+!scripts/inject_test_signal.py
+**/__pycache__
+**/*.pyc
+**/*.sqlite3

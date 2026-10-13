@@ -1,0 +1,125 @@
+# Platform chain overlay: bridge + execution workers, on top of the engine stack.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.platform.yml up -d --build \
+#       nothierly-platform-bridge nothierly-worker-bybit nothierly-worker-hyperliquid
+#
+# It is an overlay, not a standalone stack, on purpose: the engine (nothierly-agents) writes its state to the
+# `redis-broker` defined in docker-compose.yml, and the bridge must read THAT Redis. A second Redis here would be empty.
+# The services below join the base file's default network and reach `redis-broker` by name.
+#
+# Prerequisites (nothing here creates them):
+#   1. CURVE keys:   python scripts/generate_curve_keys.py --clients hyperliquid bybit --out-dir secrets/curve
+#                    (secrets/ is git-ignored; the script never prints a secret and never overwrites).
+#   2. A platform env file (copy platform.env.example to platform.env): NOTHIERLY_ZMQ_SECRET (>= 32 bytes) and the
+#      exchange credentials. REDIS_PASSWORD and CLIENT_ID come from the same environment as the base file.
+#
+# Nothing here goes live: every worker starts in dry-run on the exchange's testnet. Going live is a reviewed edit of the
+# worker's `command` (add `--live`; mainnet also needs `--network mainnet --i-understand-real-funds`), not an environment
+# variable, so that a typo in an .env file can never send a real order.
+#
+# NOT run: Docker is not installed on the machine this file was written on. It parses as YAML and its service
+# references were checked against the base file by a script, which is not the same as `docker compose config`.
+
+x-platform-logging: &platform-logging
+  driver: "json-file"
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+# Hardening shared by every service here. read_only works because the only writable paths are /data (a volume) and /tmp.
+x-platform-hardening: &platform-hardening
+  restart: unless-stopped
+  logging: *platform-logging
+  read_only: true
+  tmpfs:
+    - /tmp
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+
+x-platform-build: &platform-build
+  context: .
+  dockerfile: Dockerfile.platform
+
+services:
+  nothierly-platform-bridge:
+    <<: *platform-hardening
+    build: *platform-build
+    image: nothierly-platform:local
+    container_name: nothierly-${CLIENT_ID:?Set CLIENT_ID}-platform-bridge
+    # The bridge is the CURVE server: it binds, workers connect. No `ports:` -- reachable only from the compose network.
+    # Workers on OTHER hosts would need a published port and, above all, the CURVE keys (never plaintext).
+    command: ["python", "scripts/run_platform_bridge.py", "--endpoint", "tcp://0.0.0.0:25570", "--venue", "ALL"]
+    # The bridge reads the global kill switch, whose signature is checked with the engine's vault key: core.config
+    # validates the engine's whole configuration, so it needs the engine's env file too. This puts the engine's secrets
+    # (broker credentials included) in this container. Open item: decouple the kill-switch check from the full AppSettings.
+    env_file:
+      - ${CLIENT_ENV_FILE:-.env}
+      - platform.env
+      - secrets/curve/curve_server.env
+    environment:
+      REDIS_HOST: redis-broker
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD}
+      NOTHIERLY_ZMQ_ENCRYPTION: "true"   # CURVE mandatory: missing keys are a startup error, not a plaintext fallback
+    expose:
+      - "25570"
+    depends_on:
+      redis-broker:
+        condition: service_healthy
+
+  nothierly-worker-hyperliquid:
+    <<: *platform-hardening
+    build: *platform-build
+    image: nothierly-platform:local
+    container_name: nothierly-${CLIENT_ID:?Set CLIENT_ID}-worker-hyperliquid
+    # Dry-run on testnet. See the header for how to go live.
+    command:
+      - python
+      - -m
+      - workers.hyperliquid.worker
+      - --address
+      - tcp://nothierly-platform-bridge:25570
+      - --network
+      - testnet
+      - --db
+      - /data/hyperliquid.sqlite3
+    env_file:
+      - platform.env
+      - secrets/curve/curve_hyperliquid.env
+    environment:
+      NOTHIERLY_ZMQ_ENCRYPTION: "true"
+    volumes:
+      - platform_hyperliquid_data:/data
+    depends_on:
+      - nothierly-platform-bridge
+
+  nothierly-worker-bybit:
+    <<: *platform-hardening
+    build: *platform-build
+    image: nothierly-platform:local
+    container_name: nothierly-${CLIENT_ID:?Set CLIENT_ID}-worker-bybit
+    command:
+      - python
+      - -m
+      - workers.bybit.worker
+      - --address
+      - tcp://nothierly-platform-bridge:25570
+      - --network
+      - testnet
+      - --db
+      - /data/bybit.sqlite3
+    env_file:
+      - platform.env
+      - secrets/curve/curve_bybit.env
+    environment:
+      NOTHIERLY_ZMQ_ENCRYPTION: "true"
+    volumes:
+      - platform_bybit_data:/data
+    depends_on:
+      - nothierly-platform-bridge
+
+volumes:
+  platform_hyperliquid_data:
+  platform_bybit_data:
