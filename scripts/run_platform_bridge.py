@@ -58,6 +58,7 @@ async def _amain(args: argparse.Namespace) -> int:
         instruments=tuple(args.instruments),
         venue=TargetVenue(args.venue),
         max_position_pct=Decimal(str(args.max_position_pct)),
+        size_bucket_pct=Decimal(str(args.size_bucket_pct)) if args.size_bucket_pct > 0 else None,
         refresh_s=args.refresh_s,
         engine_grace_s=args.engine_grace_s,
         poll_s=args.poll_s,
@@ -80,6 +81,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--venue", choices=_CRYPTO_VENUES, default="ALL", help="ALL = toutes les plateformes crypto")
     parser.add_argument("--instruments", nargs="+", default=["BTC/USDT", "ETH/USDT"])
     parser.add_argument("--max-position-pct", type=float, default=20.0)
+    parser.add_argument("--size-bucket-pct", type=float, default=2.5, help="pas de quantification de la taille publiée (masque la conviction du moteur) ; 0 = taille exacte")
     parser.add_argument("--poll-s", type=float, default=2.0)
     parser.add_argument("--refresh-s", type=float, default=10.0)
     parser.add_argument("--engine-grace-s", type=float, default=30.0)

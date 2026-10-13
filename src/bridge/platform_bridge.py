@@ -13,6 +13,9 @@ pas les opinions brutes : il lit l'**état arbitré** que l'``ExecutionAgent`` p
 **Traduction.** Position ``LONG``/``SHORT`` -> direction ; absence de position -> ``FLAT``. Taille :
 ``|unités| x prix / equity du moteur`` en %, donc le dimensionnement du moteur (risque, Kelly, plafonds) est
 réutilisé tel quel ; plafonné par ``max_position_pct`` ; les workers l'appliquent ensuite à LEUR equity.
+La taille publiée est **quantifiée** (``size_bucket_pct``, 2,5 % par défaut, ``quantize_size``) : la taille exacte du
+moteur dépend de sa conviction (multiplicateur de confiance x0,7 à x1,5) et révélerait ce que ``confidence_score``
+interdit de transmettre. La grille réduit la résolution, elle ne la supprime pas : un saut de palier reste un indice.
 Le ``confidence_score`` n'est pas transmis : il est interdit pour toute plateforme crypto (le flux d'ordres y est
 visible, la magnitude de la conviction fuiterait l'alpha). Voir ``contracts.platform_signal``.
 
@@ -44,7 +47,7 @@ import logging
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Final, Protocol
 
 from contracts.platform_signal import AssetClass, OrderType, PlatformSignal, SignalDirection, TargetVenue
@@ -92,6 +95,7 @@ class BridgeConfig:
     venue: TargetVenue = TargetVenue.ALL  # ALL = toutes les plateformes crypto
     max_position_pct: Decimal = Decimal("20")
     change_threshold_pct: Decimal = Decimal("0.25")  # variation de cible qui déclenche une republication
+    size_bucket_pct: Decimal | None = Decimal("2.5")  # pas de quantification de la taille publiée ; None = taille exacte
     refresh_s: float = 10.0  # republication périodique : les workers se recalent, un worker tardif rattrape
     engine_grace_s: float = 30.0
     ttl_ms: int = 10_000
@@ -111,8 +115,34 @@ def to_internal_symbol(instrument: str, overrides: Mapping[str, str] | None = No
     return f"CRYPTO_{base}_USD"
 
 
-def desired_target(position: EnginePosition | None, equity: Decimal | None, cfg: BridgeConfig) -> tuple[SignalDirection, Decimal] | None:
-    """``(direction, % d'equity)`` visé pour un instrument, ou ``None`` si la taille est indéterminable."""
+def quantize_size(raw_pct: Decimal, bucket: Decimal, cap: Decimal, previous: Decimal | None = None) -> Decimal:
+    """Ramène une taille exacte (% d'equity) sur une grille de pas ``bucket``.
+
+    Le dimensionnement du moteur (risque fixe x multiplicateur de confiance, ``size_multiplier_from_confidence``)
+    fait varier la taille avec la conviction : publiée telle quelle sur une plateforme publique, elle la révèle. La
+    grille en réduit la résolution ; elle ne l'efface pas (un saut de palier reste un indice).
+
+    - arrondi au palier le plus proche, moitié vers le haut (``ROUND_HALF_UP`` sur des ``Decimal``, pas l'arrondi
+      du banquier de ``round()``) ;
+    - jamais moins d'un palier : une position ouverte ne devient pas un signal ``0``, que le contrat refuse pour
+      ``LONG``/``SHORT``. Conséquence assumée : une position plus petite qu'un demi-palier est publiée à un palier ;
+    - plafonné à ``cap`` (le plafond prime sur la grille s'il n'en est pas un multiple) ;
+    - hystérésis : si ``previous`` (palier déjà publié) est à moins de 0,75 palier de la taille exacte, on le garde.
+      Une taille qui oscille autour d'une frontière de palier ne fait donc pas basculer le signal à chaque cycle.
+    """
+    if previous is not None and abs(raw_pct - previous) < bucket * Decimal("0.75"):
+        return previous
+    steps = (raw_pct / bucket).to_integral_value(rounding=ROUND_HALF_UP)
+    return min(max(steps, Decimal(1)) * bucket, cap)
+
+
+def desired_target(
+    position: EnginePosition | None, equity: Decimal | None, cfg: BridgeConfig, previous: Decimal | None = None,
+) -> tuple[SignalDirection, Decimal] | None:
+    """``(direction, % d'equity)`` visé pour un instrument, ou ``None`` si la taille est indéterminable.
+
+    ``previous`` : taille déjà publiée dans le même sens, pour l'hystérésis de la quantification.
+    """
     if position is None:
         return SignalDirection.FLAT, Decimal(0)
     if equity is None or equity <= 0:
@@ -121,6 +151,8 @@ def desired_target(position: EnginePosition | None, equity: Decimal | None, cfg:
     if pct < _MIN_PCT:
         return SignalDirection.FLAT, Decimal(0)  # trop petit pour être un signal LONG/SHORT valide
     direction = SignalDirection.LONG if position.status == "LONG" else SignalDirection.SHORT
+    if cfg.size_bucket_pct is not None:
+        return direction, quantize_size(pct, cfg.size_bucket_pct, cfg.max_position_pct, previous).quantize(Decimal("0.01"))
     return direction, pct.quantize(Decimal("0.01"))
 
 
@@ -211,7 +243,10 @@ class PlatformBridge:
                 direction, pct, reason = SignalDirection.FLAT, Decimal(0), flatten_reason
             else:
                 assert view is not None
-                target = desired_target(by_instrument.get(instrument), view.equity, self._cfg)
+                position = by_instrument.get(instrument)
+                last = self._last.get(instrument)
+                same_side = last is not None and position is not None and last.direction.value == position.status
+                target = desired_target(position, view.equity, self._cfg, last.pct if same_side and last is not None else None)
                 if target is None:
                     if instrument not in self._warned:
                         self._warned.add(instrument)

@@ -25,6 +25,7 @@ from src.bridge.platform_bridge import (
     PlatformBridge,
     RedisEngineReader,
     desired_target,
+    quantize_size,
     to_internal_symbol,
 )
 
@@ -73,6 +74,7 @@ class Clock:
 
 def _bridge(view: EngineView | None = None, **cfg: Any) -> tuple[PlatformBridge, FakeReader, FakeSink, Clock]:
     reader, sink, clock = FakeReader(view), FakeSink(), Clock()
+    cfg.setdefault("size_bucket_pct", None)  # tailles exactes, sauf dans les tests de quantification
     return PlatformBridge(reader, sink, BridgeConfig(**cfg), clock=clock), reader, sink, clock
 
 
@@ -90,7 +92,7 @@ def test_symbol_translation() -> None:
 
 
 def test_target_exposure_is_the_engines_own_sizing_as_a_percentage_of_its_equity() -> None:
-    cfg = BridgeConfig()
+    cfg = BridgeConfig(size_bucket_pct=None)
     assert desired_target(_pos(units="0.01"), D(10000), cfg) == (SignalDirection.LONG, D("5.00"))  # 500 / 10 000
     assert desired_target(_pos(status="SHORT", units="0.01"), D(10000), cfg) == (SignalDirection.SHORT, D("5.00"))
     assert desired_target(_pos(units="0.1"), D(10000), cfg) == (SignalDirection.LONG, D("20.00"))  # 50 % plafonné à 20 %
@@ -98,10 +100,65 @@ def test_target_exposure_is_the_engines_own_sizing_as_a_percentage_of_its_equity
 
 
 def test_a_dust_position_becomes_flat_and_an_unknown_equity_is_never_guessed() -> None:
-    cfg = BridgeConfig()
+    cfg = BridgeConfig(size_bucket_pct=None)
     assert desired_target(_pos(units="0.000001"), D(10000), cfg) == (SignalDirection.FLAT, D(0))
     assert desired_target(_pos(), None, cfg) is None and desired_target(_pos(), D(0), cfg) is None
     assert desired_target(None, None, cfg) == (SignalDirection.FLAT, D(0))  # pas de position : flat n'a pas besoin d'equity
+
+
+# --- Quantification de la taille --------------------------------------------------------------
+
+
+def test_quantize_rounds_half_up_to_the_nearest_bucket_with_decimals() -> None:
+    q = lambda raw: quantize_size(D(raw), D("2.5"), D("20"))  # noqa: E731
+    assert q("5.00") == D("5.0") and q("6.24") == D("5.0") and q("6.25") == D("7.5")  # 2,5 x 2,5 = 6,25 : moitié vers le HAUT
+    assert q("3.75") == D("5.0") and q("3.74") == D("2.5")  # 6,25 / 2,5 = 2,5 : round() du banquier donnerait 2 -> 5,0 ; ici 3 -> 7,5
+    assert q("18.80") == D("20.0") and q("19.9") == D("20.0")
+
+
+def test_quantize_never_returns_zero_and_never_exceeds_the_cap() -> None:
+    assert quantize_size(D("0.01"), D("2.5"), D("20")) == D("2.5")  # une position ouverte n'est jamais un signal de taille 0
+    assert quantize_size(D("1.24"), D("2.5"), D("20")) == D("2.5")
+    assert quantize_size(D("20"), D("2.5"), D("19")) == D("19")  # le plafond prime sur la grille
+    assert quantize_size(D("100"), D("2.5"), D("20")) == D("20")
+
+
+def test_quantize_hysteresis_keeps_the_published_bucket_near_a_boundary() -> None:
+    # frontière entre 5,0 et 7,5 = 6,25 ; sans hystérésis 6,24 -> 5,0 et 6,26 -> 7,5 : le signal basculerait à chaque cycle
+    assert quantize_size(D("6.26"), D("2.5"), D("20"), previous=D("5.0")) == D("5.0")
+    assert quantize_size(D("6.87"), D("2.5"), D("20"), previous=D("5.0")) == D("5.0")  # |écart| 1,87 < 0,75 x 2,5
+    assert quantize_size(D("6.88"), D("2.5"), D("20"), previous=D("5.0")) == D("7.5")  # 1,88 >= 1,875 : on bascule
+    assert quantize_size(D("3.13"), D("2.5"), D("20"), previous=D("5.0")) == D("5.0")  # 1,87 < 1,875 : on garde
+    assert quantize_size(D("3.12"), D("2.5"), D("20"), previous=D("5.0")) == D("2.5")  # 1,88 vers le bas : bascule
+
+
+def test_the_bridge_publishes_buckets_not_the_engines_exact_size() -> None:
+    bridge, reader, sink, clock = _bridge(_view(_pos(units="0.0113")), instruments=("BTC/USDT",), size_bucket_pct=D("2.5"))
+    assert _step(bridge) == ["BTC/USDT:LONG:5.00:engine_state"]  # 5,65 % exact -> 5,0
+    reader.view = _view(_pos(units="0.0125"))  # 6,25 % : à la frontière, mais à 1,25 < 1,875 du palier publié : hystérésis
+    clock.now += 1
+    assert _step(bridge) == []
+    reader.view = _view(_pos(units="0.0140"))  # 7,00 % : écart 2,0 >= 1,875 -> 7,5
+    assert _step(bridge) == ["BTC/USDT:LONG:7.50:engine_state"]
+    assert [s.position_size_pct for s in sink.signals] == [5.0, 7.5]
+
+
+def test_a_tiny_position_is_published_at_one_bucket_and_flat_and_direction_changes_reset_the_grid() -> None:
+    bridge, reader, sink, clock = _bridge(_view(_pos(units="0.0004")), instruments=("BTC/USDT",), size_bucket_pct=D("2.5"))
+    assert _step(bridge) == ["BTC/USDT:LONG:2.50:engine_state"]  # 0,2 % exact : un palier, pas 0
+    reader.view = _view(_pos(status="SHORT", units="0.0004"))
+    assert _step(bridge) == ["BTC/USDT:SHORT:2.50:engine_state"]
+    reader.view = _view()
+    assert _step(bridge) == ["BTC/USDT:FLAT:0:engine_state"] and sink.signals[-1].position_size_pct == 0.0
+
+
+def test_quantized_signals_are_always_valid_contract_signals() -> None:
+    bridge, reader, sink, _ = _bridge(instruments=("BTC/USDT",), size_bucket_pct=D("2.5"))
+    for units in ("0.0001", "0.0099", "0.0151", "0.05", "0.5"):
+        reader.view = _view(_pos(units=units))
+        bridge._last.clear()
+        _step(bridge)
+    assert all(0 < s.position_size_pct <= 20 and (D(str(s.position_size_pct)) % D("2.5")) == 0 for s in sink.signals)
 
 
 # --- Publication -----------------------------------------------------------------------------
