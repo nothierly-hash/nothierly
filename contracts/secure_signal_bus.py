@@ -43,6 +43,13 @@ from typing import Any, Final
 import zmq
 from pydantic import ValidationError
 
+from contracts.curve_transport import (
+    ClientAuthenticator,
+    CurveClientConfig,
+    CurveServerConfig,
+    apply_client,
+    apply_server,
+)
 from contracts.platform_signal import PlatformSignal, TargetVenue
 
 _log = logging.getLogger(__name__)
@@ -226,27 +233,55 @@ class SecureSignalPublisher:
         bind: bool = True,
         high_water_mark: int = 1000,
         context: zmq.Context[Any] | None = None,
+        curve: CurveServerConfig | CurveClientConfig | None = None,
     ) -> None:
         """Crée le socket PUB. ``bind=True`` : écoute sur ``address`` (``tcp://127.0.0.1:*`` accepté) ;
         ``bind=False`` : se connecte à ``address`` (frontend d'un broker XSUB).
 
+        ``curve`` chiffre et authentifie le canal (voir ``contracts.curve_transport``) : un ``CurveServerConfig`` quand
+        le publisher écoute (il n'accepte alors que les clients de la liste blanche), un ``CurveClientConfig`` quand il
+        se connecte à un broker.
+
         Raises:
             WeakSecretError: clé absente ou trop courte.
-            ValueError: topic vide.
+            ValueError: topic vide, ou ``curve`` incohérent avec ``bind`` / ``context``.
         """
         if not topic:
             raise ValueError("topic ne doit pas être vide.")
+        if isinstance(curve, CurveServerConfig):
+            if not bind:
+                raise ValueError("Un publisher qui se connecte est un client CURVE : fournir un CurveClientConfig.")
+            if context is not None:
+                raise ValueError("Un serveur CURVE exige son propre contexte ZeroMQ (le gestionnaire ZAP y est lié).")
+        elif isinstance(curve, CurveClientConfig) and bind:
+            raise ValueError("Un publisher qui écoute est un serveur CURVE : fournir un CurveServerConfig.")
         self._key = _secret_bytes(secret_key)
         self._topic = topic
         self._owns_context = context is None
         self._context = zmq.Context() if context is None else context
+        self._auth: ClientAuthenticator | None = None
+        self._encrypted = curve is not None
         self._socket = self._context.socket(zmq.PUB)
-        self._socket.setsockopt(zmq.SNDHWM, high_water_mark)
-        self._socket.setsockopt(zmq.LINGER, 0)
-        if bind:
-            self._socket.bind(address)
-        else:
-            self._socket.connect(address)
+        try:
+            self._socket.setsockopt(zmq.SNDHWM, high_water_mark)
+            self._socket.setsockopt(zmq.LINGER, 0)
+            if isinstance(curve, CurveServerConfig):
+                self._auth = ClientAuthenticator(self._context, curve)
+                self._auth.start()  # avant le bind : aucune connexion ne peut passer sans vérification
+                apply_server(self._socket, curve)
+            elif isinstance(curve, CurveClientConfig):
+                apply_client(self._socket, curve)
+            if bind:
+                self._socket.bind(address)
+            else:
+                self._socket.connect(address)
+        except Exception:
+            self._socket.close(linger=0)
+            if self._auth is not None:
+                self._auth.stop()
+            if self._owns_context:
+                self._context.term()
+            raise
         self._endpoint = self._socket.getsockopt_string(zmq.LAST_ENDPOINT)
         self._closed = False
 
@@ -259,6 +294,11 @@ class SecureSignalPublisher:
     def endpoint(self) -> str:
         """Adresse réelle du socket (utile avec ``tcp://127.0.0.1:*``)."""
         return self._endpoint
+
+    @property
+    def encrypted(self) -> bool:
+        """``True`` si le canal est chiffré et authentifié par CURVE."""
+        return self._encrypted
 
     def publish(self, signal: PlatformSignal) -> bool:
         """Revalide, signe et publie. ``True`` si le message est en file d'envoi, ``False`` si la file est pleine.
@@ -295,6 +335,8 @@ class SecureSignalPublisher:
         if self._closed:
             return
         self._socket.close(linger=0)
+        if self._auth is not None:
+            self._auth.stop()
         if self._owns_context:
             self._context.term()
         self._closed = True

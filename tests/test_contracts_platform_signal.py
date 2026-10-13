@@ -418,3 +418,12 @@ def test_stop_loss_is_required_for_darwinex_zero_including_through_all() -> None
         _darwinex(target_venue=TargetVenue.DARWINEX_ZERO, metadata={})
     with pytest.raises(ValidationError, match="stop_loss_price"):  # ALL couvre aussi Darwinex Zero
         _darwinex(target_venue=TargetVenue.ALL, metadata={})
+
+
+def test_a_darwinex_flat_needs_no_stop_loss_but_any_opening_signal_still_does() -> None:
+    flat = _darwinex(direction=SignalDirection.FLAT, position_size_pct=0.0, metadata={})
+    assert flat.direction is SignalDirection.FLAT
+    assert _darwinex(target_venue=TargetVenue.ALL, direction=SignalDirection.FLAT, position_size_pct=0.0, metadata={}).direction is SignalDirection.FLAT
+    for direction in (SignalDirection.LONG, SignalDirection.SHORT):
+        with pytest.raises(ValidationError, match="stop_loss_price"):
+            _darwinex(direction=direction, metadata={})

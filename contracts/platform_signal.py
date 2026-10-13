@@ -126,7 +126,7 @@ class PlatformSignal(BaseModel):
             un ordre ``LONG``/``SHORT`` exécutable.
         order_type: ``MARKET``, ``LIMIT`` ou ``PREDICTION_ONLY`` (aucun ordre : score seul).
         metadata: Dictionnaire libre. Clés exigées selon le cas : ``limit_price`` (``LIMIT``),
-            ``stop_loss_price`` (``DARWINEX_ZERO``, ordre exécutable).
+            ``stop_loss_price`` (``DARWINEX_ZERO``, ordre pouvant ouvrir une exposition : pas pour un ``FLAT``).
         ttl_ms: Durée de validité optionnelle. ``None`` = pas d'expiration (cas Numerai, qui
             n'est pas temps réel). Un worker temps réel rejette un signal expiré (``is_expired``).
     """
@@ -154,7 +154,8 @@ class PlatformSignal(BaseModel):
         self._check_limit_price()
         if TargetVenue.NUMERAI_SIGNALS in venues and self.order_type is not OrderType.PREDICTION_ONLY:
             raise ValueError("Numerai n'accepte que des signaux de type PREDICTION_ONLY.")
-        if TargetVenue.DARWINEX_ZERO in venues and self.order_type is not OrderType.PREDICTION_ONLY:
+        opens_exposure = self.order_type is not OrderType.PREDICTION_ONLY and self.direction is not SignalDirection.FLAT
+        if TargetVenue.DARWINEX_ZERO in venues and opens_exposure:  # une clôture (FLAT) n'a pas de stop-loss à poser
             if "stop_loss_price" not in self.metadata:
                 raise ValueError("Les workers Darwinex exigent 'stop_loss_price' dans metadata (gestion VaR).")
         self._check_stop_loss_side()

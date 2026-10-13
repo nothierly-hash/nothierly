@@ -94,3 +94,21 @@ def test_script_refuses_remote_endpoints_and_weak_or_missing_keys(monkeypatch: p
     assert module.main(["--endpoint", f"tcp://127.0.0.1:{_free_port()}", "--settle", "0"]) == 2
     monkeypatch.delenv(SECRET_ENV_VAR)
     assert module.main(["--endpoint", f"tcp://127.0.0.1:{_free_port()}", "--settle", "0"]) == 2
+
+
+def test_a_forex_signal_for_darwinex_needs_a_stop_loss_and_carries_it(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.setenv(SECRET_ENV_VAR, SECRET)
+    module = _load()
+    base = ["--symbol", "FOREX_EUR_USD", "--venue", "DARWINEX_ZERO", "--settle", "0.1", "--repeat", "1"]
+    assert module.main(["--endpoint", f"tcp://127.0.0.1:{_free_port()}", *base]) == 2  # le contrat refuse une ouverture sans stop
+    assert "stop_loss_price" in capsys.readouterr().err
+    endpoint = f"tcp://127.0.0.1:{_free_port()}"
+    ctx, sub = _subscriber(endpoint)
+    try:
+        assert module.main(["--endpoint", endpoint, *base, "--settle", "1.0", "--repeat", "3", "--stop-loss", "1.095"]) == 0
+        assert sub.poll(3000)
+        frames = sub.recv_multipart()
+    finally:
+        ctx.destroy(linger=0)
+    signal = open_envelope(frames[1], SECRET, venue=TargetVenue.DARWINEX_ZERO).signal
+    assert signal is not None and signal.metadata == {"stop_loss_price": 1.095}

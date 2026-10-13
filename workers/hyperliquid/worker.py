@@ -24,6 +24,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import ClassVar
 
+from contracts.curve_transport import CurveClientConfig, CurveConfigError, transport_refusal
 from contracts.platform_signal import PlatformSignal, TargetVenue
 from contracts.secure_signal_bus import load_secret_from_env
 from workers.common.base import (
@@ -180,6 +181,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--live", action="store_true", help="envoie réellement les ordres ; sinon dry-run (lecture seule)")
     parser.add_argument("--i-understand-real-funds", action="store_true", help="requis pour --live sur mainnet")
     parser.add_argument("--clear-halt", action="store_true", help="lève les verrous (drawdown et homme mort) puis quitte")
+    parser.add_argument("--allow-plaintext-remote", action="store_true", help="autorise un endpoint non local SANS chiffrement CURVE")
     parser.add_argument("--dead-man-timeout", type=float, default=300.0, metavar="SECONDES",
                         help="ferme toutes les positions puis se verrouille après ce délai sans signal valide (0 = désactivé)")
     args = parser.parse_args(argv)
@@ -192,6 +194,13 @@ def main(argv: Sequence[str] | None = None) -> None:
         parser.error("--dead-man-timeout doit être >= 0")
     if not args.address:
         parser.error("--address ou NOTHIERLY_ZMQ_ADDRESS requis")
+    try:
+        curve = CurveClientConfig.from_env()
+    except CurveConfigError as exc:
+        parser.error(str(exc))
+    refusal = transport_refusal(args.address, curve_enabled=curve is not None, allow_plaintext_remote=args.allow_plaintext_remote)
+    if refusal:
+        parser.error(refusal)
     network = Network(args.network)
     if args.live and network is Network.MAINNET and not args.i_understand_real_funds:
         parser.error("--live sur mainnet exige --i-understand-real-funds")
@@ -209,7 +218,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     config = HyperliquidWorkerConfig(
         address=args.address, secret_key=load_secret_from_env(), db_path=args.db, dry_run=not args.live,
-        dead_man_timeout_s=args.dead_man_timeout or None,
+        dead_man_timeout_s=args.dead_man_timeout or None, curve=curve,
     )
     worker = HyperliquidWorker(config, client)
     _log.info("hl_worker_start network=%s mode=%s", network.value, "LIVE" if args.live else "DRY-RUN")

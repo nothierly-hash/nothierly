@@ -46,6 +46,7 @@ from typing import Final
 import zmq
 import zmq.asyncio
 
+from contracts.curve_transport import CurveClientConfig, CurveConfigError, apply_client, is_local_endpoint, transport_refusal
 from contracts.platform_signal import SignalDirection, TargetVenue
 from contracts.secure_signal_bus import DEFAULT_TOPIC, ReplayGuard, load_secret_from_env, open_envelope, verify_signature
 from workers.numerai.client import DryRunClient, NumeraiClient, NumerapiClient
@@ -139,6 +140,7 @@ class NumeraiWorkerConfig:
     max_attempts_per_day: int = 5
     poll_ms: int = 500
     schedule_check_interval_s: float = 15.0
+    curve: CurveClientConfig | None = None  # chiffrement et authentification du canal ; ``None`` = en clair
 
 
 class NumeraiWorker:
@@ -270,6 +272,10 @@ class NumeraiWorker:
         socket = context.socket(zmq.SUB)
         socket.setsockopt(zmq.LINGER, 0)
         socket.setsockopt(zmq.SUBSCRIBE, self._cfg.topic)
+        if self._cfg.curve is not None:
+            apply_client(socket, self._cfg.curve)
+        elif not is_local_endpoint(self._cfg.address):
+            _log.warning("numerai_plaintext_remote address=%s : canal NON chiffré", self._cfg.address)
         socket.connect(self._cfg.address)
         next_check = 0.0
         try:
@@ -298,13 +304,21 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--db", default="numerai_worker.sqlite3")
     parser.add_argument("--out", default="numerai_submissions")
     parser.add_argument("--live", action="store_true", help="soumet réellement (NUMERAI_* requis) ; sinon dry-run")
+    parser.add_argument("--allow-plaintext-remote", action="store_true", help="autorise un endpoint non local SANS chiffrement CURVE")
     args = parser.parse_args(argv)
     if not args.address:
         parser.error("--address ou NOTHIERLY_ZMQ_ADDRESS requis")
+    try:
+        curve = CurveClientConfig.from_env()
+    except CurveConfigError as exc:
+        parser.error(str(exc))
+    refusal = transport_refusal(args.address, curve_enabled=curve is not None, allow_plaintext_remote=args.allow_plaintext_remote)
+    if refusal:
+        parser.error(refusal)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     client: NumeraiClient = NumerapiClient.from_env() if args.live else DryRunClient()
     config = NumeraiWorkerConfig(
-        address=args.address, secret_key=load_secret_from_env(), db_path=args.db, output_dir=Path(args.out)
+        address=args.address, secret_key=load_secret_from_env(), db_path=args.db, output_dir=Path(args.out), curve=curve
     )
     try:
         # Boucle Selector explicite : sous Windows, la boucle Proactor par défaut est incompatible avec zmq.asyncio.

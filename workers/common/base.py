@@ -61,6 +61,7 @@ from typing import ClassVar, Protocol
 import zmq
 import zmq.asyncio
 
+from contracts.curve_transport import CurveClientConfig, apply_client, is_local_endpoint
 from contracts.platform_signal import PlatformSignal, TargetVenue
 from contracts.secure_signal_bus import DEFAULT_TOPIC, ReplayGuard, open_envelope, verify_signature
 from workers.common.exposure import RiskLimits
@@ -114,6 +115,8 @@ class ExposureWorkerConfig:
     dead_man_check_interval_s: float = 5.0
     dead_man_startup_grace_s: float = 30.0
     emergency_slippage_bps: Decimal = Decimal("300")
+    # Chiffrement et authentification du canal (CURVE). ``None`` = en clair (acceptable seulement en local).
+    curve: CurveClientConfig | None = None
 
 
 class ExposureWorkerBase(ABC):
@@ -376,6 +379,10 @@ class ExposureWorkerBase(ABC):
         socket = context.socket(zmq.SUB)
         socket.setsockopt(zmq.LINGER, 0)
         socket.setsockopt(zmq.SUBSCRIBE, self._cfg.topic)
+        if self._cfg.curve is not None:
+            apply_client(socket, self._cfg.curve)
+        elif not is_local_endpoint(self._cfg.address):
+            _log.warning("%s_plaintext_remote address=%s : canal NON chiffré, un observateur lit les signaux", self._tag, self._cfg.address)
         socket.connect(self._cfg.address)
         tasks = [asyncio.create_task(self._executor(stop, wake))]
         if self._cfg.dead_man_timeout_s is not None:

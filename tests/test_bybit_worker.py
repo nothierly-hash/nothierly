@@ -570,10 +570,10 @@ def test_cli_refuses_mainnet_live_without_the_acknowledgement_and_missing_keys(m
 
     monkeypatch.setattr(worker_module, "BybitRestClient", forbidden)
     with pytest.raises(SystemExit):
-        worker_module.main(["--address", "tcp://x:1", "--live", "--network", "mainnet"])
+        worker_module.main(["--address", "tcp://127.0.0.1:1", "--live", "--network", "mainnet"])
     _env(monkeypatch)
     with pytest.raises(SystemExit):
-        worker_module.main(["--address", "tcp://x:1"])  # clés absentes
+        worker_module.main(["--address", "tcp://127.0.0.1:1"])  # clés absentes
 
 
 def test_cli_refuses_a_key_that_can_withdraw_and_never_starts_the_worker(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -585,8 +585,8 @@ def test_cli_refuses_a_key_that_can_withdraw_and_never_starts_the_worker(monkeyp
         raise AssertionError("le worker ne doit pas démarrer")
 
     monkeypatch.setattr(worker_module, "BybitWorker", forbidden)
-    assert worker_module.main(["--address", "tcp://x:1"]) == 2
-    assert worker_module.main(["--address", "tcp://x:1", "--live"]) == 2
+    assert worker_module.main(["--address", "tcp://127.0.0.1:1"]) == 2
+    assert worker_module.main(["--address", "tcp://127.0.0.1:1", "--live"]) == 2
 
 
 def test_cli_defaults_to_dry_run_testnet_with_copy_trading_required(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -605,7 +605,7 @@ def test_cli_defaults_to_dry_run_testnet_with_copy_trading_required(monkeypatch:
     monkeypatch.setattr(worker_module, "BybitRestClient", client_factory)
     monkeypatch.setattr(worker_module, "BybitWorker", worker_factory)
     with pytest.raises(RuntimeError, match="stop"):
-        worker_module.main(["--address", "tcp://x:1"])
+        worker_module.main(["--address", "tcp://127.0.0.1:1"])
     assert seen["network"] is BybitNetwork.TESTNET
     assert seen["config"].dry_run is True and seen["config"].require_copy_trading is True and seen["config"].max_equity_usd is None
 
@@ -726,14 +726,14 @@ def test_cli_dead_man_timeout_defaults_to_300_and_zero_is_refused_on_mainnet_liv
 
     monkeypatch.setattr(worker_module, "BybitRestClient", lambda **_: _KeyOnly(ok))
     monkeypatch.setattr(worker_module, "BybitWorker", worker_factory)
-    for args, expected in ((["--address", "tcp://x:1"], 300.0), (["--address", "tcp://x:1", "--dead-man-timeout", "45"], 45.0),
-                           (["--address", "tcp://x:1", "--dead-man-timeout", "0"], None)):
+    for args, expected in ((["--address", "tcp://127.0.0.1:1"], 300.0), (["--address", "tcp://127.0.0.1:1", "--dead-man-timeout", "45"], 45.0),
+                           (["--address", "tcp://127.0.0.1:1", "--dead-man-timeout", "0"], None)):
         _env(monkeypatch, BYBIT_API_KEY="k", BYBIT_API_SECRET="s", NOTHIERLY_ZMQ_SECRET=SECRET)
         with pytest.raises(_Stop):
             worker_module.main(args)
         assert seen[-1] == expected
     _env(monkeypatch, BYBIT_API_KEY="k", BYBIT_API_SECRET="s", NOTHIERLY_ZMQ_SECRET=SECRET)
     with pytest.raises(SystemExit):
-        worker_module.main(["--address", "tcp://x:1", "--live", "--network", "mainnet", "--i-understand-real-funds", "--dead-man-timeout", "0"])
+        worker_module.main(["--address", "tcp://127.0.0.1:1", "--live", "--network", "mainnet", "--i-understand-real-funds", "--dead-man-timeout", "0"])
     with pytest.raises(SystemExit):
-        worker_module.main(["--address", "tcp://x:1", "--dead-man-timeout", "-5"])
+        worker_module.main(["--address", "tcp://127.0.0.1:1", "--dead-man-timeout", "-5"])

@@ -561,7 +561,7 @@ def test_mainnet_live_requires_the_explicit_acknowledgement(monkeypatch: pytest.
 
     monkeypatch.setattr(worker_module, "SdkHyperliquidClient", forbidden)
     with pytest.raises(SystemExit):
-        worker_module.main(["--address", "tcp://x:1", "--live", "--network", "mainnet"])
+        worker_module.main(["--address", "tcp://127.0.0.1:1", "--live", "--network", "mainnet"])
 
 
 def test_live_requires_an_agent_key_and_dry_run_never_receives_one(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -574,10 +574,10 @@ def test_live_requires_an_agent_key_and_dry_run_never_receives_one(monkeypatch: 
     monkeypatch.setattr(worker_module, "SdkHyperliquidClient", recorder)
     _cli_env(monkeypatch, HL_ACCOUNT_ADDRESS=ACCOUNT)
     with pytest.raises(SystemExit):
-        worker_module.main(["--address", "tcp://x:1", "--live"])  # pas de HL_AGENT_SECRET
+        worker_module.main(["--address", "tcp://127.0.0.1:1", "--live"])  # pas de HL_AGENT_SECRET
     _cli_env(monkeypatch, HL_ACCOUNT_ADDRESS=ACCOUNT, HL_AGENT_SECRET=FAKE_KEY)
     with pytest.raises(RuntimeError, match="stop"):
-        worker_module.main(["--address", "tcp://x:1"])  # dry-run : la clé présente dans l'environnement est ignorée
+        worker_module.main(["--address", "tcp://127.0.0.1:1"])  # dry-run : la clé présente dans l'environnement est ignorée
     assert seen["agent_secret"] is None and seen["network"] is Network.TESTNET
 
 
@@ -692,14 +692,14 @@ def test_cli_dead_man_timeout_defaults_to_300_and_zero_is_refused_on_mainnet_liv
 
     monkeypatch.setattr(worker_module, "SdkHyperliquidClient", lambda **_: object())
     monkeypatch.setattr(worker_module, "HyperliquidWorker", worker_factory)
-    for args, expected in ((["--address", "tcp://x:1"], 300.0), (["--address", "tcp://x:1", "--dead-man-timeout", "45"], 45.0),
-                           (["--address", "tcp://x:1", "--dead-man-timeout", "0"], None)):
+    for args, expected in ((["--address", "tcp://127.0.0.1:1"], 300.0), (["--address", "tcp://127.0.0.1:1", "--dead-man-timeout", "45"], 45.0),
+                           (["--address", "tcp://127.0.0.1:1", "--dead-man-timeout", "0"], None)):
         _cli_env(monkeypatch, HL_ACCOUNT_ADDRESS=ACCOUNT, NOTHIERLY_ZMQ_SECRET=SECRET)
         with pytest.raises(_Stop):
             worker_module.main(args)
         assert seen[-1] == expected
     _cli_env(monkeypatch, HL_ACCOUNT_ADDRESS=ACCOUNT, HL_AGENT_SECRET=FAKE_KEY, NOTHIERLY_ZMQ_SECRET=SECRET)
     with pytest.raises(SystemExit):  # mainnet live sans homme mort : refusé
-        worker_module.main(["--address", "tcp://x:1", "--live", "--network", "mainnet", "--i-understand-real-funds", "--dead-man-timeout", "0"])
+        worker_module.main(["--address", "tcp://127.0.0.1:1", "--live", "--network", "mainnet", "--i-understand-real-funds", "--dead-man-timeout", "0"])
     with pytest.raises(SystemExit):
-        worker_module.main(["--address", "tcp://x:1", "--dead-man-timeout", "-5"])
+        worker_module.main(["--address", "tcp://127.0.0.1:1", "--dead-man-timeout", "-5"])

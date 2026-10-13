@@ -1,14 +1,14 @@
 # Architecture Hub-and-Spoke : Cerveau Alpha vers 6 plateformes de capital externe, en 3 pôles
 
-Statut : le **contrat** (`contracts/platform_signal.py`), le **transport signé** (`contracts/secure_signal_bus.py`) et trois workers (`workers/numerai`, `workers/hyperliquid`, `workers/bybit`, qui partagent le socle `workers/common`) sont implémentés et testés, mais **jamais exécutés contre les vraies plateformes**. Les 3 autres plateformes ont leur nom réservé dans le contrat et **aucun worker**. Les faits sur les plateformes viennent de recherches web et sont marqués **[à vérifier]** quand les sources divergent ou manquent. Les éléments du repo cités existent réellement (chemins indiqués).
+Statut : le **contrat** (`contracts/platform_signal.py`), le **transport signé** (`contracts/secure_signal_bus.py`) le **chiffrement du bus** (`contracts/curve_transport.py`, CURVE) et quatre workers (`workers/numerai`, `workers/hyperliquid`, `workers/bybit`, `workers/darwinex`, qui partagent le socle `workers/common`) sont implémentés et testés, mais **jamais exécutés contre les vraies plateformes**. Les 2 autres plateformes (Binance, Enzyme) ont leur nom réservé dans le contrat et **aucun worker**. Les faits sur les plateformes viennent de recherches web et sont marqués **[à vérifier]** quand les sources divergent ou manquent. Les éléments du repo cités existent réellement (chemins indiqués).
 
 Périmètre : exactement 6 plateformes, celles du tableau ci-dessous.
 
 | Pôle | Plateformes | Exécution | Worker |
 |---|---|---|---|
-| Crypto | `HYPERLIQUID`, `BINANCE`, `BYBIT`, `ENZYME` | temps réel | Hyperliquid et Bybit écrits (dry-run) ; les 2 autres non écrits |
+| Crypto | `HYPERLIQUID`, `BINANCE`, `BYBIT`, `ENZYME` | temps réel | Hyperliquid et Bybit écrits (dry-run) ; Binance et Enzyme non écrits |
 | Actions | `NUMERAI_SIGNALS` | batch quotidien | écrit (dry-run) |
-| Forex / CFD | `DARWINEX_ZERO` | pont MT5 | non écrit |
+| Forex / CFD | `DARWINEX_ZERO` | pont MT5 (Windows) | écrit (dry-run) |
 
 ---
 
@@ -83,7 +83,7 @@ Le Cerveau ne connaît aucune plateforme. Il publie une **intention** (jamais un
 1. **Cerveau sans egress.** Réseau Docker `internal: true`. Les données de marché arrivent par un conteneur `market-data` séparé qui, lui, a un egress.
 2. **Sens unique.** Brain → gateway par PUSH/PULL. Les acks vont à `ack-ledger`, pas au Cerveau. Une plateforme compromise ne peut ni interroger ni atteindre le Cerveau.
 3. **Jamais bloquant.** Envoi ZMQ avec `DONTWAIT` et HWM borné. Si le bus est saturé, les intentions sont **abandonnées** (le TTL les aurait périmées de toute façon), jamais mises en file illimitée. Le Cerveau n'attend aucune réponse.
-4. **Chiffrement + authentification du bus : ZMQ CURVE** (libzmq natif, supporté par pyzmq), une paire de clés par worker. Un worker ne peut s'abonner qu'à son propre topic (ACL au gateway). Un worker compromis ne voit que son flux.
+4. **Chiffrement + authentification du bus : ZMQ CURVE (implémenté, `contracts/curve_transport.py`).** Le pont est le serveur : clé secrète + liste blanche des clés publiques des workers (vérifiée par un gestionnaire ZAP). Chaque worker épingle la clé publique du serveur, donc un faux publisher ne peut pas se faire passer pour le vrai. Un client hors liste blanche, ou sans CURVE, ne reçoit rien : aucun repli en clair. Un serveur sans liste blanche est refusé (chiffré mais ouvert : la clé publique du serveur n'est pas secrète). Voir §1.5. *Les topics par plateforme, pour qu'un worker compromis ne voie que son flux, restent à faire (§5.2).*
 5. **Egress en liste blanche par worker** (règles de pare-feu par conteneur) : `w-hyper` uniquement vers les domaines Hyperliquid, `w-numerai` uniquement vers numer.ai, etc.
 6. **Worker Darwinex hors Docker Linux** : le package `MetaTrader5` est Windows-only et pilote un terminal MT5 en cours d'exécution. Il tourne en service Windows (ou VM Windows dédiée) et se connecte au bus en CURVE sur l'adresse du gateway.
 7. **Aucune bibliothèque partagée avec le Cerveau.** Les workers importent uniquement un paquet `contracts` minimal (schémas Pydantic), jamais `core.quant_math` ni rien d'autre. Le repo a déjà un dossier `contracts/` ; il devient la frontière d'IP.
@@ -92,7 +92,7 @@ Le Cerveau ne connaît aucune plateforme. Il publie une **intention** (jamais un
 
 | Besoin | Existant à réutiliser |
 |---|---|
-| Bus pub/sub | `core/zmq_bus.py`, `core/zmq_broker.py` (à renforcer avec CURVE) |
+| Bus pub/sub | `core/zmq_bus.py`, `core/zmq_broker.py` (le bus des workers, lui, est `contracts/secure_signal_bus.py` + `curve_transport.py`) |
 | Schémas stricts | `core/schemas.py` : `extra="forbid"`, `frozen=True` (même discipline pour les nouveaux) |
 | Kill switch global signé | `core/security.py` (HMAC + epoch anti-rejeu) |
 | Coupe-circuits | `core/circuit_breaker.py` |
@@ -134,6 +134,30 @@ Point de design important : le `TradingSignal` actuel (`-1/0/1` + `confidence`, 
 - **Décisions simulées.** En `MOCK_MODE`/`SHADOW`, les positions du moteur sont simulées. Un worker en mode live tradera de l'argent réel d'après elles : garder les workers en dry-run, testnet ou démo. Le pont l'affiche au démarrage.
 - **Comptes dédiés.** Un worker ramène le compte à la cible de chaque symbole suivi, y compris `FLAT` : une position ouverte à la main sur ce symbole serait fermée.
 - **Si le pont ou le moteur meurt**, ce sont les workers qui protègent : leur homme mort ferme toutes leurs positions après N secondes sans signal valide, puis les verrouille (voir §6.7).
+
+### 1.5 Chiffrement du bus (CURVE)
+
+*Implémenté et testé sur de vrais sockets TCP, y compris sous Windows. Jamais éprouvé sur un réseau réel entre deux machines.*
+
+**Ce que CURVE ajoute au HMAC.** Le HMAC prouve qu'un message vient du moteur ; il ne le cache pas. Sur internet ou entre VPS, un observateur lirait le payload, donc l'alpha. CURVE (Curve25519) chiffre et authentifie le canal lui-même. Le HMAC reste : il protège aussi contre un message rejoué ou fabriqué par un pair déjà autorisé.
+
+| Propriété | Preuve dans les tests |
+|---|---|
+| Opacité sur le fil | Un relais TCP enregistre tous les octets : sans CURVE (témoin) il lit la paire `CRYPTO_BTC_USD`, `position_size_pct`, la signature ; avec CURVE, aucun de ces fragments n'apparaît. |
+| Authentification des clients | Une clé publique hors liste blanche ne reçoit rien, et le refus est journalisé (préfixe de clé seulement). |
+| Pas de repli en clair | Un client sans CURVE ne peut pas lire un serveur CURVE ; un client CURVE ne se rabat pas sur un publisher en clair. |
+| Pas d'usurpation du publisher | Un faux publisher chiffré (autre clé serveur) n'est pas écouté par un worker qui épingle la vraie clé publique. |
+
+**Déploiement.** `python scripts/generate_curve_keys.py --clients hyperliquid bybit numerai darwinex --out-dir secrets/curve` écrit `curve_server.env` (clé secrète du serveur + clés publiques des workers) et un `curve_<worker>.env` par worker (sa paire + la clé publique du serveur). Chaque fichier va sur **sa** machine uniquement ; le script n'affiche jamais une clé secrète, refuse d'écraser un fichier (régénérer invalide les clés déployées) et signale un dossier non ignoré par git. Les variables : `NOTHIERLY_CURVE_SERVER_SECRET`, `NOTHIERLY_CURVE_CLIENT_KEYS` (serveur) ; `NOTHIERLY_CURVE_SERVER_PUBLIC`, `NOTHIERLY_CURVE_CLIENT_PUBLIC`, `NOTHIERLY_CURVE_CLIENT_SECRET` (worker).
+
+**Garde-fous de ligne de commande.** Un endpoint non local sans CURVE est **refusé** par le pont, l'injecteur et les quatre workers, sauf `--allow-plaintext-remote` (choix explicite, à vos risques). Une configuration CURVE partielle est une erreur, jamais un repli en clair.
+
+**Limites.**
+
+- CURVE ne cache pas la taille ni le rythme des messages, et ne protège pas contre un hôte compromis (les clés sont en mémoire sur chaque machine).
+- Les clés sont des chaînes Z85 sans somme de contrôle : seuls la longueur et l'alphabet se vérifient. Une faute de frappe dans la clé publique d'un serveur épinglé empêche simplement le canal de s'établir.
+- **Défaut trouvé en route** : le `ThreadAuthenticator` de pyzmq lance une boucle `asyncio` dans son thread ; sous Windows (boucle Proactor par défaut) ce thread meurt, plus aucun client n'est jamais autorisé et `stop()` bloque à jamais. Il est remplacé par un gestionnaire ZAP minimal, synchrone et sans asyncio (`ClientAuthenticator`).
+- Un serveur CURVE exige son propre contexte ZeroMQ (le gestionnaire ZAP y est lié).
 
 ---
 
@@ -307,15 +331,36 @@ Rust ou C++ n'apportent rien ici. La latence est dominée par l'API de la venue 
 
 ### 4.3 Worker Darwinex Zero
 
-*Non écrit.*
+*Implémenté : `workers/darwinex/` (dry-run par défaut). **Jamais exécuté contre un vrai terminal MetaTrader 5** : le paquet `MetaTrader5` n'est pas installé ici et aucun compte n'a été utilisé. Testé avec un faux module, dont les constantes sont des nombres arbitraires pour vérifier qu'elles sont utilisées par leur nom.*
 
-- **Pont** : package `MetaTrader5` (Windows uniquement, terminal MT5 requis et connecté). Alternative : EA MQL5 + liaison ZMQ (connecteur type "DWX ZeroMQ"), plus robuste si le package Python décroche, au prix d'un code MQL5 à maintenir.
-- **Fait à vérifier** : plateforme exacte du compte Darwinex Zero (MT4/MT5) et symboles disponibles **[à vérifier avant le dev]**. Les trades du compte alimentent l'indice DARWIN après un entraînement de 90 jours maximum, donc le worker ne doit jamais envoyer d'ordres de test.
-- **Auth** : identifiants du compte dans le coffre ; le terminal reste connecté sur l'hôte Windows. L'hôte n'expose aucun port entrant.
-- **Sécurité des positions** : chaque ordre porte un **SL serveur** (stop-loss côté courtier). Si le pont ou le worker meurt, la position n'est pas nue.
-- **Idempotence** : `magic` = identifiant de stratégie, `comment` = `cloid` tronqué. Avant tout retry après timeout, interroger positions et ordres par `comment` : un `order_send` sans réponse est **ambigu**, jamais rejouer à l'aveugle.
-- **Table de symboles** : `FX_EURUSD` → symbole broker (suffixes possibles), arrondis de lot, `trade_stops_level`, `trade_mode`.
-- **Calendrier** : le Forex est fermé le week-end, les indices ont leurs sessions. Une porte de calendrier évite des rejets "market closed" parfaitement prévisibles.
+**Fait pour Windows.** Le paquet `MetaTrader5` n'existe que sous Windows et pilote un terminal MT5 installé et lancé : le worker tourne sur l'hôte Windows, reçoit ses signaux du bus (chiffré en CURVE) et agit comme pont local.
+
+**Ce que dit la doc officielle (MQL5), appliqué dans le code.**
+
+- `order_send` : action `DEAL`, `type` BUY/SELL, `deviation` en points, `sl`, `magic`, `comment`, `type_filling`, `position` = ticket pour fermer. Codes de retour : 10009 fait, 10010 partiel, 10008 placé, 10012 délai et 10031 connexion (ambigus, jamais rejoués), 10018 marché fermé, 10019 pas assez de fonds, 10016 stops invalides, etc.
+- Remplissage : IOC/FOK toujours permis en exécution Instant/Request ; selon les drapeaux du symbole en exécution Market ; `RETURN` interdit en exécution Market. Si aucune politique ne convient, l'ordre est refusé (`no_valid_filling`).
+- En exécution Market le prix n'est pas utilisé : la déviation ne plafonne alors pas le glissement, l'ordre est un ordre au marché.
+- `initialize()` sans identifiants reprend « le dernier compte » du terminal.
+
+**Garde-fous de compte, parce que le terminal trade le compte sur lequel il est connecté, quel qu'il soit.** Le numéro de compte doit être exactement `--account-login` (obligatoire), vérifié à chaque lecture **et** juste avant chaque ordre : un compte ouvert à la main dans le même terminal n'est jamais piloté. Un compte de type réel est refusé sans `--allow-real-account`, et `--live` sur un compte réel exige l'homme mort.
+
+**Sizing.** Un lot Forex n'a pas la valeur « prix × quantité ». Le client mesure la valeur d'un lot en devise du compte avec `order_calc_profit` (gain d'un lot pour un petit mouvement de prix, ramené au prix) : cela gère les paires non cotées en USD et l'or. Les lots sont arrondis vers zéro au pas de volume ; un compte trop petit pour un lot minimal à ce pourcentage répond `below_min_volume` (et non un trompeur `on_target`).
+
+**Ordres.**
+
+- **Stop-loss serveur** sur toute ouverture (le `stop_loss_price` du signal, exigé par le contrat), refusé s'il est du mauvais côté ou plus près que `trade_stops_level`. Un stop n'est posé qu'à l'ouverture.
+- **Une inversion se fait en deux temps** : sur un compte hedging, un ordre opposé plus gros ouvre une position inverse sans fermer la première. Le worker ferme d'abord (avec le ticket), le signal suivant ouvre le reste.
+- Une seule position nette par symbole : plusieurs positions (hedging) arrêtent l'ordre (`hedge_positions_unsupported`).
+- Les modes `CLOSEONLY`, `LONGONLY`, `SHORTONLY`, `DISABLED` bloquent les ouvertures mais jamais une fermeture ; un spread trop large (`--max-spread-bps`) bloque une ouverture, jamais une fermeture.
+- Idempotence : `magic` (identifiant de stratégie) et commentaire déterministe par signal ; aucun nouvel essai après une réponse ambiguë, la position est relue au signal suivant.
+- Tous les appels MT5 passent par un verrou unique (l'API n'est pas documentée comme réentrante).
+
+**Limites à connaître.**
+
+- **Week-end** : marché fermé = ordre refusé (`MARKET_CLOSED`). L'homme mort réessaie à chaque intervalle, donc une position non fermable reste ouverte jusqu'à la réouverture : le risque de gap n'est pas couvert par ce worker, seul le stop serveur l'est.
+- **Plateforme exacte du compte Darwinex Zero** (MT4/MT5, type de compte, symboles et suffixes) : **[à vérifier avant tout usage]**. Les trades alimentent l'indice DARWIN après un entraînement de 90 jours maximum, donc le worker ne doit jamais envoyer d'ordre de test.
+- Les ordres `LIMIT` ne sont pas honorés comme tels en exécution Market.
+- `order_calc_profit` est pris comme renvoyant des unités de la devise du compte (c'est ce que montre l'exemple de la doc) : si une valeur est indéterminable, rien n'est ordonné (`no_valuation`).
 
 ### 4.4 Worker Numerai Signals
 
@@ -496,11 +541,11 @@ Le worker tombe seul, le Cerveau n'en sait rien.
 | Phase | Contenu | État / coût |
 |---|---|---|
 | 0 | Paper trading continu avec réarmement auto du kill switch, produire des fills mesurables et un track record interne | à faire, 0 |
-| 1 | Contrat `PlatformSignal` + transport signé | **fait** ; restent : `intent-gateway`, topics par plateforme, CURVE, ack-ledger |
+| 1 | Contrat `PlatformSignal` + transport signé + chiffrement CURVE | **fait** ; restent : `intent-gateway`, topics par plateforme, ack-ledger |
 | 2 | **Numerai Signals** : worker + validations (aucune exécution) | **fait** (dry-run) ; soumission réelle non testée ; 0 |
 | 3 | **Hyperliquid** : worker temps réel, clé agent sans retrait | **fait** (dry-run) ; testnet à faire ; ≈200 USDC + stake pour un vault |
 | 4 | **Bybit** : API V5, perp USDT, clé sans retrait | **fait** (dry-run) ; testnet à faire ; compte des fonds et mode de position à confirmer ; critères master à confirmer |
-| 5 | **Darwinex Zero** : pont MT5 Windows, SL serveur, calendrier, idempotence | à écrire ; abonnement |
+| 5 | **Darwinex Zero** : pont MT5 Windows, SL serveur, garde de compte, idempotence | **fait** (dry-run) ; test sur un vrai terminal à faire ; plateforme exacte du compte à vérifier ; abonnement |
 | 6 | **Enzyme** : vault EVM, relais anti-MEV | à écrire ; gas |
 | 7 | **Binance** : seulement après confirmation écrite des conditions et de l'API d'ordres | bloqué par des inconnues |
 

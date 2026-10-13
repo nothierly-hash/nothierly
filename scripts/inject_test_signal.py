@@ -15,7 +15,7 @@ Choix qui évitent les faux négatifs et les accidents :
   ``--repeat`` fois ; le worker le dédoublonne par ``signal_id`` (les rejeux suivants apparaissent comme
   ``replay`` dans ses logs, c'est attendu).
 - Le signal expire après ``--ttl-ms`` (10 s par défaut) : un message de test oublié ne sera pas exécuté plus tard.
-- Endpoint non local refusé sans ``--allow-remote`` : on ne pousse pas un signal de test vers un bus réel par mégarde.
+- Endpoint non local refusé sans chiffrement CURVE (ou ``--allow-plaintext-remote``) : on ne pousse pas un signal de test vers un bus réel par mégarde.
 - Aucun ordre n'est envoyé par ce script : il publie un signal. Ce que le worker en fait dépend de son mode
   (dry-run par défaut ; ``--live`` envoie de vrais ordres).
 """
@@ -33,10 +33,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from pydantic import ValidationError  # noqa: E402
 
+from contracts.curve_transport import CurveClientConfig, CurveConfigError, CurveServerConfig, transport_refusal  # noqa: E402
 from contracts.platform_signal import AssetClass, OrderType, PlatformSignal, SignalDirection, TargetVenue  # noqa: E402
 from contracts.secure_signal_bus import DEFAULT_TOPIC, SecureSignalPublisher, WeakSecretError, load_secret_from_env  # noqa: E402
 
-_LOCAL_PREFIXES = ("tcp://127.0.0.1:", "tcp://localhost:", "tcp://[::1]:", "inproc://", "ipc://")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -47,19 +47,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--symbol", default="CRYPTO_BTC_USD")
     parser.add_argument("--direction", choices=[d.value for d in SignalDirection], default=SignalDirection.LONG.value)
     parser.add_argument("--pct", type=float, default=None, help="exposition cible en %% (défaut : 5, ou 0 pour FLAT)")
+    parser.add_argument("--stop-loss", type=float, default=None, help="stop_loss_price (exigé par le contrat pour ouvrir chez DARWINEX_ZERO)")
     parser.add_argument("--ttl-ms", type=int, default=10_000)
     parser.add_argument("--settle", type=float, default=2.0, help="secondes d'attente de la connexion de l'abonné")
     parser.add_argument("--repeat", type=int, default=3, help="nombre de publications du même signal")
-    parser.add_argument("--allow-remote", action="store_true", help="autorise un endpoint non local")
+    parser.add_argument("--allow-plaintext-remote", action="store_true", help="autorise un endpoint non local SANS chiffrement CURVE")
     args = parser.parse_args(argv)
 
-    if not args.allow_remote and not args.endpoint.startswith(_LOCAL_PREFIXES):
-        print(f"Refusé : {args.endpoint!r} n'est pas un endpoint local (utiliser --allow-remote si c'est voulu).", file=sys.stderr)
-        return 2
     try:
         secret = load_secret_from_env()
-    except WeakSecretError as exc:
+        curve = CurveClientConfig.from_env() if args.connect else CurveServerConfig.from_env()
+    except (WeakSecretError, CurveConfigError) as exc:
         print(f"Erreur : {exc}", file=sys.stderr)
+        return 2
+    refusal = transport_refusal(args.endpoint, curve_enabled=curve is not None, allow_plaintext_remote=args.allow_plaintext_remote)
+    if refusal:
+        print(refusal, file=sys.stderr)
         return 2
 
     direction = SignalDirection(args.direction)
@@ -71,7 +74,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"Erreur : le préfixe {prefix!r} de {args.symbol!r} n'est pas une classe d'actif.", file=sys.stderr)
         return 2
 
-    with SecureSignalPublisher(args.endpoint, secret, topic=DEFAULT_TOPIC, bind=not args.connect) as publisher:
+    with SecureSignalPublisher(args.endpoint, secret, topic=DEFAULT_TOPIC, bind=not args.connect, curve=curve) as publisher:
         print(f"{'Connexion à' if args.connect else 'Écoute sur'} {publisher.endpoint} ; attente de l'abonné ({args.settle}s)...")
         time.sleep(args.settle)
         try:  # créé après l'attente : le signal part « frais » (le worker rejette un signal trop vieux)
@@ -82,6 +85,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 direction=direction,
                 position_size_pct=pct,
                 order_type=OrderType.MARKET,
+                metadata={} if args.stop_loss is None else {"stop_loss_price": args.stop_loss},
                 ttl_ms=args.ttl_ms,
             )
         except ValidationError as exc:
