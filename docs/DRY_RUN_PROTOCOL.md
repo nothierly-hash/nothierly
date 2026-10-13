@@ -36,6 +36,7 @@ Options utiles (les valeurs ci-dessous sont les valeurs par défaut) :
 |---|---|---|
 | `--instruments` | `BTC/USDT ETH/USDT` | paires suivies (seules les paires crypto `BASE/USDT` sont traduites) |
 | `--max-position-pct` | `20` | plafond de la taille publiée, en % de l'equity du moteur |
+| `--min-hold-s` | `60` | durée minimale avant de publier la fermeture/inversion d'une position publiée ; `0` = aucune |
 | `--size-bucket-pct` | `2.5` | pas de quantification de la taille ; `0` publie la taille exacte (pour comparer) |
 | `--poll-s` / `--refresh-s` | `2` / `10` | lecture du moteur / republication périodique |
 | `--engine-grace-s` | `30` | délai avant de publier `FLAT` si le moteur se tait |
@@ -56,7 +57,7 @@ Points à contrôler, dans l'ordre :
 2. **`confidence_score` toujours `null`** : le contrat l'interdit pour toute plateforme crypto.
 3. **Quand le moteur ouvre une position** : `LONG`/`SHORT` avec une taille qui est un multiple de `--size-bucket-pct`
    (ou `--max-position-pct` si la taille exacte le dépasse), jamais `0` pour une position ouverte.
-4. **Quand il la ferme** : `FLAT` tout de suite.
+4. **Quand il la ferme** : `FLAT` dès que la position publiée a `--min-hold-s` (60 s par défaut) ; avant, une ligne `bridge_hold` indique que la fermeture est retenue. Un kill switch, lui, publie `FLAT` sans attendre.
 5. **Pas de republication inutile** : un état stable ne reparaît qu'au rythme de `--refresh-s`.
 6. **Repli** : arrêter le moteur (ou laisser expirer son heartbeat) doit produire `FLAT` avec `reason=engine_down` après
    `--engine-grace-s` ; un kill switch actif produit `FLAT` avec `reason=kill_switch` immédiatement. Ces deux cas sont couverts par les
@@ -76,7 +77,7 @@ Points à contrôler, dans l'ordre :
 Observations du premier run contre le vrai moteur (2026-10-13, une minute) : les positions du moteur dépassaient le
 plafond de 20 % (BTC à ~67 % de l'equity), donc la taille publiée vaut le plafond et la quantification n'a rien à
 masquer ; et les positions ne durent que quelques secondes à une minute, ce qui ferait des allers-retours coûteux chez un
-worker connecté. Un délai minimal de maintien dans le pont reste à décider avant tout passage en réel.
+worker connecté. C'est ce que couvre `--min-hold-s` (60 s par défaut) : une position fermée par le moteur après 6 s reste publiée 60 s. Pour comparer, relancer avec `--min-hold-s 0`.
 
 ## 5. Docker, ensuite
 

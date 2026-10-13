@@ -75,6 +75,7 @@ class Clock:
 def _bridge(view: EngineView | None = None, **cfg: Any) -> tuple[PlatformBridge, FakeReader, FakeSink, Clock]:
     reader, sink, clock = FakeReader(view), FakeSink(), Clock()
     cfg.setdefault("size_bucket_pct", None)  # tailles exactes, sauf dans les tests de quantification
+    cfg.setdefault("min_hold_s", 0.0)  # pas de délai de maintien, sauf dans ses propres tests
     return PlatformBridge(reader, sink, BridgeConfig(**cfg), clock=clock), reader, sink, clock
 
 
@@ -110,9 +111,12 @@ def test_a_dust_position_becomes_flat_and_an_unknown_equity_is_never_guessed() -
 
 
 def test_quantize_rounds_half_up_to_the_nearest_bucket_with_decimals() -> None:
-    q = lambda raw: quantize_size(D(raw), D("2.5"), D("20"))  # noqa: E731
-    assert q("5.00") == D("5.0") and q("6.24") == D("5.0") and q("6.25") == D("7.5")  # 2,5 x 2,5 = 6,25 : moitié vers le HAUT
-    assert q("3.75") == D("5.0") and q("3.74") == D("2.5")  # 6,25 / 2,5 = 2,5 : round() du banquier donnerait 2 -> 5,0 ; ici 3 -> 7,5
+    def q(raw: str) -> Decimal:
+        return quantize_size(D(raw), D("2.5"), D("20"))
+
+    # 6,25 / 2,5 = 2,5 : moitié vers le HAUT -> 3 paliers = 7,5 ; le round() du banquier donnerait 2 -> 5,0
+    assert q("5.00") == D("5.0") and q("6.24") == D("5.0") and q("6.25") == D("7.5")
+    assert q("3.75") == D("5.0") and q("3.74") == D("2.5")  # 3,75 / 2,5 = 1,5 -> 2 paliers = 5,0 ; 3,74 -> 1 palier
     assert q("18.80") == D("20.0") and q("19.9") == D("20.0")
 
 
@@ -159,6 +163,86 @@ def test_quantized_signals_are_always_valid_contract_signals() -> None:
         bridge._last.clear()
         _step(bridge)
     assert all(0 < s.position_size_pct <= 20 and (D(str(s.position_size_pct)) % D("2.5")) == 0 for s in sink.signals)
+
+
+# --- Durée minimale de maintien ----------------------------------------------------------------
+
+
+def test_a_close_requested_before_the_minimum_hold_is_deferred_then_published() -> None:
+    bridge, reader, sink, clock = _bridge(_view(_pos()), instruments=("BTC/USDT",), min_hold_s=60.0, refresh_s=1000.0)
+    assert _step(bridge) == ["BTC/USDT:LONG:5.00:engine_state"]  # t = 1000 : ouverture publiée tout de suite
+    reader.view = _view()  # le moteur ferme 6 s plus tard
+    clock.now += 6
+    assert _step(bridge) == []  # tenue : 6 s < 60 s ; la cible publiée reste LONG
+    clock.now += 53  # 59 s depuis l'ouverture : encore sous le délai
+    assert _step(bridge) == [] and [s.direction for s in sink.signals] == [SignalDirection.LONG]
+    clock.now += 1  # 60 s pile : le délai est atteint
+    assert _step(bridge) == ["BTC/USDT:FLAT:0:engine_state"]
+
+
+def test_a_position_the_engine_reopened_during_the_hold_cancels_the_deferred_close() -> None:
+    """Fermeture puis réouverture dans le même sens avant la fin du délai : le worker ne voit jamais de FLAT."""
+    bridge, reader, sink, clock = _bridge(_view(_pos()), instruments=("BTC/USDT",), min_hold_s=60.0, refresh_s=1000.0)
+    _step(bridge)
+    reader.view = _view()
+    clock.now += 5
+    assert _step(bridge) == []
+    reader.view = _view(_pos())
+    clock.now += 5
+    assert _step(bridge) == [] and [s.direction for s in sink.signals] == [SignalDirection.LONG]
+
+
+def test_a_reversal_is_held_like_a_close_and_the_held_signal_is_still_refreshed() -> None:
+    bridge, reader, sink, clock = _bridge(_view(_pos()), instruments=("BTC/USDT",), min_hold_s=60.0, refresh_s=10.0)
+    _step(bridge)
+    reader.view = _view(_pos(status="SHORT"))
+    clock.now += 10  # 10 s : le moteur est SHORT, le pont tient LONG et republie LONG (rattrapage périodique)
+    assert _step(bridge) == ["BTC/USDT:LONG:5.00:engine_state"]
+    clock.now += 50  # 60 s depuis l'ouverture : l'inversion passe
+    assert _step(bridge) == ["BTC/USDT:SHORT:5.00:engine_state"]
+    assert [s.direction for s in sink.signals] == [SignalDirection.LONG, SignalDirection.LONG, SignalDirection.SHORT]
+
+
+def test_entries_and_same_side_size_changes_are_never_delayed() -> None:
+    bridge, reader, _, clock = _bridge(_view(), instruments=("BTC/USDT",), min_hold_s=60.0)
+    _step(bridge)  # FLAT publié
+    reader.view = _view(_pos(units="0.01"))
+    clock.now += 1
+    assert _step(bridge) == ["BTC/USDT:LONG:5.00:engine_state"]  # ouverture 1 s après un FLAT : immédiate
+    reader.view = _view(_pos(units="0.02"))
+    clock.now += 1
+    assert _step(bridge) == ["BTC/USDT:LONG:10.00:engine_state"]  # changement de taille : immédiat
+
+
+def test_the_kill_switch_and_a_silent_engine_ignore_the_minimum_hold() -> None:
+    bridge, reader, _, clock = _bridge(_view(_pos(), _pos("ETH/USDT", units="0.2", price="2500")), min_hold_s=600.0)
+    _step(bridge)
+    reader.view = _view(_pos(), _pos("ETH/USDT", units="0.2", price="2500"), safe=False)
+    clock.now += 1
+    assert sorted(_step(bridge)) == ["BTC/USDT:FLAT:0:kill_switch", "ETH/USDT:FLAT:0:kill_switch"]
+    bridge, reader, _, clock = _bridge(_view(_pos()), instruments=("BTC/USDT",), min_hold_s=600.0, engine_grace_s=30.0)
+    _step(bridge)
+    reader.view = _view(_pos(), alive=False)
+    clock.now += 31
+    _step(bridge)  # démarre le délai de grâce
+    clock.now += 31
+    assert _step(bridge) == ["BTC/USDT:FLAT:0:engine_down"]
+
+
+def test_the_hold_is_counted_per_instrument_and_zero_disables_it() -> None:
+    bridge, reader, _, clock = _bridge(_view(_pos()), instruments=("BTC/USDT", "ETH/USDT"), min_hold_s=60.0, refresh_s=1000.0)
+    _step(bridge)
+    clock.now += 40
+    reader.view = _view(_pos(), _pos("ETH/USDT", units="0.2", price="2500"))  # ETH s'ouvre à 40 s
+    assert _step(bridge) == ["ETH/USDT:LONG:5.00:engine_state"]
+    clock.now += 25  # BTC a 65 s, ETH 25 s
+    reader.view = _view()
+    assert _step(bridge) == ["BTC/USDT:FLAT:0:engine_state"]  # BTC sort ; ETH reste tenu
+    off, off_reader, _, off_clock = _bridge(_view(_pos()), instruments=("BTC/USDT",), min_hold_s=0.0)
+    _step(off)
+    off_reader.view = _view()
+    off_clock.now += 1
+    assert _step(off) == ["BTC/USDT:FLAT:0:engine_state"]
 
 
 # --- Publication -----------------------------------------------------------------------------

@@ -59,6 +59,7 @@ async def _amain(args: argparse.Namespace) -> int:
         venue=TargetVenue(args.venue),
         max_position_pct=Decimal(str(args.max_position_pct)),
         size_bucket_pct=Decimal(str(args.size_bucket_pct)) if args.size_bucket_pct > 0 else None,
+        min_hold_s=args.min_hold_s,
         refresh_s=args.refresh_s,
         engine_grace_s=args.engine_grace_s,
         poll_s=args.poll_s,
@@ -82,12 +83,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--instruments", nargs="+", default=["BTC/USDT", "ETH/USDT"])
     parser.add_argument("--max-position-pct", type=float, default=20.0)
     parser.add_argument("--size-bucket-pct", type=float, default=2.5, help="pas de quantification de la taille publiée (masque la conviction du moteur) ; 0 = taille exacte")
+    parser.add_argument("--min-hold-s", type=float, default=60.0, help="durée minimale de maintien d'une position publiée avant sa fermeture/inversion ; 0 = aucune")
     parser.add_argument("--poll-s", type=float, default=2.0)
     parser.add_argument("--refresh-s", type=float, default=10.0)
     parser.add_argument("--engine-grace-s", type=float, default=30.0)
     parser.add_argument("--dry-run", action="store_true", help="journalise les signaux sans les publier")
     parser.add_argument("--allow-plaintext-remote", action="store_true", help="autorise un endpoint non local SANS chiffrement CURVE")
     args = parser.parse_args(argv)
+    if args.min_hold_s < 0:
+        parser.error("--min-hold-s doit être >= 0")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     if not args.dry_run:
         try:

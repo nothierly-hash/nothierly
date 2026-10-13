@@ -16,6 +16,15 @@ réutilisé tel quel ; plafonné par ``max_position_pct`` ; les workers l'appliq
 La taille publiée est **quantifiée** (``size_bucket_pct``, 2,5 % par défaut, ``quantize_size``) : la taille exacte du
 moteur dépend de sa conviction (multiplicateur de confiance x0,7 à x1,5) et révélerait ce que ``confidence_score``
 interdit de transmettre. La grille réduit la résolution, elle ne la supprime pas : un saut de palier reste un indice.
+
+**Durée minimale de maintien** (``min_hold_s``, 60 s par défaut, 0 = aucune). Le moteur ouvre et ferme parfois en quelques
+secondes ; chaque aller-retour coûterait deux fois frais et glissement à un worker connecté. Le pont ne publie donc la
+fermeture ou l'inversion d'une position qu'une fois la position publiée vieille de ``min_hold_s`` ; en attendant, il
+republie la cible qu'il tient. Ouvertures et changements de taille dans le même sens ne sont jamais retardés. Le kill
+switch et le moteur silencieux passent outre : ils réduisent l'exposition immédiatement. Pendant le délai l'exposition
+externe peut dépasser celle du moteur (elle reste ouverte alors que le moteur est sorti) : c'est le prix assumé.
+Le délai se compte depuis la première publication de la position par CE processus : au redémarrage, une position déjà
+ouverte est tenue ``min_hold_s`` de plus.
 Le ``confidence_score`` n'est pas transmis : il est interdit pour toute plateforme crypto (le flux d'ordres y est
 visible, la magnitude de la conviction fuiterait l'alpha). Voir ``contracts.platform_signal``.
 
@@ -96,6 +105,7 @@ class BridgeConfig:
     max_position_pct: Decimal = Decimal("20")
     change_threshold_pct: Decimal = Decimal("0.25")  # variation de cible qui déclenche une republication
     size_bucket_pct: Decimal | None = Decimal("2.5")  # pas de quantification de la taille publiée ; None = taille exacte
+    min_hold_s: float = 60.0  # durée minimale entre l'ouverture publiée d'une position et sa fermeture/inversion ; 0 = aucune
     refresh_s: float = 10.0  # republication périodique : les workers se recalent, un worker tardif rattrape
     engine_grace_s: float = 30.0
     ttl_ms: int = 10_000
@@ -161,6 +171,7 @@ class _Published:
     direction: SignalDirection
     pct: Decimal
     at: float
+    opened_at: float  # instant où CETTE direction (non FLAT) a été publiée pour la première fois ; conservé tant qu'elle dure
 
 
 class PlatformBridge:
@@ -175,6 +186,7 @@ class PlatformBridge:
         self._last: dict[str, _Published] = {}
         self._unhealthy_since: float | None = None
         self._warned: set[str] = set()
+        self._held: set[str] = set()  # instruments dont une fermeture/inversion est en attente du délai minimal
         self._symbols = {i: to_internal_symbol(i, self._cfg.symbol_overrides) for i in self._cfg.instruments}
         for instrument, symbol in self._symbols.items():
             if symbol is None:
@@ -197,6 +209,31 @@ class PlatformBridge:
             return True
         return abs(pct - last.pct) >= self._cfg.change_threshold_pct or now - last.at >= self._cfg.refresh_s
 
+    def _apply_min_hold(self, instrument: str, direction: SignalDirection, pct: Decimal, now: float) -> tuple[SignalDirection, Decimal]:
+        """Retient la cible déjà publiée tant que la position publiée n'a pas vécu ``min_hold_s``.
+
+        Ne retient que ce qui défait une position publiée : la fermeture (``FLAT``) et l'inversion. Une ouverture, un
+        changement de taille dans le même sens et la republication périodique ne sont jamais retardés. Le moteur peut
+        ouvrir puis fermer en quelques secondes ; sans ce délai, un worker connecté paierait deux fois les frais et le
+        glissement pour chaque aller-retour. Contrepartie assumée : pendant le délai, l'exposition externe peut différer de
+        celle du moteur (elle reste ouverte alors que le moteur est déjà sorti). Le kill switch et le moteur silencieux
+        ne passent jamais par ici : ils réduisent l'exposition tout de suite.
+        """
+        last = self._last.get(instrument)
+        if (
+            self._cfg.min_hold_s <= 0 or last is None or last.direction is SignalDirection.FLAT
+            or direction is last.direction or now - last.opened_at >= self._cfg.min_hold_s
+        ):
+            self._held.discard(instrument)
+            return direction, pct
+        if instrument not in self._held:
+            self._held.add(instrument)
+            _log.info(
+                "bridge_hold instrument=%s : le moteur demande %s mais %s est publié depuis %.0fs (< %.0fs), cible conservée",
+                instrument, direction.value, last.direction.value, now - last.opened_at, self._cfg.min_hold_s,
+            )
+        return last.direction, last.pct
+
     def _publish(self, instrument: str, direction: SignalDirection, pct: Decimal, reason: str, now: float) -> str | None:
         symbol = self._symbols[instrument]
         if symbol is None:
@@ -205,7 +242,9 @@ class PlatformBridge:
         if not self._sink.publish(signal):
             _log.warning("bridge_signal_dropped instrument=%s", instrument)
             return None
-        self._last[instrument] = _Published(direction, pct, now)
+        previous = self._last.get(instrument)
+        opened_at = previous.opened_at if previous is not None and previous.direction is direction and direction is not SignalDirection.FLAT else now
+        self._last[instrument] = _Published(direction, pct, now, opened_at)
         _log.info("bridge_signal instrument=%s %s %s%% venue=%s reason=%s", instrument, direction.value, pct, self._cfg.venue.value, reason)
         return f"{instrument}:{direction.value}:{pct}:{reason}"
 
@@ -253,7 +292,7 @@ class PlatformBridge:
                         _log.warning("bridge_no_equity instrument=%s : position ouverte mais equity inconnue, rien n'est publié", instrument)
                     continue
                 self._warned.discard(instrument)
-                (direction, pct), reason = target, "engine_state"
+                (direction, pct), reason = self._apply_min_hold(instrument, *target, now), "engine_state"
             if self._should_publish(instrument, direction, pct, now):
                 entry = self._publish(instrument, direction, pct, reason, now)
                 if entry is not None:
