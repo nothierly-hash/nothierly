@@ -1,8 +1,8 @@
-"""Tests du contrat ``contracts.trading_signal.TradingSignal`` (moteur -> workers multi-plateformes).
+"""Tests du contrat ``contracts.platform_signal.PlatformSignal`` (moteur -> workers multi-plateformes).
 
 Chaque règle de validation a son test, y compris les deux cas donnés dans la spécification
 d'origine (``LIMIT`` sans ``limit_price`` ; Darwinex sans ``stop_loss_price``). Le fichier
-``trading_signal.schema.json`` est comparé au modèle pour détecter une dérive.
+``platform_signal.schema.json`` est comparé au modèle pour détecter une dérive.
 """
 
 from __future__ import annotations
@@ -16,47 +16,45 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from contracts.trading_signal import (
+from contracts.platform_signal import (
     SCHEMA_PATH,
     AssetClass,
     OrderType,
     SignalDirection,
     TargetVenue,
-    TradingSignal,
+    PlatformSignal,
     json_schema,
 )
 
 
-def _hyperliquid(**overrides: Any) -> TradingSignal:
+def _hyperliquid(**overrides: Any) -> PlatformSignal:
     base: dict[str, Any] = dict(
         target_venue=TargetVenue.HYPERLIQUID,
         asset_class=AssetClass.CRYPTO,
         symbol="CRYPTO_BTC_USD",
         direction=SignalDirection.LONG,
-        confidence_score=0.85,
         position_size_pct=5.0,
         order_type=OrderType.MARKET,
     )
     base.update(overrides)
-    return TradingSignal(**base)
+    return PlatformSignal(**base)
 
 
-def _darwinex(**overrides: Any) -> TradingSignal:
+def _darwinex(**overrides: Any) -> PlatformSignal:
     base: dict[str, Any] = dict(
         target_venue=TargetVenue.DARWINEX,
         asset_class=AssetClass.FOREX,
         symbol="FOREX_EUR_USD",
         direction=SignalDirection.SHORT,
-        confidence_score=0.6,
         position_size_pct=2.0,
         order_type=OrderType.MARKET,
         metadata={"stop_loss_price": 1.12},
     )
     base.update(overrides)
-    return TradingSignal(**base)
+    return PlatformSignal(**base)
 
 
-def _numerai(**overrides: Any) -> TradingSignal:
+def _numerai(**overrides: Any) -> PlatformSignal:
     base: dict[str, Any] = dict(
         target_venue=TargetVenue.NUMERAI,
         asset_class=AssetClass.EQUITY,
@@ -67,7 +65,7 @@ def _numerai(**overrides: Any) -> TradingSignal:
         order_type=OrderType.PREDICTION_ONLY,
     )
     base.update(overrides)
-    return TradingSignal(**base)
+    return PlatformSignal(**base)
 
 
 # --- Cas valides et sérialisation -------------------------------------------------------------
@@ -90,7 +88,7 @@ def test_defaults_generate_a_real_uuid_and_a_current_millisecond_timestamp() -> 
 
 def test_zmq_payload_roundtrips_to_an_equal_signal() -> None:
     original = _darwinex(metadata={"stop_loss_price": 1.12, "note": "x"})
-    restored = TradingSignal.from_zmq_payload(original.to_zmq_payload())
+    restored = PlatformSignal.from_zmq_payload(original.to_zmq_payload())
     assert restored == original
 
 
@@ -107,14 +105,14 @@ def test_zmq_payload_is_plain_json_with_the_specified_fields() -> None:
 
 def test_from_zmq_payload_accepts_bytes_as_received_from_the_socket() -> None:
     original = _hyperliquid()
-    assert TradingSignal.from_zmq_payload(original.to_zmq_payload().encode("utf-8")) == original
+    assert PlatformSignal.from_zmq_payload(original.to_zmq_payload().encode("utf-8")) == original
 
 
 def test_from_zmq_payload_rejects_a_corrupted_message() -> None:
     body = json.loads(_hyperliquid().to_zmq_payload())
     body["confidence_score"] = 7.0
     with pytest.raises(ValidationError):
-        TradingSignal.from_zmq_payload(json.dumps(body))
+        PlatformSignal.from_zmq_payload(json.dumps(body))
 
 
 # --- LIMIT / limit_price ----------------------------------------------------------------------
@@ -189,12 +187,37 @@ def test_all_routes_to_the_venue_of_the_asset_class_and_applies_its_rules() -> N
 @pytest.mark.parametrize("bad", [-0.01, 1.01, math.nan, math.inf])
 def test_confidence_score_must_stay_in_unit_interval(bad: float) -> None:
     with pytest.raises(ValidationError):
-        _hyperliquid(confidence_score=bad)
+        _numerai(confidence_score=bad)
 
 
 @pytest.mark.parametrize("ok", [0.0, 1.0])
 def test_confidence_score_bounds_are_inclusive(ok: float) -> None:
-    assert _hyperliquid(confidence_score=ok).confidence_score == ok
+    assert _numerai(confidence_score=ok).confidence_score == ok
+
+
+# --- confidence_score : exigé pour Numerai, interdit ailleurs (fuite d'IP) ---------------------
+
+
+def test_numerai_requires_a_confidence_score() -> None:
+    with pytest.raises(ValidationError, match="Numerai exige confidence_score"):
+        _numerai(confidence_score=None)
+
+
+@pytest.mark.parametrize("builder", [_hyperliquid, _darwinex])
+def test_visible_flow_venues_refuse_a_confidence_score(builder: Any) -> None:
+    with pytest.raises(ValidationError, match="confidence_score est interdit"):
+        builder(confidence_score=0.85)
+
+
+def test_confidence_rule_follows_the_asset_class_when_target_is_all() -> None:
+    with pytest.raises(ValidationError, match="confidence_score est interdit"):
+        _hyperliquid(target_venue=TargetVenue.ALL, confidence_score=0.5)  # crypto -> Hyperliquid
+    with pytest.raises(ValidationError, match="Numerai exige confidence_score"):
+        _numerai(target_venue=TargetVenue.ALL, confidence_score=None)  # equity -> Numerai
+
+
+def test_realtime_signals_serialize_confidence_as_null() -> None:
+    assert json.loads(_hyperliquid().to_zmq_payload())["confidence_score"] is None
 
 
 @pytest.mark.parametrize("bad", [-0.01, 100.01, math.nan])
@@ -270,7 +293,7 @@ def test_unknown_fields_are_refused() -> None:
     body = json.loads(_hyperliquid().to_zmq_payload())
     body["leverage"] = 50
     with pytest.raises(ValidationError):
-        TradingSignal.from_zmq_payload(json.dumps(body))
+        PlatformSignal.from_zmq_payload(json.dumps(body))
 
 
 def test_signal_is_immutable() -> None:
@@ -294,12 +317,14 @@ def test_expiration_boundary_is_exact() -> None:
 
 def test_published_json_schema_matches_the_model() -> None:
     on_disk = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
-    assert on_disk == json_schema(), "trading_signal.schema.json est périmé : python -m contracts.trading_signal"
+    assert on_disk == json_schema(), "platform_signal.schema.json est périmé : python -m contracts.platform_signal"
 
 
 def test_json_schema_pins_the_documented_bounds_and_enums() -> None:
     props = json_schema()["properties"]
-    assert props["confidence_score"]["minimum"] == 0.0 and props["confidence_score"]["maximum"] == 1.0
+    number, null = props["confidence_score"]["anyOf"]  # Optional[float] : nombre borné ou null
+    assert number["minimum"] == 0.0 and number["maximum"] == 1.0 and null == {"type": "null"}
+    assert "confidence_score" not in json_schema()["required"]
     assert props["position_size_pct"]["minimum"] == 0.0 and props["position_size_pct"]["maximum"] == 100.0
     assert json_schema()["additionalProperties"] is False
     assert json_schema()["$defs"]["TargetVenue"]["enum"] == ["NUMERAI", "HYPERLIQUID", "DARWINEX", "ALL"]

@@ -1,24 +1,27 @@
 """Contrat de signal multi-plateformes : le seul message qui sort du moteur vers les workers.
 
-Le moteur ne parle jamais aux API des plateformes. Il valide un ``TradingSignal``, le sérialise
+Le moteur ne parle jamais aux API des plateformes. Il valide un ``PlatformSignal``, le sérialise
 en JSON (``to_zmq_payload``) et le publie sur le bus ZeroMQ ; chaque worker (Numerai, Hyperliquid,
 Darwinex Zero) le relit avec ``from_zmq_payload``, qui rejoue exactement la même validation.
 Un signal incohérent lève donc côté moteur, avant publication, et ne peut pas non plus être
 accepté côté worker.
 
-Ce n'est PAS ``core.schemas.TradingSignal`` : celui-là est une opinion d'agent (``-1/0/1`` +
+Ce n'est PAS ``core.schemas.TradingSignal`` : celui-là est une opinion d'agent interne (``-1/0/1`` +
 confiance) consommée par l'``ExecutionAgent`` pour son consensus, et n'autorise rien. Celui-ci est
-une décision déjà arbitrée, destinée à une plateforme externe. Les deux coexistent ; importer
-toujours par chemin complet (``from contracts.trading_signal import TradingSignal``).
+une décision déjà arbitrée, destinée à une plateforme externe : d'où le nom distinct.
+
+``confidence_score`` n'est transmis qu'à Numerai (qui en a besoin pour son score). Pour Hyperliquid
+(vault public on-chain) et Darwinex, il est interdit : la magnitude de la conviction permettrait de
+rétro-ingénierer l'alpha depuis le flux d'ordres.
 
 Frontière d'IP : ce module ne doit rien importer de ``core`` ni de ``src``. Les workers n'importent
 que ``contracts``, jamais le code du moteur.
 
 Les règles croisées (venue/classe d'actif, ``limit_price``, ``stop_loss_price``...) ne sont pas
-exprimables en JSON Schema dérivé de Pydantic : ``trading_signal.schema.json`` décrit la
+exprimables en JSON Schema dérivé de Pydantic : ``platform_signal.schema.json`` décrit la
 structure et les bornes, la validation Python reste la source de vérité.
 
-Régénérer le schéma : ``python -m contracts.trading_signal``.
+Régénérer le schéma : ``python -m contracts.platform_signal``.
 """
 
 from __future__ import annotations
@@ -88,7 +91,7 @@ def _positive_finite(metadata: dict[str, Any], key: str) -> float:
     return float(value)
 
 
-class TradingSignal(BaseModel):
+class PlatformSignal(BaseModel):
     """Décision arbitrée à destination d'une plateforme externe. Immuable, champs inconnus refusés.
 
     Attributes:
@@ -99,7 +102,8 @@ class TradingSignal(BaseModel):
         symbol: Ticker interne générique, préfixé par la classe d'actif (ex. ``CRYPTO_BTC_USD``).
             Le mapping vers le ticker de la plateforme est fait par chaque worker.
         direction: ``LONG``, ``SHORT`` ou ``FLAT`` (cible : pas d'exposition).
-        confidence_score: Confiance de l'alpha, dans ``[0, 1]``.
+        confidence_score: Confiance de l'alpha, dans ``[0, 1]``. **Obligatoire** pour Numerai,
+            **interdit** (doit rester ``None``) pour Hyperliquid et Darwinex.
         position_size_pct: Pourcentage du capital alloué, dans ``[0, 100]``. Doit valoir 0 pour
             ``FLAT`` et dépasser 0 pour un ordre ``LONG``/``SHORT`` exécutable.
         order_type: ``MARKET``, ``LIMIT`` ou ``PREDICTION_ONLY`` (aucun ordre : score seul).
@@ -117,16 +121,17 @@ class TradingSignal(BaseModel):
     asset_class: AssetClass
     symbol: str = Field(pattern=_SYMBOL_PATTERN)
     direction: SignalDirection
-    confidence_score: float = Field(ge=0.0, le=1.0)
+    confidence_score: float | None = Field(default=None, ge=0.0, le=1.0)
     position_size_pct: float = Field(ge=0.0, le=100.0)
     order_type: OrderType
     metadata: dict[str, Any] = Field(default_factory=dict)
     ttl_ms: int | None = Field(default=None, gt=0)
 
     @model_validator(mode="after")
-    def _validate_cross_field_rules(self) -> TradingSignal:
+    def _validate_cross_field_rules(self) -> PlatformSignal:
         self._check_symbol_matches_asset_class()
         venues = self._effective_venues()
+        self._check_confidence_disclosure(venues)
         self._check_sizing()
         self._check_limit_price()
         if TargetVenue.NUMERAI in venues and self.order_type is not OrderType.PREDICTION_ONLY:
@@ -151,6 +156,17 @@ class TradingSignal(BaseModel):
                 f"{self.target_venue.value} ne traite pas la classe {self.asset_class.value} (plateforme attendue : {owner.value})."
             )
         return {owner}
+
+    def _check_confidence_disclosure(self, venues: set[TargetVenue]) -> None:
+        """``confidence_score`` : exigé pour Numerai, interdit pour les plateformes à flux visible."""
+        if TargetVenue.NUMERAI in venues:
+            if self.confidence_score is None:
+                raise ValueError("Numerai exige confidence_score (il devient le score soumis).")
+        elif self.confidence_score is not None:
+            raise ValueError(
+                f"confidence_score est interdit pour {', '.join(sorted(v.value for v in venues))} : "
+                "la magnitude de la conviction fuiterait l'alpha via le flux d'ordres visible."
+            )
 
     def _check_sizing(self) -> None:
         if self.direction is SignalDirection.FLAT and self.position_size_pct != 0.0:
@@ -178,6 +194,11 @@ class TradingSignal(BaseModel):
         if self.direction is SignalDirection.SHORT and stop <= limit:
             raise ValueError("SHORT : stop_loss_price doit être supérieur à limit_price.")
 
+    @property
+    def routed_venue(self) -> TargetVenue:
+        """Plateforme qui doit traiter ce signal (résout ``ALL`` par la classe d'actif)."""
+        return _VENUE_BY_ASSET_CLASS[self.asset_class]
+
     def is_expired(self, now_ms: int | None = None) -> bool:
         """``True`` si ``ttl_ms`` est défini et dépassé. Sans ``ttl_ms``, jamais expiré."""
         if self.ttl_ms is None:
@@ -190,20 +211,20 @@ class TradingSignal(BaseModel):
         return self.model_dump_json()
 
     @classmethod
-    def from_zmq_payload(cls, payload: str | bytes) -> TradingSignal:
+    def from_zmq_payload(cls, payload: str | bytes) -> PlatformSignal:
         """Relit et revalide un payload reçu du bus. Lève ``ValidationError`` si invalide."""
         return cls.model_validate_json(payload)
 
 
-SCHEMA_PATH: Final[Path] = Path(__file__).with_name("trading_signal.schema.json")
+SCHEMA_PATH: Final[Path] = Path(__file__).with_name("platform_signal.schema.json")
 
 
 def json_schema() -> dict[str, Any]:
     """JSON Schema (structure et bornes) du contrat, tel que publié pour les workers."""
-    schema = TradingSignal.model_json_schema()
+    schema = PlatformSignal.model_json_schema()
     return {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "$id": "https://nothierly.local/contracts/trading_signal.schema.json",
+        "$id": "https://nothierly.local/contracts/platform_signal.schema.json",
         **schema,
     }
 
