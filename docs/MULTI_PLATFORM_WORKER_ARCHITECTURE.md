@@ -1,12 +1,12 @@
 # Architecture Hub-and-Spoke : Cerveau Alpha vers 6 plateformes de capital externe, en 3 pôles
 
-Statut : le **contrat** (`contracts/platform_signal.py`), le **transport signé** (`contracts/secure_signal_bus.py`) et deux workers (`workers/numerai`, `workers/hyperliquid`) sont implémentés et testés, mais **jamais exécutés contre les vraies plateformes**. Les 4 autres plateformes ont leur nom réservé dans le contrat et **aucun worker**. Les faits sur les plateformes viennent de recherches web et sont marqués **[à vérifier]** quand les sources divergent ou manquent. Les éléments du repo cités existent réellement (chemins indiqués).
+Statut : le **contrat** (`contracts/platform_signal.py`), le **transport signé** (`contracts/secure_signal_bus.py`) et trois workers (`workers/numerai`, `workers/hyperliquid`, `workers/bybit`, qui partagent le socle `workers/common`) sont implémentés et testés, mais **jamais exécutés contre les vraies plateformes**. Les 3 autres plateformes ont leur nom réservé dans le contrat et **aucun worker**. Les faits sur les plateformes viennent de recherches web et sont marqués **[à vérifier]** quand les sources divergent ou manquent. Les éléments du repo cités existent réellement (chemins indiqués).
 
 Périmètre : exactement 6 plateformes, celles du tableau ci-dessous.
 
 | Pôle | Plateformes | Exécution | Worker |
 |---|---|---|---|
-| Crypto | `HYPERLIQUID`, `BINANCE`, `BYBIT`, `ENZYME` | temps réel | Hyperliquid écrit (dry-run) ; les 3 autres non écrits |
+| Crypto | `HYPERLIQUID`, `BINANCE`, `BYBIT`, `ENZYME` | temps réel | Hyperliquid et Bybit écrits (dry-run) ; les 2 autres non écrits |
 | Actions | `NUMERAI_SIGNALS` | batch quotidien | écrit (dry-run) |
 | Forex / CFD | `DARWINEX_ZERO` | pont MT5 | non écrit |
 
@@ -301,12 +301,24 @@ Rust ou C++ n'apportent rien ici. La latence est dominée par l'API de la venue 
 - Éligibilité actuelle (futures) et disponibilité par région : non trouvées.
 - Le repo a un `CcxtBrokerAdapter` (`src/execution/broker_gateway.py`) à évaluer, mais il ne couvre pas les endpoints spécifiques au copy trading.
 
-### 4.6 Worker Bybit (master trader) : non écrit
+### 4.6 Worker Bybit (master trader)
 
-- **API V5 documentée** : un ordre de copy trading passe par le endpoint standard `/v5/order/create`. Limites documentées : **perpétuels USDT uniquement** (le champ `copyTrading` de *Get Instruments Info* dit quels symboles sont éligibles) ; permission « Contract - Orders & Positions » obligatoire.
-- Les fonctions de gestion (followers, réglages du master) ne sont pas confirmées dans V5 ; le SDK `pybit` garde un module legacy pour certaines.
+*Implémenté : `workers/bybit/` (dry-run testnet par défaut, jamais exécuté contre le service, aucune clé utilisée).*
+
+Ce qui vient de la doc V5 officielle et est appliqué dans le code :
+
+- **Ordre** : `POST /v5/order/create` (`category=linear`), quantité et prix en chaînes, `orderLinkId` unique de 36 caractères maximum, `reduceOnly`, `positionIdx`. **Perpétuels USDT uniquement** pour le copy trading ; le champ `copyTrading` d'`instruments-info` dit si un symbole est éligible (le worker refuse `none`).
+- **Signature** : `HMAC_SHA256(secret, timestamp + clé API + recv_window + (query | corps JSON))`, en hexadécimal ; le corps est signé tel qu'envoyé. Testée contre la formule recalculée indépendamment.
+- **Réponse asynchrone** : Bybit n'accuse que la réception (« please use the websocket to confirm the order status »). Le statut journalisé est `accepted`, jamais `filled` : le remplissage réel se lit dans la position au signal suivant, qui est la source de vérité de la logique d'exposition.
+- **Garde-fou de clé** : `GET /v5/user/query-api` expose les permissions. La CLI **refuse toute clé avec `Wallet: Withdraw`** (même en dry-run), et en mode live toute clé en lecture seule ou sans « Contract - Orders & Positions ».
+- Les ordres `MARKET` du signal sont envoyés en **limite IOC** bornée par `max_slippage_bps` autour du mid (le plafond de glissement est le nôtre) ; achat arrondi au tick supérieur, vente au tick inférieur.
+
+**Inconnues non tranchées par la doc, traitées en échec sûr** (à vérifier sur testnet avec une vraie clé) :
+
+- **Où sont les fonds d'un master trader ?** Seul `accountType=UNIFIED` est documenté pour `wallet-balance`. Une equity lue sur le mauvais compte fausserait la taille des ordres. Parade : `--max-equity-usd` plafonne l'equity utilisée pour dimensionner.
+- **Mode de position.** Le worker ne gère que le mode one-way (`positionIdx` 0) ; une position hedge arrête l'ordre (`hedge_mode_unsupported`). L'exemple copy trading de la doc utilise `positionIdx: 1` : si les comptes de copy trading sont en hedge, le worker devra être étendu.
+- **Dry-run avec clé.** Solde et positions sont des données privées : même le dry-run exige une clé API (en lecture seule de préférence).
 - Critères pour devenir master : introuvables officiellement (voir §0.1) ; passer par la page de candidature de Bybit.
-- C'est, avec Hyperliquid, le chemin d'ordre le mieux **documenté** des plateformes crypto restantes, donc le plus simple à écrire en premier.
 
 ### 4.7 Worker Enzyme (vault EVM) : non écrit
 
@@ -426,7 +438,7 @@ Le worker tombe seul, le Cerveau n'en sait rien.
 | 1 | Contrat `PlatformSignal` + transport signé | **fait** ; restent : `intent-gateway`, topics par plateforme, CURVE, ack-ledger |
 | 2 | **Numerai Signals** : worker + validations (aucune exécution) | **fait** (dry-run) ; soumission réelle non testée ; 0 |
 | 3 | **Hyperliquid** : worker temps réel, clé agent sans retrait | **fait** (dry-run) ; testnet à faire ; ≈200 USDC + stake pour un vault |
-| 4 | **Bybit** : chemin d'ordre documenté (V5), perp USDT | à écrire ; critères master à confirmer |
+| 4 | **Bybit** : API V5, perp USDT, clé sans retrait | **fait** (dry-run) ; testnet à faire ; compte des fonds et mode de position à confirmer ; critères master à confirmer |
 | 5 | **Darwinex Zero** : pont MT5 Windows, SL serveur, calendrier, idempotence | à écrire ; abonnement |
 | 6 | **Enzyme** : vault EVM, relais anti-MEV | à écrire ; gas |
 | 7 | **Binance** : seulement après confirmation écrite des conditions et de l'API d'ordres | bloqué par des inconnues |

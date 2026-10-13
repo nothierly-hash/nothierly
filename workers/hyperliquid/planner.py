@@ -24,26 +24,16 @@ from dataclasses import dataclass
 from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal
 from typing import Final
 
-from contracts.platform_signal import OrderType, PlatformSignal, SignalDirection
+from contracts.platform_signal import OrderType, PlatformSignal
+from workers.common.exposure import ZERO, RiskLimits, Skip, decide_exposure
 
-ZERO: Final[Decimal] = Decimal(0)
 _MAX_DECIMALS_PERP: Final[int] = 6
 _QUOTE_SUFFIXES: Final[frozenset[str]] = frozenset({"USD", "USDC", "USDT"})
 _BPS: Final[Decimal] = Decimal(10_000)
 
-
-@dataclass(frozen=True)
-class RiskLimits:
-    """Limites locales du worker : il juge sur l'état réel du compte, jamais sur ce que dit le moteur."""
-
-    max_position_pct: Decimal = Decimal("20")  # |exposition cible| / equity, par actif
-    max_gross_exposure_pct: Decimal = Decimal("100")  # somme des |expositions| / equity
-    rebalance_tolerance_pct: Decimal = Decimal("0.5")  # écart minimal (en % d'equity) pour réajuster
-    min_order_notional_usd: Decimal = Decimal("10")
-    max_slippage_bps: Decimal = Decimal("50")  # ordres MARKET : IOC limité à mid +/- ce plafond
-    max_limit_deviation_bps: Decimal = Decimal("500")  # un LIMIT trop loin du mid est une faute de frappe
-    limit_tif: str = "Ioc"  # "Gtc" laisserait des ordres au carnet si le worker s'arrête : opt-in
-    max_daily_drawdown_pct: Decimal = Decimal("5")  # au-delà : mode réduction seule
+__all__ = [
+    "ZERO", "OrderPlan", "RiskLimits", "Skip", "hl_asset", "make_cloid", "plan_order", "round_price", "size_for_pct",
+]
 
 
 @dataclass(frozen=True)
@@ -57,11 +47,6 @@ class OrderPlan:
     cloid: str
     target_size: Decimal
     current_size: Decimal
-
-
-@dataclass(frozen=True)
-class Skip:
-    reason: str
 
 
 def hl_asset(symbol: str, overrides: Mapping[str, str] | None = None) -> str | None:
@@ -100,10 +85,6 @@ def round_price(px: Decimal, sz_decimals: int) -> Decimal:
     return px.quantize(Decimal(1).scaleb(-max(decimals, 0)), rounding=ROUND_HALF_UP)
 
 
-def _is_pure_reduction(position: Decimal, target: Decimal) -> bool:
-    return (position > 0 and 0 <= target < position) or (position < 0 and position < target <= 0)
-
-
 def plan_order(
     signal: PlatformSignal,
     *,
@@ -125,34 +106,19 @@ def plan_order(
         others_notional: exposition absolue des AUTRES actifs, en USD (pour le plafond brut).
         halted: mode réduction seule (coupe-circuit de drawdown) : seules les réductions passent.
     """
-    if signal.order_type is OrderType.PREDICTION_ONLY:
-        return Skip("prediction_only")
-    if equity <= 0:
-        return Skip("no_equity")
-    if mid <= 0:
-        return Skip("no_price")
-    if Decimal(str(signal.position_size_pct)) > limits.max_position_pct:
-        return Skip("exceeds_position_cap")
-
-    sign = {SignalDirection.LONG: 1, SignalDirection.SHORT: -1, SignalDirection.FLAT: 0}[signal.direction]
-    target = target_abs_size * sign
-    delta = target - position
-    if delta == 0:
-        return Skip("on_target")
-
-    reduction = _is_pure_reduction(position, target)
-    delta_notional = abs(delta) * mid
-    if target != 0 and delta_notional < limits.rebalance_tolerance_pct / Decimal(100) * equity:
-        return Skip("within_tolerance")
-    if halted and not reduction:
-        return Skip("halted_reduce_only")
-    if not reduction:
-        if delta_notional < limits.min_order_notional_usd:
-            return Skip("below_min_notional")
-        if others_notional + abs(target) * mid > limits.max_gross_exposure_pct / Decimal(100) * equity:
-            return Skip("exceeds_gross_cap")
-
-    is_buy = delta > 0
+    decision = decide_exposure(
+        signal,
+        target_abs_size=target_abs_size,
+        equity=equity,
+        position=position,
+        mid=mid,
+        others_notional=others_notional,
+        limits=limits,
+        halted=halted,
+    )
+    if isinstance(decision, Skip):
+        return decision
+    is_buy = decision.is_buy
     if signal.order_type is OrderType.LIMIT:
         limit_price = Decimal(str(signal.metadata["limit_price"]))
         if abs(limit_price - mid) / mid * _BPS > limits.max_limit_deviation_bps:
@@ -164,11 +130,11 @@ def plan_order(
     return OrderPlan(
         asset=asset,
         is_buy=is_buy,
-        size=abs(delta),
+        size=decision.size,
         limit_px=round_price(raw, sz_decimals),
         tif=tif,
-        reduce_only=reduction,
+        reduce_only=decision.reduce_only,
         cloid=make_cloid(signal),
-        target_size=target,
-        current_size=position,
+        target_size=decision.target_size,
+        current_size=decision.current_size,
     )
