@@ -104,8 +104,10 @@ class PlatformSignal(BaseModel):
         direction: ``LONG``, ``SHORT`` ou ``FLAT`` (cible : pas d'exposition).
         confidence_score: Confiance de l'alpha, dans ``[0, 1]``. **Obligatoire** pour Numerai,
             **interdit** (doit rester ``None``) pour Hyperliquid et Darwinex.
-        position_size_pct: Pourcentage du capital alloué, dans ``[0, 100]``. Doit valoir 0 pour
-            ``FLAT`` et dépasser 0 pour un ordre ``LONG``/``SHORT`` exécutable.
+        position_size_pct: Exposition **cible**, en % du capital, dans ``[0, 100]`` (pas un ordre à
+            ajouter : un worker compare la cible à sa position réelle et n'envoie que l'écart, donc
+            republier le même signal ne change rien). Doit valoir 0 pour ``FLAT`` et dépasser 0 pour
+            un ordre ``LONG``/``SHORT`` exécutable.
         order_type: ``MARKET``, ``LIMIT`` ou ``PREDICTION_ONLY`` (aucun ordre : score seul).
         metadata: Dictionnaire libre. Clés exigées selon le cas : ``limit_price`` (``LIMIT``),
             ``stop_loss_price`` (Darwinex, ordre exécutable).
