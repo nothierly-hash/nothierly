@@ -150,9 +150,9 @@ def test_numerai_rejects_a_non_equity_class() -> None:
 # --- Darwinex ---------------------------------------------------------------------------------
 
 
-def test_darwinex_executable_order_without_stop_loss_is_rejected() -> None:
-    with pytest.raises(ValidationError, match="stop_loss_price"):
-        _darwinex(metadata={})
+def test_darwinex_order_without_stop_loss_is_accepted_the_worker_adds_a_default_one() -> None:
+    assert _darwinex(metadata={}).metadata == {}  # plus exigé : le worker Darwinex pose un stop par défaut
+    assert _darwinex(metadata={"stop_loss_price": 1.12}).metadata == {"stop_loss_price": 1.12}
 
 
 def test_darwinex_prediction_only_does_not_need_a_stop_loss() -> None:
@@ -177,8 +177,7 @@ def test_all_routes_to_the_venue_of_the_asset_class_and_applies_its_rules() -> N
     assert _hyperliquid(target_venue=TargetVenue.ALL).target_venue is TargetVenue.ALL  # crypto : aucune règle de plus
     with pytest.raises(ValidationError, match="PREDICTION_ONLY"):  # equity -> Numerai
         _numerai(target_venue=TargetVenue.ALL, order_type=OrderType.MARKET, position_size_pct=1.0)
-    with pytest.raises(ValidationError, match="stop_loss_price"):  # forex -> Darwinex
-        _darwinex(target_venue=TargetVenue.ALL, metadata={})
+    assert _darwinex(target_venue=TargetVenue.ALL, metadata={}).target_venue is TargetVenue.ALL  # forex -> Darwinex : stop optionnel
 
 
 # --- Bornes et cohérence direction / taille ---------------------------------------------------
@@ -413,17 +412,10 @@ def test_a_targeted_platform_is_the_only_one_that_matches() -> None:
     assert not any(binance.targets(v) for v in TargetVenue if v is not TargetVenue.BINANCE)
 
 
-def test_stop_loss_is_required_for_darwinex_zero_including_through_all() -> None:
-    with pytest.raises(ValidationError, match="stop_loss_price"):
-        _darwinex(target_venue=TargetVenue.DARWINEX_ZERO, metadata={})
-    with pytest.raises(ValidationError, match="stop_loss_price"):  # ALL couvre aussi Darwinex Zero
-        _darwinex(target_venue=TargetVenue.ALL, metadata={})
-
-
-def test_a_darwinex_flat_needs_no_stop_loss_but_any_opening_signal_still_does() -> None:
-    flat = _darwinex(direction=SignalDirection.FLAT, position_size_pct=0.0, metadata={})
-    assert flat.direction is SignalDirection.FLAT
-    assert _darwinex(target_venue=TargetVenue.ALL, direction=SignalDirection.FLAT, position_size_pct=0.0, metadata={}).direction is SignalDirection.FLAT
-    for direction in (SignalDirection.LONG, SignalDirection.SHORT):
-        with pytest.raises(ValidationError, match="stop_loss_price"):
-            _darwinex(direction=direction, metadata={})
+def test_the_stop_loss_is_optional_for_darwinex_but_still_validated_when_present() -> None:
+    for venue in (TargetVenue.DARWINEX_ZERO, TargetVenue.ALL):
+        for direction in (SignalDirection.LONG, SignalDirection.SHORT):
+            assert _darwinex(target_venue=venue, direction=direction, metadata={}).direction is direction
+    assert _darwinex(direction=SignalDirection.FLAT, position_size_pct=0.0, metadata={}).direction is SignalDirection.FLAT
+    with pytest.raises(ValidationError, match="stop_loss_price"):  # un stop présent mais absurde reste refusé
+        _darwinex(metadata={"stop_loss_price": -1.0})

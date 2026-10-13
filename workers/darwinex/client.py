@@ -24,6 +24,7 @@ vérifient le câblage avec un faux module et les codes de retour de la doc offi
 
 from __future__ import annotations
 
+import sys
 import threading
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -48,6 +49,14 @@ _AMBIGUOUS = frozenset({10012, 10031})  # délai / connexion perdue : l'ordre es
 
 class Mt5Error(RuntimeError):
     """Terminal injoignable, ou lecture MT5 impossible."""
+
+
+class UnsupportedPlatformError(Mt5Error):
+    """Le paquet ``MetaTrader5`` n'existe que sous Windows : le worker ne peut pas tourner ici."""
+
+
+class Mt5NotInstalledError(Mt5Error):
+    """Le paquet ``MetaTrader5`` est absent (``pip install MetaTrader5``, Windows uniquement)."""
 
 
 class WrongAccountError(Mt5Error):
@@ -153,10 +162,16 @@ class MetaTrader5Client:
         mt5_module: Any | None = None,
     ) -> None:
         if mt5_module is None:
+            # Contrôle d'OS ici, et non à l'import du module : avec un faux module injecté (tests, CI Linux) rien ne l'exige.
+            if sys.platform != "win32":
+                raise UnsupportedPlatformError(
+                    f"Le worker Darwinex exige Windows (le paquet MetaTrader5 n'existe pas sur {sys.platform}) : "
+                    "lancer ce worker sur la machine Windows qui héberge le terminal MT5."
+                )
             try:
                 import MetaTrader5 as mt5_module  # type: ignore[import-not-found,no-redef,unused-ignore]
-            except ImportError as exc:  # pragma: no cover - dépend de l'environnement
-                raise RuntimeError("MetaTrader5 n'est pas installé (Windows uniquement) : pip install MetaTrader5") from exc
+            except ImportError as exc:
+                raise Mt5NotInstalledError("MetaTrader5 n'est pas installé : pip install MetaTrader5 (Windows uniquement).") from exc
         self._mt5: Any = mt5_module
         self._expected_login = expected_login
         self._magic = magic

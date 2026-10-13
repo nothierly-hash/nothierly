@@ -786,3 +786,118 @@ def test_cli_defaults_are_dry_run_demo_with_the_dead_man_armed(monkeypatch: pyte
     assert seen["config"].dry_run is True and seen["config"].dead_man_timeout_s == 300.0 and seen["config"].symbol_suffix == ".r"
     assert seen["client_kwargs"]["expected_login"] == LOGIN and seen["client_kwargs"]["allow_real_account"] is False
     assert (seen["client_kwargs"]["login"], seen["client_kwargs"]["server"]) == (LOGIN, "Darwinex-Demo")
+
+
+# --- Stop-loss par défaut --------------------------------------------------------------------
+
+
+def test_the_worker_adds_a_default_stop_at_one_percent_of_the_entry_price() -> None:
+    buy = _plan(_signal(metadata={}), default_stop_loss_bps=D(100))
+    assert isinstance(buy, Mt5OrderPlan) and buy.sl_defaulted
+    assert buy.sl == D("1.08909")  # ask 1,1001 x 0,99 = 1,089099, arrondi au point INFÉRIEUR (plus loin = plus protecteur)
+    sell = _plan(_short(metadata={}), default_stop_loss_bps=D(100))
+    assert isinstance(sell, Mt5OrderPlan) and sell.sl == D("1.11090") and sell.sl_defaulted  # bid 1,0999 x 1,01 = 1,110899 -> point supérieur
+
+
+def test_the_default_stop_of_a_limit_order_is_measured_from_its_own_entry_price() -> None:
+    limit = _plan(_signal(order_type=OrderType.LIMIT, metadata={"limit_price": 1.095}), default_stop_loss_bps=D(100))
+    assert isinstance(limit, Mt5OrderPlan) and limit.price == D("1.09500")
+    assert limit.sl == D("1.08405")  # 1,095 x 0,99 : sous l'ENTRÉE, pas sous le marché (sinon le stop serait au-dessus de l'entrée)
+
+
+def test_a_default_stop_is_pushed_out_to_the_brokers_minimum_distance() -> None:
+    buy = _plan(_signal(metadata={}), default_stop_loss_bps=D(1))  # 1 pb = 0,00011 : plus près que bid - 10 points
+    sell = _plan(_short(metadata={}), default_stop_loss_bps=D(1))
+    assert isinstance(buy, Mt5OrderPlan) and isinstance(sell, Mt5OrderPlan)
+    assert buy.sl == D("1.09980") and sell.sl == D("1.10020")  # bid - 0,0001 et ask + 0,0001
+
+
+def test_a_stop_given_by_the_signal_is_never_silently_replaced() -> None:
+    bad = _signal(metadata={"stop_loss_price": 1.0999})  # trop près du bid
+    assert _plan(bad, default_stop_loss_bps=D(100)) == Skip("stop_too_close_or_wrong_side")
+    kept = _plan(_signal(metadata={"stop_loss_price": 1.095}), default_stop_loss_bps=D(100))
+    assert isinstance(kept, Mt5OrderPlan) and kept.sl == D("1.09500") and not kept.sl_defaulted
+
+
+def test_without_a_default_a_missing_stop_refuses_the_order_and_a_close_never_needs_one() -> None:
+    assert _plan(_signal(metadata={})) == Skip("missing_stop_loss")
+    close = _plan(_flat(), position=Mt5Position(77, D("0.04"), D("1.1")), target_abs_lots=D(0), default_stop_loss_bps=D(100))
+    assert isinstance(close, Mt5OrderPlan) and close.sl is None and not close.sl_defaulted
+
+
+def test_the_worker_sends_the_default_stop_to_mt5_and_journals_that_it_chose_it(tmp_path: Path) -> None:
+    client = FakeDwx()
+    w = _worker(tmp_path, client)
+    assert w._dwx_cfg.default_stop_loss_bps == D("100")  # armé par défaut
+    assert _run(w, _signal(metadata={})) == "filled"
+    assert client.sent[0].sl == D("1.08909")
+    assert "stop par défaut" in w.state.executions()[0].detail
+
+
+def test_with_the_default_disabled_the_worker_refuses_a_signal_without_a_stop(tmp_path: Path) -> None:
+    client = FakeDwx()
+    w = _worker(tmp_path, client, default_stop_loss_bps=None)
+    assert _run(w, _signal(metadata={})) == "missing_stop_loss" and client.sent == []
+    assert _run(w, _signal(metadata={"stop_loss_price": 1.095})) == "filled"  # un stop explicite passe toujours
+
+
+def test_cli_default_stop_loss_option(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[Any] = []
+
+    class _Stop(Exception):
+        pass
+
+    class _Ok:
+        def account_check(self) -> AccountInfo:
+            return AccountInfo(LOGIN, "DEMO", "HEDGING", "USD", "x", True)
+
+        def close(self) -> None:
+            pass
+
+    def worker_factory(config: DarwinexWorkerConfig, client: Any) -> None:
+        seen.append(config.default_stop_loss_bps)
+        raise _Stop
+
+    monkeypatch.setattr(worker_module, "MetaTrader5Client", lambda **_: _Ok())
+    monkeypatch.setattr(worker_module, "DarwinexWorker", worker_factory)
+    for extra, expected in (([], D("100")), (["--default-stop-loss-bps", "50"], D("50")), (["--default-stop-loss-bps", "0"], None)):
+        _env(monkeypatch, NOTHIERLY_ZMQ_SECRET=SECRET)
+        with pytest.raises(_Stop):
+            worker_module.main(["--address", "tcp://127.0.0.1:1", "--account-login", str(LOGIN), *extra])
+        assert seen[-1] == expected
+    with pytest.raises(SystemExit):
+        worker_module.main(["--address", "tcp://127.0.0.1:1", "--account-login", str(LOGIN), "--default-stop-loss-bps", "-5"])
+
+
+# --- Vérification d'OS (CI Linux) ------------------------------------------------------------
+
+
+def test_the_client_refuses_to_start_off_windows_but_a_mocked_module_works_on_any_os(monkeypatch: pytest.MonkeyPatch) -> None:
+    from workers.darwinex import client as client_module
+
+    monkeypatch.setattr(client_module, "sys", SimpleNamespace(platform="linux"))
+    with pytest.raises(client_module.UnsupportedPlatformError, match="Windows"):
+        MetaTrader5Client(expected_login=LOGIN, magic=1)
+    # Avec un module simulé, aucune exigence d'OS : c'est ce qui permet aux tests de tourner sur un pipeline CI Linux.
+    assert MetaTrader5Client(expected_login=LOGIN, magic=1, mt5_module=FakeMt5()).account_check().login == LOGIN
+
+
+def test_a_missing_metatrader5_package_is_a_clear_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    import sys
+
+    from workers.darwinex import client as client_module
+
+    monkeypatch.setattr(client_module, "sys", SimpleNamespace(platform="win32"))
+    monkeypatch.setitem(sys.modules, "MetaTrader5", None)  # `import MetaTrader5` lève ImportError
+    with pytest.raises(client_module.Mt5NotInstalledError, match="pip install MetaTrader5"):
+        MetaTrader5Client(expected_login=LOGIN, magic=1)
+
+
+def test_the_command_line_stops_with_a_message_not_a_traceback_off_windows(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    from workers.darwinex import client as client_module
+
+    _env(monkeypatch, NOTHIERLY_ZMQ_SECRET=SECRET)
+    monkeypatch.setattr(client_module, "sys", SimpleNamespace(platform="darwin"))
+    monkeypatch.setattr(worker_module, "DarwinexWorker", lambda *a, **k: pytest.fail("le worker ne doit pas démarrer"))
+    assert worker_module.main(["--address", "tcp://127.0.0.1:1", "--account-login", str(LOGIN)]) == 2
+    assert "Windows" in capsys.readouterr().err

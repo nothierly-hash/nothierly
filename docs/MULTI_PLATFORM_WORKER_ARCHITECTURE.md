@@ -130,7 +130,7 @@ Point de design important : le `TradingSignal` actuel (`-1/0/1` + `confidence`, 
 **Ce que le pont ne peut pas faire, honnêtement :**
 
 - **Pas d'actions.** Le moteur n'a aucun modèle d'actions : ses instruments sont `BTC/USDT`, `ETH/USDT`, `EUR_USD`, `XAU_USD`. Rien ne peut alimenter `NUMERAI_SIGNALS`, qui exige 100 scores d'actions par jour minimum. Il faudrait un modèle de classement de l'univers d'actions, ce qui est un projet à part.
-- **Pas de forex.** `DARWINEX_ZERO` exige un `stop_loss_price` que le moteur ne fournit pas ; `EUR_USD` et `XAU_USD` sont ignorés (avec un avertissement).
+- **Pas de forex dans le pont.** Le moteur ne fournit pas de `stop_loss_price` ; le worker Darwinex saurait en poser un par défaut, mais le pont ne traduit pour l'instant que les paires crypto : `EUR_USD` et `XAU_USD` sont ignorés (avec un avertissement).
 - **Décisions simulées.** En `MOCK_MODE`/`SHADOW`, les positions du moteur sont simulées. Un worker en mode live tradera de l'argent réel d'après elles : garder les workers en dry-run, testnet ou démo. Le pont l'affiche au démarrage.
 - **Comptes dédiés.** Un worker ramène le compte à la cible de chaque symbole suivi, y compris `FLAT` : une position ouverte à la main sur ce symbole serait fermée.
 - **Si le pont ou le moteur meurt**, ce sont les workers qui protègent : leur homme mort ferme toutes leurs positions après N secondes sans signal valide, puis les verrouille (voir §6.7).
@@ -333,7 +333,7 @@ Rust ou C++ n'apportent rien ici. La latence est dominée par l'API de la venue 
 
 *Implémenté : `workers/darwinex/` (dry-run par défaut). **Jamais exécuté contre un vrai terminal MetaTrader 5** : le paquet `MetaTrader5` n'est pas installé ici et aucun compte n'a été utilisé. Testé avec un faux module, dont les constantes sont des nombres arbitraires pour vérifier qu'elles sont utilisées par leur nom.*
 
-**Fait pour Windows.** Le paquet `MetaTrader5` n'existe que sous Windows et pilote un terminal MT5 installé et lancé : le worker tourne sur l'hôte Windows, reçoit ses signaux du bus (chiffré en CURVE) et agit comme pont local.
+**Fait pour Windows.** Le paquet `MetaTrader5` n'existe que sous Windows et pilote un terminal MT5 installé et lancé : le worker tourne sur l'hôte Windows, reçoit ses signaux du bus (chiffré en CURVE) et agit comme pont local. Lancé ailleurs, il s'arrête proprement avec un message clair (code 2, pas de trace) : `UnsupportedPlatformError` hors Windows, `Mt5NotInstalledError` si le paquet manque. Le contrôle est dans le client et non à l'import : avec un module simulé il ne s'applique pas, ce qui laisse les tests tourner sur un pipeline CI Linux (non vérifié ici : seulement exécutés sous Windows).
 
 **Ce que dit la doc officielle (MQL5), appliqué dans le code.**
 
@@ -348,7 +348,7 @@ Rust ou C++ n'apportent rien ici. La latence est dominée par l'API de la venue 
 
 **Ordres.**
 
-- **Stop-loss serveur** sur toute ouverture (le `stop_loss_price` du signal, exigé par le contrat), refusé s'il est du mauvais côté ou plus près que `trade_stops_level`. Un stop n'est posé qu'à l'ouverture.
+- **Stop-loss serveur** sur toute ouverture (le score de risque Darwinex l'impose). Le `stop_loss_price` du signal est utilisé s'il existe ; refusé s'il est du mauvais côté ou plus près que `trade_stops_level`, **jamais remplacé en silence**. S'il manque, le worker pose un stop par défaut à `--default-stop-loss-bps` du prix de l'ordre (100 = 1 % par défaut ; le prix limite pour un `LIMIT`), reculé au besoin à la distance minimale du courtier, et le journal le note. `--default-stop-loss-bps 0` le désactive : un signal sans stop est alors refusé (`missing_stop_loss`). Le contrat n'exige donc plus le stop (il le valide s'il est présent). Un stop n'est posé qu'à l'ouverture.
 - **Une inversion se fait en deux temps** : sur un compte hedging, un ordre opposé plus gros ouvre une position inverse sans fermer la première. Le worker ferme d'abord (avec le ticket), le signal suivant ouvre le reste.
 - Une seule position nette par symbole : plusieurs positions (hedging) arrêtent l'ordre (`hedge_positions_unsupported`).
 - Les modes `CLOSEONLY`, `LONGONLY`, `SHORTONLY`, `DISABLED` bloquent les ouvertures mais jamais une fermeture ; un spread trop large (`--max-spread-bps`) bloque une ouverture, jamais une fermeture.

@@ -13,10 +13,13 @@ conversion de la devise de cotation vers celle du compte. Le client la mesure (`
 inverse sans fermer la première. Une inversion LONG -> SHORT est donc planifiée comme la fermeture seule (avec le ticket
 de la position) ; le signal suivant, état-pilote, ouvre le reste.
 
-**Stop-loss.** Le contrat exige un ``stop_loss_price`` pour tout ordre exécutable vers ``DARWINEX_ZERO``. Il part avec
-l'ordre d'ouverture (stop côté serveur : si le worker ou le pont meurt, la position n'est pas nue). Le stop est refusé
-s'il est du mauvais côté du prix ou plus près que ``trade_stops_level``. Un stop n'est posé qu'à l'ouverture : un
-changement ultérieur de ``stop_loss_price`` sur une position déjà à la cible n'est pas appliqué.
+**Stop-loss.** Le score de risque Darwinex impose un stop sur toute position. Tout ordre d'ouverture part avec un stop
+côté serveur (si le worker ou le pont meurt, la position n'est pas nue). Le ``stop_loss_price`` du signal est utilisé
+s'il existe ; il est refusé (``stop_too_close_or_wrong_side``) s'il est du mauvais côté du prix ou plus près que
+``trade_stops_level``, **jamais remplacé en silence**. S'il manque, le worker pose un stop par défaut à
+``default_stop_loss_bps`` du prix de l'ordre (prix limite pour un ``LIMIT``, sinon ask/bid), reculé au besoin pour
+respecter la distance minimale du courtier ; sans ``default_stop_loss_bps`` l'ordre est refusé (``missing_stop_loss``).
+Un stop n'est posé qu'à l'ouverture : un changement ultérieur sur une position déjà à la cible n'est pas appliqué.
 """
 
 from __future__ import annotations
@@ -37,7 +40,7 @@ _FILL_IOC: Final[int] = 2
 
 __all__ = [
     "ZERO", "Mt5OrderPlan", "Mt5Position", "Quote", "RiskLimits", "Skip", "SymbolSpec", "choose_filling",
-    "deviation_points", "lots_for_pct", "make_comment", "mt5_symbol", "plan_order",
+    "default_stop_loss", "deviation_points", "lots_for_pct", "make_comment", "mt5_symbol", "plan_order",
 ]
 
 
@@ -82,6 +85,7 @@ class Mt5OrderPlan:
     comment: str
     target_lots: Decimal
     current_lots: Decimal
+    sl_defaulted: bool = False  # le stop vient du worker, pas du signal
 
     @property
     def size(self) -> Decimal:  # satisfait PlannedOrder (journal)
@@ -134,6 +138,18 @@ def make_comment(signal_id: object) -> str:
     return "n" + hashlib.sha256(f"{signal_id}:DARWINEX".encode()).hexdigest()[:16]
 
 
+def default_stop_loss(is_buy: bool, ref_price: Decimal, quote: Quote, spec: SymbolSpec, bps: Decimal) -> Decimal:
+    """Stop par défaut à ``bps`` du prix de l'ordre, jamais plus près que la distance minimale du courtier.
+
+    Achat : sous le prix, au plus ``bid - distance`` ; vente : au-dessus, au moins ``ask + distance``. L'arrondi au point
+    va toujours dans le sens qui éloigne le stop (plus protecteur, et ne peut pas violer la distance minimale).
+    """
+    distance = spec.stops_level * spec.point
+    if is_buy:
+        return _round_to_digits(min(ref_price * (1 - bps / _BPS), quote.bid - distance), spec, up=False)
+    return _round_to_digits(max(ref_price * (1 + bps / _BPS), quote.ask + distance), spec, up=True)
+
+
 def _round_to_digits(value: Decimal, spec: SymbolSpec, *, up: bool | None = None) -> Decimal:
     quantum = Decimal(1).scaleb(-spec.digits)
     if up is None:
@@ -156,6 +172,7 @@ def plan_order(
     limits: RiskLimits,
     halted: bool,
     max_spread_bps: Decimal,
+    default_stop_loss_bps: Decimal | None = None,
 ) -> Mt5OrderPlan | Skip:
     """Décide de l'ordre (ou de l'absence d'ordre) qui amène la position réelle vers la cible du signal."""
     current = position.volume if position is not None else ZERO
@@ -196,16 +213,6 @@ def plan_order(
     else:
         size = min(size, spec.volume_max)  # une fermeture trop grosse se fait en plusieurs tours
 
-    sl: Decimal | None = None
-    if not reduce_only:
-        raw_sl = signal.metadata.get("stop_loss_price")
-        if raw_sl is None:
-            return Skip("missing_stop_loss")
-        sl = _round_to_digits(Decimal(str(raw_sl)), spec)
-        distance = spec.stops_level * spec.point
-        if (is_buy and sl > quote.bid - distance) or (not is_buy and sl < quote.ask + distance):
-            return Skip("stop_too_close_or_wrong_side")
-
     if signal.order_type is OrderType.LIMIT and not reduce_only:
         limit_price = Decimal(str(signal.metadata["limit_price"]))
         if abs(limit_price - mid) / mid * _BPS > limits.max_limit_deviation_bps:
@@ -214,8 +221,23 @@ def plan_order(
     else:
         price = _round_to_digits(quote.ask if is_buy else quote.bid, spec)
         deviation = deviation_points(price, limits.max_slippage_bps, spec)
+
+    sl: Decimal | None = None
+    sl_defaulted = False
+    if not reduce_only:
+        raw_sl = signal.metadata.get("stop_loss_price")
+        if raw_sl is not None:
+            sl = _round_to_digits(Decimal(str(raw_sl)), spec)
+            distance = spec.stops_level * spec.point
+            if (is_buy and sl > quote.bid - distance) or (not is_buy and sl < quote.ask + distance):
+                return Skip("stop_too_close_or_wrong_side")  # le stop du signal n'est jamais remplacé en silence
+        elif default_stop_loss_bps is None:
+            return Skip("missing_stop_loss")
+        else:
+            sl, sl_defaulted = default_stop_loss(is_buy, price, quote, spec, default_stop_loss_bps), True
     return Mt5OrderPlan(
         symbol=symbol, is_buy=is_buy, volume=size, price=price, deviation_points=deviation, sl=sl, filling=filling,
         reduce_only=reduce_only, position_ticket=position.ticket if (reduce_only and position is not None) else None,
         comment=make_comment(signal.signal_id), target_lots=decision.target_size, current_lots=current,
+        sl_defaulted=sl_defaulted,
     )

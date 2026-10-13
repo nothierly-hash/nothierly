@@ -96,12 +96,11 @@ def test_script_refuses_remote_endpoints_and_weak_or_missing_keys(monkeypatch: p
     assert module.main(["--endpoint", f"tcp://127.0.0.1:{_free_port()}", "--settle", "0"]) == 2
 
 
-def test_a_forex_signal_for_darwinex_needs_a_stop_loss_and_carries_it(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+def test_a_forex_signal_for_darwinex_may_omit_the_stop_loss_and_carries_it_when_given(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(SECRET_ENV_VAR, SECRET)
     module = _load()
     base = ["--symbol", "FOREX_EUR_USD", "--venue", "DARWINEX_ZERO", "--settle", "0.1", "--repeat", "1"]
-    assert module.main(["--endpoint", f"tcp://127.0.0.1:{_free_port()}", *base]) == 2  # le contrat refuse une ouverture sans stop
-    assert "stop_loss_price" in capsys.readouterr().err
+    assert module.main(["--endpoint", f"tcp://127.0.0.1:{_free_port()}", *base]) == 0  # sans stop : accepté, le worker en pose un
     endpoint = f"tcp://127.0.0.1:{_free_port()}"
     ctx, sub = _subscriber(endpoint)
     try:

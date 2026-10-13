@@ -27,6 +27,7 @@ import argparse
 import asyncio
 import logging
 import os
+import sys
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -80,6 +81,7 @@ class DarwinexWorkerConfig(ExposureWorkerConfig):
     db_path: str | Path = "darwinex_worker.sqlite3"
     symbol_suffix: str = ""
     max_spread_bps: Decimal = Decimal("20")  # une ouverture au-delà est refusée (une fermeture ne l'est jamais)
+    default_stop_loss_bps: Decimal | None = Decimal("100")  # stop posé par le worker si le signal n'en porte pas ; None = refuser
 
 
 class DarwinexWorker(ExposureWorkerBase):
@@ -150,13 +152,13 @@ class DarwinexWorker(ExposureWorkerBase):
         plan = plan_order(
             signal, symbol=asset, target_abs_lots=target, equity=snapshot.equity, position=snapshot.positions.get(asset),
             quote=quote, spec=spec, notional_per_lot=notional, others_notional=others, limits=self._cfg.limits,
-            halted=halted, max_spread_bps=self._dwx_cfg.max_spread_bps,
+            halted=halted, max_spread_bps=self._dwx_cfg.max_spread_bps, default_stop_loss_bps=self._dwx_cfg.default_stop_loss_bps,
         )
         if not isinstance(plan, Mt5OrderPlan):
             self._record(signal, asset, f"skipped:{plan.reason}", now, None, "")
             return plan.reason
         if self._cfg.dry_run:
-            self._record(signal, asset, "dry_run", now, plan, "")
+            self._record(signal, asset, "dry_run", now, plan, "stop par défaut" if plan.sl_defaulted else "")
             _log.info("dwx_dry_run %s %s lots=%s px=%s sl=%s close=%s", asset, "BUY" if plan.is_buy else "SELL", plan.volume, plan.price, plan.sl, plan.reduce_only)
             return "dry_run"
         request = Mt5OrderRequest(
@@ -174,7 +176,7 @@ class DarwinexWorker(ExposureWorkerBase):
             _log.exception("dwx_send_failed")
             self._record(signal, asset, "error", now, plan, repr(exc)[:200])
             return "error"
-        self._record(signal, asset, outcome.status, now, plan, outcome.detail)
+        self._record(signal, asset, outcome.status, now, plan, ("stop par défaut ; " if plan.sl_defaulted else "") + outcome.detail)
         return outcome.status
 
     async def emergency_flatten(self, asset: str, *, attempt: int, now_ms: int) -> str:
@@ -226,6 +228,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--symbol-suffix", default="", help="suffixe des symboles chez le courtier (ex. .r)")
     parser.add_argument("--magic", type=int, default=24100601, help="identifiant de stratégie MT5 des ordres")
     parser.add_argument("--max-spread-bps", type=Decimal, default=Decimal("20"))
+    parser.add_argument("--default-stop-loss-bps", type=Decimal, default=Decimal("100"),
+                        help="stop-loss posé par le worker à cet écart du prix d'entrée si le signal n'en porte pas (100 = 1 %% ; 0 = refuser)")
     parser.add_argument("--clear-halt", action="store_true", help="lève les verrous (drawdown et homme mort) puis quitte")
     parser.add_argument("--dead-man-timeout", type=float, default=300.0, metavar="SECONDES",
                         help="ferme toutes les positions puis se verrouille après ce délai sans signal valide (0 = désactivé)")
@@ -238,6 +242,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if args.dead_man_timeout < 0:
         parser.error("--dead-man-timeout doit être >= 0")
+    if args.default_stop_loss_bps < 0:
+        parser.error("--default-stop-loss-bps doit être >= 0")
     if not args.address:
         parser.error("--address ou NOTHIERLY_ZMQ_ADDRESS requis")
     if args.account_login <= 0:
@@ -253,20 +259,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--live sur un compte réel exige l'homme mort : --dead-man-timeout doit être > 0")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     login_env = os.environ.get("MT5_LOGIN")
-    client = MetaTrader5Client(
-        expected_login=args.account_login, magic=args.magic, path=os.environ.get("MT5_PATH"),
-        login=int(login_env) if login_env else None, password=os.environ.get("MT5_PASSWORD"), server=os.environ.get("MT5_SERVER"),
-        allow_real_account=args.allow_real_account,
-    )
     try:
+        client = MetaTrader5Client(
+            expected_login=args.account_login, magic=args.magic, path=os.environ.get("MT5_PATH"),
+            login=int(login_env) if login_env else None, password=os.environ.get("MT5_PASSWORD"), server=os.environ.get("MT5_SERVER"),
+            allow_real_account=args.allow_real_account,
+        )
         info = client.account_check()
-    except Mt5Error as exc:
-        _log.error("dwx_account_refused %s", exc)
+    except Mt5Error as exc:  # mauvais OS, paquet absent, terminal injoignable, mauvais compte : un message, pas une trace
+        _log.error("dwx_cannot_start %s", exc)
+        print(f"Erreur : {exc}", file=sys.stderr)
         return 2
     _log.info("dwx_account login=%s mode=%s margin=%s currency=%s server=%s", info.login, info.trade_mode, info.margin_mode, info.currency, info.server)
     config = DarwinexWorkerConfig(
         address=args.address, secret_key=load_secret_from_env(), db_path=args.db, dry_run=not args.live,
         symbol_suffix=args.symbol_suffix, max_spread_bps=args.max_spread_bps,
+        default_stop_loss_bps=args.default_stop_loss_bps or None,
         dead_man_timeout_s=args.dead_man_timeout or None, curve=curve,
     )
     worker = DarwinexWorker(config, client)
