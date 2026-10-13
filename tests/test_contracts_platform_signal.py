@@ -42,7 +42,7 @@ def _hyperliquid(**overrides: Any) -> PlatformSignal:
 
 def _darwinex(**overrides: Any) -> PlatformSignal:
     base: dict[str, Any] = dict(
-        target_venue=TargetVenue.DARWINEX,
+        target_venue=TargetVenue.DARWINEX_ZERO,
         asset_class=AssetClass.FOREX,
         symbol="FOREX_EUR_USD",
         direction=SignalDirection.SHORT,
@@ -56,7 +56,7 @@ def _darwinex(**overrides: Any) -> PlatformSignal:
 
 def _numerai(**overrides: Any) -> PlatformSignal:
     base: dict[str, Any] = dict(
-        target_venue=TargetVenue.NUMERAI,
+        target_venue=TargetVenue.NUMERAI_SIGNALS,
         asset_class=AssetClass.EQUITY,
         symbol="EQUITY_US_AAPL",
         direction=SignalDirection.LONG,
@@ -73,7 +73,7 @@ def _numerai(**overrides: Any) -> PlatformSignal:
 
 def test_valid_signals_for_each_venue_are_accepted() -> None:
     assert _hyperliquid().target_venue is TargetVenue.HYPERLIQUID
-    assert _darwinex().target_venue is TargetVenue.DARWINEX
+    assert _darwinex().target_venue is TargetVenue.DARWINEX_ZERO
     assert _numerai().order_type is OrderType.PREDICTION_ONLY
 
 
@@ -327,4 +327,97 @@ def test_json_schema_pins_the_documented_bounds_and_enums() -> None:
     assert "confidence_score" not in json_schema()["required"]
     assert props["position_size_pct"]["minimum"] == 0.0 and props["position_size_pct"]["maximum"] == 100.0
     assert json_schema()["additionalProperties"] is False
-    assert json_schema()["$defs"]["TargetVenue"]["enum"] == ["NUMERAI", "HYPERLIQUID", "DARWINEX", "ALL"]
+    assert json_schema()["$defs"]["TargetVenue"]["enum"] == ["HYPERLIQUID", "BINANCE", "BYBIT", "ZIGNALY", "ENZYME", "NUMERAI_SIGNALS", "AXI_SELECT", "DARWINEX_ZERO", "ALL"]
+
+
+# --- Les 8 plateformes ------------------------------------------------------------------------
+
+_CRYPTO_VENUES = [TargetVenue.HYPERLIQUID, TargetVenue.BINANCE, TargetVenue.BYBIT, TargetVenue.ZIGNALY, TargetVenue.ENZYME]
+_FOREX_VENUES = [TargetVenue.AXI_SELECT, TargetVenue.DARWINEX_ZERO]
+_NON_NUMERAI = _CRYPTO_VENUES + _FOREX_VENUES
+
+
+def _for_venue(venue: TargetVenue, **overrides: Any) -> PlatformSignal:
+    """Un signal valide pour ``venue`` (classe d'actif, ordre et métadonnées propres à sa plateforme)."""
+    if venue is TargetVenue.NUMERAI_SIGNALS:
+        return _numerai(**overrides)
+    if venue in _FOREX_VENUES:
+        return _darwinex(target_venue=venue, **overrides)
+    return _hyperliquid(target_venue=venue, **overrides)
+
+
+def test_target_venue_is_exactly_the_eight_platforms_plus_all() -> None:
+    assert {v.value for v in TargetVenue} == {
+        "HYPERLIQUID", "BINANCE", "BYBIT", "ZIGNALY", "ENZYME", "NUMERAI_SIGNALS", "AXI_SELECT", "DARWINEX_ZERO", "ALL",
+    }
+
+
+def test_every_platform_belongs_to_exactly_one_asset_class() -> None:
+    from contracts.platform_signal import venues_for
+
+    assert venues_for(AssetClass.CRYPTO) == frozenset(_CRYPTO_VENUES)
+    assert venues_for(AssetClass.FOREX) == frozenset(_FOREX_VENUES)
+    assert venues_for(AssetClass.EQUITY) == frozenset({TargetVenue.NUMERAI_SIGNALS})
+    all_venues = set().union(*(venues_for(c) for c in AssetClass))
+    assert all_venues == set(TargetVenue) - {TargetVenue.ALL}
+
+
+@pytest.mark.parametrize("venue", [v for v in TargetVenue if v is not TargetVenue.ALL])
+def test_a_valid_signal_exists_for_every_platform(venue: TargetVenue) -> None:
+    assert _for_venue(venue).target_venue is venue
+
+
+@pytest.mark.parametrize(
+    ("venue", "wrong_class", "symbol"),
+    [
+        (TargetVenue.BINANCE, AssetClass.EQUITY, "EQUITY_US_AAPL"),
+        (TargetVenue.BYBIT, AssetClass.FOREX, "FOREX_EUR_USD"),
+        (TargetVenue.ZIGNALY, AssetClass.FOREX, "FOREX_EUR_USD"),
+        (TargetVenue.ENZYME, AssetClass.EQUITY, "EQUITY_US_AAPL"),
+        (TargetVenue.AXI_SELECT, AssetClass.CRYPTO, "CRYPTO_BTC_USD"),
+        (TargetVenue.DARWINEX_ZERO, AssetClass.CRYPTO, "CRYPTO_BTC_USD"),
+        (TargetVenue.NUMERAI_SIGNALS, AssetClass.FOREX, "FOREX_EUR_USD"),
+    ],
+)
+def test_each_platform_refuses_the_wrong_asset_class(venue: TargetVenue, wrong_class: AssetClass, symbol: str) -> None:
+    with pytest.raises(ValidationError, match="ne traite pas la classe"):
+        PlatformSignal(
+            target_venue=venue, asset_class=wrong_class, symbol=symbol, direction=SignalDirection.FLAT,
+            position_size_pct=0.0, order_type=OrderType.PREDICTION_ONLY, confidence_score=0.5,
+        )
+
+
+@pytest.mark.parametrize("venue", _NON_NUMERAI)
+def test_confidence_score_is_forbidden_on_every_platform_except_numerai(venue: TargetVenue) -> None:
+    assert _for_venue(venue).confidence_score is None
+    with pytest.raises(ValidationError, match="confidence_score est interdit"):
+        _for_venue(venue, confidence_score=0.9)
+
+
+def test_confidence_score_is_required_only_for_numerai_signals() -> None:
+    assert _numerai().confidence_score == 0.7
+    with pytest.raises(ValidationError, match="Numerai exige confidence_score"):
+        _numerai(confidence_score=None)
+
+
+def test_all_expands_to_every_platform_of_the_asset_class() -> None:
+    crypto = _hyperliquid(target_venue=TargetVenue.ALL)
+    assert {v for v in TargetVenue if v is not TargetVenue.ALL and crypto.targets(v)} == set(_CRYPTO_VENUES)
+    forex = _darwinex(target_venue=TargetVenue.ALL)
+    assert {v for v in TargetVenue if v is not TargetVenue.ALL and forex.targets(v)} == set(_FOREX_VENUES)
+    equity = _numerai(target_venue=TargetVenue.ALL)
+    assert {v for v in TargetVenue if v is not TargetVenue.ALL and equity.targets(v)} == {TargetVenue.NUMERAI_SIGNALS}
+
+
+def test_a_targeted_platform_is_the_only_one_that_matches() -> None:
+    binance = _hyperliquid(target_venue=TargetVenue.BINANCE)
+    assert binance.targets(TargetVenue.BINANCE)
+    assert not any(binance.targets(v) for v in TargetVenue if v is not TargetVenue.BINANCE)
+
+
+def test_stop_loss_is_required_for_darwinex_zero_but_no_rule_is_invented_for_axi_select() -> None:
+    with pytest.raises(ValidationError, match="stop_loss_price"):
+        _darwinex(target_venue=TargetVenue.DARWINEX_ZERO, metadata={})
+    assert _darwinex(target_venue=TargetVenue.AXI_SELECT, metadata={}).target_venue is TargetVenue.AXI_SELECT
+    with pytest.raises(ValidationError, match="stop_loss_price"):  # ALL couvre aussi Darwinex Zero
+        _darwinex(target_venue=TargetVenue.ALL, metadata={})

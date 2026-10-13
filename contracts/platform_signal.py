@@ -39,9 +39,19 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class TargetVenue(str, Enum):
-    NUMERAI = "NUMERAI"
+    """Les 8 plateformes cibles, par pôle, plus ``ALL``. Pas de 9e : ajouter une plateforme est un choix explicite."""
+
+    # Pôle crypto (temps réel)
     HYPERLIQUID = "HYPERLIQUID"
-    DARWINEX = "DARWINEX"
+    BINANCE = "BINANCE"
+    BYBIT = "BYBIT"
+    ZIGNALY = "ZIGNALY"
+    ENZYME = "ENZYME"
+    # Pôle actions (batch)
+    NUMERAI_SIGNALS = "NUMERAI_SIGNALS"
+    # Pôle forex / CFD (pont MT4/MT5)
+    AXI_SELECT = "AXI_SELECT"
+    DARWINEX_ZERO = "DARWINEX_ZERO"
     ALL = "ALL"
 
 
@@ -63,14 +73,23 @@ class OrderType(str, Enum):
     PREDICTION_ONLY = "PREDICTION_ONLY"
 
 
-# Plateforme qui traite chaque classe d'actif dans cette architecture. Une seule par classe :
-# c'est ce qui donne un sens à ``target_venue=ALL`` (le signal va à la plateforme de sa classe).
-# À mettre à jour si une classe d'actif gagne une deuxième plateforme.
-_VENUE_BY_ASSET_CLASS: Final[dict[AssetClass, TargetVenue]] = {
-    AssetClass.EQUITY: TargetVenue.NUMERAI,
-    AssetClass.CRYPTO: TargetVenue.HYPERLIQUID,
-    AssetClass.FOREX: TargetVenue.DARWINEX,
+# Classe d'actif que traite chaque plateforme (une seule). ``target_venue=ALL`` signifie « toutes les
+# plateformes de la classe d'actif du signal » : 5 pour CRYPTO, 2 pour FOREX, 1 pour EQUITY.
+_ASSET_CLASS_BY_VENUE: Final[dict[TargetVenue, AssetClass]] = {
+    TargetVenue.HYPERLIQUID: AssetClass.CRYPTO,
+    TargetVenue.BINANCE: AssetClass.CRYPTO,
+    TargetVenue.BYBIT: AssetClass.CRYPTO,
+    TargetVenue.ZIGNALY: AssetClass.CRYPTO,
+    TargetVenue.ENZYME: AssetClass.CRYPTO,
+    TargetVenue.NUMERAI_SIGNALS: AssetClass.EQUITY,
+    TargetVenue.AXI_SELECT: AssetClass.FOREX,
+    TargetVenue.DARWINEX_ZERO: AssetClass.FOREX,
 }
+
+
+def venues_for(asset_class: AssetClass) -> frozenset[TargetVenue]:
+    """Plateformes qui traitent ``asset_class`` (ce que couvre ``target_venue=ALL``)."""
+    return frozenset(v for v, cls in _ASSET_CLASS_BY_VENUE.items() if cls is asset_class)
 
 # EQUITY_US_AAPL, CRYPTO_BTC_USD, FOREX_EUR_USD : préfixe de classe, puis au moins un segment.
 _SYMBOL_PATTERN: Final[str] = r"^[A-Z0-9]+(?:_[A-Z0-9]+)+$"
@@ -97,20 +116,21 @@ class PlatformSignal(BaseModel):
     Attributes:
         signal_id: UUID unique du signal (sert de base à l'idempotence côté worker).
         timestamp_ms: Instant d'émission, en millisecondes epoch (horloge murale).
-        target_venue: Plateforme visée, ou ``ALL`` (= la plateforme de la classe d'actif).
+        target_venue: Plateforme visée, ou ``ALL`` (= toutes les plateformes de la classe d'actif).
         asset_class: ``EQUITY``, ``CRYPTO`` ou ``FOREX``.
         symbol: Ticker interne générique, préfixé par la classe d'actif (ex. ``CRYPTO_BTC_USD``).
             Le mapping vers le ticker de la plateforme est fait par chaque worker.
         direction: ``LONG``, ``SHORT`` ou ``FLAT`` (cible : pas d'exposition).
-        confidence_score: Confiance de l'alpha, dans ``[0, 1]``. **Obligatoire** pour Numerai,
-            **interdit** (doit rester ``None``) pour Hyperliquid et Darwinex.
+        confidence_score: Confiance de l'alpha, dans ``[0, 1]``. **Obligatoire** pour
+            ``NUMERAI_SIGNALS``, **interdit** (doit rester ``None``) pour toutes les autres
+            plateformes (crypto et forex) : leur flux d'ordres est visible.
         position_size_pct: Exposition **cible**, en % du capital, dans ``[0, 100]`` (pas un ordre à
             ajouter : un worker compare la cible à sa position réelle et n'envoie que l'écart, donc
             republier le même signal ne change rien). Doit valoir 0 pour ``FLAT`` et dépasser 0 pour
             un ordre ``LONG``/``SHORT`` exécutable.
         order_type: ``MARKET``, ``LIMIT`` ou ``PREDICTION_ONLY`` (aucun ordre : score seul).
         metadata: Dictionnaire libre. Clés exigées selon le cas : ``limit_price`` (``LIMIT``),
-            ``stop_loss_price`` (Darwinex, ordre exécutable).
+            ``stop_loss_price`` (``DARWINEX_ZERO``, ordre exécutable).
         ttl_ms: Durée de validité optionnelle. ``None`` = pas d'expiration (cas Numerai, qui
             n'est pas temps réel). Un worker temps réel rejette un signal expiré (``is_expired``).
     """
@@ -136,9 +156,9 @@ class PlatformSignal(BaseModel):
         self._check_confidence_disclosure(venues)
         self._check_sizing()
         self._check_limit_price()
-        if TargetVenue.NUMERAI in venues and self.order_type is not OrderType.PREDICTION_ONLY:
+        if TargetVenue.NUMERAI_SIGNALS in venues and self.order_type is not OrderType.PREDICTION_ONLY:
             raise ValueError("Numerai n'accepte que des signaux de type PREDICTION_ONLY.")
-        if TargetVenue.DARWINEX in venues and self.order_type is not OrderType.PREDICTION_ONLY:
+        if TargetVenue.DARWINEX_ZERO in venues and self.order_type is not OrderType.PREDICTION_ONLY:
             if "stop_loss_price" not in self.metadata:
                 raise ValueError("Les workers Darwinex exigent 'stop_loss_price' dans metadata (gestion VaR).")
         self._check_stop_loss_side()
@@ -150,18 +170,21 @@ class PlatformSignal(BaseModel):
                 f"symbol {self.symbol!r} doit commencer par '{self.asset_class.value}_' (asset_class={self.asset_class.value})."
             )
 
-    def _effective_venues(self) -> set[TargetVenue]:
+    def _effective_venues(self) -> frozenset[TargetVenue]:
         """Plateformes réellement concernées ; refuse une plateforme qui ne traite pas la classe."""
-        owner = _VENUE_BY_ASSET_CLASS[self.asset_class]
-        if self.target_venue is not TargetVenue.ALL and self.target_venue is not owner:
+        if self.target_venue is TargetVenue.ALL:
+            return venues_for(self.asset_class)
+        expected = _ASSET_CLASS_BY_VENUE[self.target_venue]
+        if expected is not self.asset_class:
             raise ValueError(
-                f"{self.target_venue.value} ne traite pas la classe {self.asset_class.value} (plateforme attendue : {owner.value})."
+                f"{self.target_venue.value} ne traite pas la classe {self.asset_class.value} "
+                f"(classe de cette plateforme : {expected.value})."
             )
-        return {owner}
+        return frozenset({self.target_venue})
 
-    def _check_confidence_disclosure(self, venues: set[TargetVenue]) -> None:
-        """``confidence_score`` : exigé pour Numerai, interdit pour les plateformes à flux visible."""
-        if TargetVenue.NUMERAI in venues:
+    def _check_confidence_disclosure(self, venues: frozenset[TargetVenue]) -> None:
+        """``confidence_score`` : exigé pour Numerai, interdit pour toutes les plateformes à flux visible."""
+        if TargetVenue.NUMERAI_SIGNALS in venues:
             if self.confidence_score is None:
                 raise ValueError("Numerai exige confidence_score (il devient le score soumis).")
         elif self.confidence_score is not None:
@@ -196,10 +219,9 @@ class PlatformSignal(BaseModel):
         if self.direction is SignalDirection.SHORT and stop <= limit:
             raise ValueError("SHORT : stop_loss_price doit être supérieur à limit_price.")
 
-    @property
-    def routed_venue(self) -> TargetVenue:
-        """Plateforme qui doit traiter ce signal (résout ``ALL`` par la classe d'actif)."""
-        return _VENUE_BY_ASSET_CLASS[self.asset_class]
+    def targets(self, venue: TargetVenue) -> bool:
+        """``True`` si ``venue`` doit traiter ce signal (``ALL`` couvre toutes les plateformes de la classe)."""
+        return venue in self._effective_venues()
 
     def is_expired(self, now_ms: int | None = None) -> bool:
         """``True`` si ``ttl_ms`` est défini et dépassé. Sans ``ttl_ms``, jamais expiré."""

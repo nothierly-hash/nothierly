@@ -58,7 +58,7 @@ def _crypto(**overrides: Any) -> PlatformSignal:
 
 def _forex(**overrides: Any) -> PlatformSignal:
     base: dict[str, Any] = dict(
-        target_venue=TargetVenue.DARWINEX,
+        target_venue=TargetVenue.DARWINEX_ZERO,
         asset_class=AssetClass.FOREX,
         symbol="FOREX_EUR_USD",
         direction=SignalDirection.SHORT,
@@ -203,14 +203,14 @@ def test_a_validly_signed_but_incoherent_payload_is_rejected() -> None:
 
 def test_a_valid_signal_replayed_to_the_wrong_venue_worker_is_refused() -> None:
     envelope = build_envelope(_crypto(), SECRET)
-    assert open_envelope(envelope, SECRET, venue=TargetVenue.DARWINEX).reject_reason == "wrong_venue"
-    assert open_envelope(envelope, SECRET, venue=TargetVenue.NUMERAI).reject_reason == "wrong_venue"
+    assert open_envelope(envelope, SECRET, venue=TargetVenue.DARWINEX_ZERO).reject_reason == "wrong_venue"
+    assert open_envelope(envelope, SECRET, venue=TargetVenue.NUMERAI_SIGNALS).reject_reason == "wrong_venue"
 
 
 def test_target_all_is_routed_by_asset_class() -> None:
     envelope = build_envelope(_crypto(target_venue=TargetVenue.ALL), SECRET)
     assert open_envelope(envelope, SECRET, venue=TargetVenue.HYPERLIQUID).accepted
-    assert open_envelope(envelope, SECRET, venue=TargetVenue.DARWINEX).reject_reason == "wrong_venue"
+    assert open_envelope(envelope, SECRET, venue=TargetVenue.DARWINEX_ZERO).reject_reason == "wrong_venue"
 
 
 def test_worker_venue_cannot_be_all() -> None:
@@ -373,3 +373,17 @@ def test_from_env_builds_a_working_publisher(monkeypatch: pytest.MonkeyPatch, zm
         sub = _subscribe(zmq_ctx, pub.endpoint)
         frames = _receive_after_publishing(pub, sub, _crypto())
     assert verify_signature(frames[1], SECRET) is True
+
+
+# --- Aiguillage des 8 plateformes ------------------------------------------------------------
+
+
+def test_each_crypto_worker_accepts_all_crypto_but_a_targeted_signal_only_its_own() -> None:
+    crypto_venues = [TargetVenue.HYPERLIQUID, TargetVenue.BINANCE, TargetVenue.BYBIT, TargetVenue.ZIGNALY, TargetVenue.ENZYME]
+    fan_out = build_envelope(_crypto(target_venue=TargetVenue.ALL), SECRET)
+    binance_only = build_envelope(_crypto(target_venue=TargetVenue.BINANCE), SECRET)
+    for venue in crypto_venues:
+        assert open_envelope(fan_out, SECRET, venue=venue).accepted
+        assert open_envelope(binance_only, SECRET, venue=venue).accepted is (venue is TargetVenue.BINANCE)
+    assert open_envelope(fan_out, SECRET, venue=TargetVenue.AXI_SELECT).reject_reason == "wrong_venue"
+    assert open_envelope(fan_out, SECRET, venue=TargetVenue.NUMERAI_SIGNALS).reject_reason == "wrong_venue"

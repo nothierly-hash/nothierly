@@ -353,7 +353,7 @@ def test_only_valid_hyperliquid_signals_are_queued(tmp_path: Path) -> None:
     assert w.handle_frames(_frames(_signal(target_venue=TargetVenue.ALL, symbol="CRYPTO_ETH_USD")), now_ms=now) == "queued"
     assert w.handle_frames(_frames(_signal(), secret=OTHER_SECRET), now_ms=now) == "bad_signature"
     forex = PlatformSignal(
-        target_venue=TargetVenue.DARWINEX, asset_class=AssetClass.FOREX, symbol="FOREX_EUR_USD",
+        target_venue=TargetVenue.DARWINEX_ZERO, asset_class=AssetClass.FOREX, symbol="FOREX_EUR_USD",
         direction=SignalDirection.SHORT, position_size_pct=2.0, order_type=OrderType.MARKET,
         metadata={"stop_loss_price": 1.12}, timestamp_ms=T0,
     )

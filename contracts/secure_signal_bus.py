@@ -20,7 +20,7 @@ Ce que le HMAC ne fait pas à lui seul :
 - **Confidentialité.** Le payload n'est pas chiffré. Un lecteur du réseau voit les signaux ; il ne
   peut pas en forger. Chiffrer le canal (ZMQ CURVE) est une étape distincte, non couverte ici.
 - **Aiguillage.** La signature ne couvre pas le topic (l'enveloppe est celle de la spécification).
-  Le worker contrôle donc ``signal.routed_venue`` : un signal Hyperliquid rejoué vers le worker
+  Le worker contrôle donc ``signal.targets(venue)`` : un signal Hyperliquid rejoué vers le worker
   Darwinex est refusé même avec une signature valide.
 
 Frontière d'IP : ce module n'importe que la stdlib, ``zmq`` et ``contracts.platform_signal``.
@@ -194,8 +194,8 @@ def open_envelope(
     except ValidationError:
         # Signature valide mais contenu incohérent : le moteur a signé un message qu'il n'aurait pas dû.
         return _reject("invalid_payload")
-    if signal.routed_venue is not venue:
-        return _reject("wrong_venue", signal_id=signal.signal_id, expected=venue.value, got=signal.routed_venue.value)
+    if not signal.targets(venue):
+        return _reject("wrong_venue", signal_id=signal.signal_id, expected=venue.value, got=signal.target_venue.value)
     now = int(time.time() * 1000) if now_ms is None else now_ms
     if signal.is_expired(now):
         return _reject("expired", signal_id=signal.signal_id)

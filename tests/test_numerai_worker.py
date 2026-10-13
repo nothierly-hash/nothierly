@@ -51,7 +51,7 @@ def _ms(dt: datetime) -> int:
 
 def _numerai_signal(symbol: str = "EQUITY_US_AAPL", **overrides: Any) -> PlatformSignal:
     base: dict[str, Any] = dict(
-        target_venue=TargetVenue.NUMERAI,
+        target_venue=TargetVenue.NUMERAI_SIGNALS,
         asset_class=AssetClass.EQUITY,
         symbol=symbol,
         direction=SignalDirection.LONG,

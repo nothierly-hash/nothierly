@@ -169,7 +169,7 @@ class NumeraiWorker:
         verdict = open_envelope(
             frames[1],
             self._cfg.secret_key,
-            venue=TargetVenue.NUMERAI,
+            venue=TargetVenue.NUMERAI_SIGNALS,
             max_age_ms=self._cfg.max_age_ms,
             replay_guard=self._replay_guard,
             now_ms=now,
