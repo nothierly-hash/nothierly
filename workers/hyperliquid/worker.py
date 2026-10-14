@@ -34,6 +34,7 @@ from workers.common.base import (
     ExposureWorkerBase,
     ExposureWorkerConfig,
     clear_execution_halt,
+    dead_man_timeout_problem,
 )
 from workers.common.exposure import emergency_slippage_bps
 from workers.common.fills_db import FillsDatabase
@@ -203,6 +204,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         return
     if args.dead_man_timeout < 0:
         parser.error("--dead-man-timeout doit être >= 0")
+    if (timeout_problem := dead_man_timeout_problem(args.dead_man_timeout)) is not None:
+        parser.error(timeout_problem)
     if not args.address:
         parser.error("--address ou NOTHIERLY_ZMQ_ADDRESS requis")
     try:

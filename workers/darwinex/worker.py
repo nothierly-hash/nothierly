@@ -39,7 +39,7 @@ from contracts.curve_transport import CurveClientConfig, CurveConfigError, trans
 from contracts.platform_signal import PlatformSignal, TargetVenue
 from contracts.secure_signal_bus import load_secret_from_env
 from workers.common.alerts import AlertConfigError, WebhookAlerter
-from workers.common.base import EmergencyOrder, ExposureWorkerBase, ExposureWorkerConfig, clear_execution_halt
+from workers.common.base import EmergencyOrder, ExposureWorkerBase, ExposureWorkerConfig, clear_execution_halt, dead_man_timeout_problem
 from workers.common.exposure import emergency_slippage_bps
 from workers.common.logging_setup import configure_logging
 from workers.common.state import ExecutionState
@@ -245,6 +245,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if args.dead_man_timeout < 0:
         parser.error("--dead-man-timeout doit être >= 0")
+    if (timeout_problem := dead_man_timeout_problem(args.dead_man_timeout)) is not None:
+        parser.error(timeout_problem)
     if args.default_stop_loss_bps < 0:
         parser.error("--default-stop-loss-bps doit être >= 0")
     if not args.address:

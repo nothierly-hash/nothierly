@@ -49,7 +49,7 @@ from workers.binance.client import (
 )
 from workers.binance.planner import ZERO, OrderPlan, binance_symbol, plan_order, round_price, size_for_pct_step
 from workers.common.alerts import AlertConfigError, WebhookAlerter
-from workers.common.base import EmergencyOrder, ExposureWorkerBase, ExposureWorkerConfig, clear_execution_halt
+from workers.common.base import EmergencyOrder, ExposureWorkerBase, ExposureWorkerConfig, clear_execution_halt, dead_man_timeout_problem
 from workers.common.exposure import emergency_slippage_bps
 from workers.common.fills_db import FillsDatabase
 from workers.common.logging_setup import configure_logging
@@ -236,6 +236,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if args.dead_man_timeout < 0:
         parser.error("--dead-man-timeout doit être >= 0")
+    if (timeout_problem := dead_man_timeout_problem(args.dead_man_timeout)) is not None:
+        parser.error(timeout_problem)
     if not args.address:
         parser.error("--address ou NOTHIERLY_ZMQ_ADDRESS requis")
     try:

@@ -96,6 +96,28 @@ _LAST_SIGNAL_PREFIX = "last_signal:"
 _DM_TRIPPED = "dead_man_tripped"
 _DM_PENDING = "dead_man_pending"
 _FLAT_RECHECK_MIN_S = 60.0
+# Le pont republie la cible toutes les 10 s (``refresh_s``) : un homme mort plus court que 3 de ces battements se déclencherait sur un simple
+# retard. Et le pont se tait légitimement jusqu'à ``engine_grace_s`` (30 s) quand le moteur est lent : sous 2 fois cela on avertit.
+MIN_DEAD_MAN_TIMEOUT_S = 30.0
+RECOMMENDED_DEAD_MAN_TIMEOUT_S = 60.0
+
+
+def dead_man_timeout_problem(timeout_s: float) -> str | None:
+    """Message d'erreur si ``--dead-man-timeout`` est dans la zone interdite (0 < t < 30 s), sinon ``None`` ; avertit entre 30 et 60 s.
+
+    ``0`` (désactivé) n'est pas jugé ici : la CLI l'interdit déjà en réel sur mainnet.
+    """
+    if 0 < timeout_s < MIN_DEAD_MAN_TIMEOUT_S:
+        return (
+            f"--dead-man-timeout {timeout_s:g}s est inférieur à {MIN_DEAD_MAN_TIMEOUT_S:g}s (3 battements de republication du pont, 10 s chacun) : "
+            "le worker se verrouillerait (HALTED) sur un simple retard du pont"
+        )
+    if 0 < timeout_s < RECOMMENDED_DEAD_MAN_TIMEOUT_S:
+        _log.warning(
+            "dead_man_timeout_short timeout_s=%g : le pont se tait jusqu'à 30 s quand le moteur est lent (engine_grace_s) ; "
+            "au moins %gs est recommandé pour qu'un démarrage lent ne verrouille pas le worker", timeout_s, RECOMMENDED_DEAD_MAN_TIMEOUT_S,
+        )
+    return None
 # Résultats d'``emergency_flatten`` qui terminent le travail sur un actif (les autres sont réessayés).
 _FLATTEN_DONE = frozenset({"no_position", "dry_run"})
 # Codes d'``execute_signal`` qui signalent une panne côté exchange (lecture ou envoi), par opposition à un rejet ordinaire.
@@ -199,6 +221,7 @@ class ExposureWorkerBase(ABC):
         self._started_ms = int(time.time() * 1000)
         self._flat_until_ms: dict[str, int] = {}
         self._flatten_attempts: dict[str, int] = {}
+        self._grace_warned: set[str] = set()
         self._streaks = {name: _FailureStreak(config.api_failure_threshold) for name in _STREAK_MESSAGES}
         for signal_id in self._state.recent_signal_ids(self._started_ms - _REPLAY_WINDOW_MS):
             self._replay_guard.check_and_add(uuid.UUID(signal_id))  # un redémarrage n'ouvre pas de fenêtre de rejeu
@@ -406,6 +429,15 @@ class ExposureWorkerBase(ABC):
         grace_until = self._started_ms + int(self._cfg.dead_man_startup_grace_s * 1000)
         expired = []
         for asset, last in self._tracked_assets().items():
+            if now_ms < grace_until and now_ms - last > timeout_ms:
+                if asset not in self._grace_warned:  # le déclenchement est suspendu, pas oublié : on le dit une fois, avec de quoi diagnostiquer
+                    self._grace_warned.add(asset)
+                    _log.warning(
+                        "%s_dead_man_startup_grace asset=%s silent_for_s=%.0f timeout_s=%s : déclenchement suspendu jusqu'à la fin du délai de grâce "
+                        "(%.0fs après le démarrage) ; un signal valide du pont d'ici là réarme l'horloge",
+                        self._tag, asset, (now_ms - last) / 1000, self._cfg.dead_man_timeout_s, self._cfg.dead_man_startup_grace_s,
+                    )
+                continue
             if now_ms < grace_until or now_ms - last <= timeout_ms:
                 continue  # dans le délai de grâce du démarrage, ou signal assez récent (le dépassement est strict)
             if self._flat_until_ms.get(asset, 0) > now_ms:

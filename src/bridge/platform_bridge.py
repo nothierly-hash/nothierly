@@ -80,6 +80,8 @@ _log = logging.getLogger(__name__)
 ACTIVE_POSITIONS_KEY: Final[str] = "NOTHIERLY_ACTIVE_POSITIONS"
 EQUITY_CURVE_KEY: Final[str] = "NOTHIERLY_EQUITY_CURVE"
 ENGINE_HEARTBEAT_KEY: Final[str] = "heartbeat:execution-agent"
+ENGINE_STATE_KEY: Final[str] = "engine:state"  # écrit par core.heartbeat avec le heartbeat
+STATE_STARTING: Final[str] = "STARTING"
 _QUOTES: Final[frozenset[str]] = frozenset({"USDT", "USD"})
 _MIN_PCT: Final[Decimal] = Decimal("0.01")
 
@@ -98,6 +100,7 @@ class EngineView:
     equity: Decimal | None  # equity du moteur en USD, ou None si inconnue
     engine_alive: bool  # heartbeat de l'ExecutionAgent présent
     system_safe: bool  # kill switch global : False = halte
+    engine_state: str | None = None  # « STARTING » (modèles en chargement) ou « ACTIVE » ; None = clé absente (ancien moteur) : traité comme prêt
 
 
 class EngineStateReader(Protocol):
@@ -122,6 +125,9 @@ class BridgeConfig:
     min_hold_s: float = 60.0  # durée minimale entre l'ouverture publiée d'une position et sa fermeture/inversion ; 0 = aucune
     refresh_s: float = 10.0  # republication périodique : les workers se recalent, un worker tardif rattrape
     engine_grace_s: float = 30.0
+    # Démarrage à froid : tant que le moteur n'a jamais été vu prêt (ou qu'il annonce STARTING), son silence est un AVERTISSEMENT, pas un
+    # ordre FLAT ni une alerte. Borné : passé ce délai le silence redevient une panne (délai ``engine_grace_s`` ensuite).
+    engine_startup_grace_s: float = 180.0
     ttl_ms: int = 10_000
     poll_s: float = 2.0
     publish_failure_threshold: int = 3  # publications refusées d'affilée avant d'alerter
@@ -203,6 +209,10 @@ class PlatformBridge:
         self._clock = clock
         self._last: dict[str, _Published] = {}
         self._unhealthy_since: float | None = None
+        self._started_at = clock()
+        self._engine_ready_seen = False  # le moteur a-t-il déjà été vu vivant ET prêt (pas STARTING) depuis le démarrage du pont ?
+        self._starting_since: float | None = None
+        self._last_starting_log = float("-inf")
         self._warned: set[str] = set()
         self._held: set[str] = set()  # instruments dont une fermeture/inversion est en attente du délai minimal
         self._symbols = {i: to_internal_symbol(i, self._cfg.symbol_overrides) for i in self._cfg.instruments}
@@ -299,6 +309,24 @@ class PlatformBridge:
         _log.info("bridge_signal instrument=%s %s %s%% venue=%s reason=%s", instrument, direction.value, pct, self._cfg.venue.value, reason)
         return f"{instrument}:{direction.value}:{pct}:{reason}"
 
+    def _starting_within_grace(self, view: EngineView | None, now: float) -> bool:
+        """``True`` si le moteur est en démarrage et que le délai de grâce de démarrage n'est pas écoulé.
+
+        Deux cas : le moteur annonce ``STARTING`` (``core.heartbeat``, écrit avant le chargement des modèles), ou il n'a JAMAIS été vu prêt depuis
+        le démarrage du pont et son heartbeat n'existe pas encore (lancement à froid : le pont part avant le moteur). Un Redis illisible
+        n'entre pas ici : c'est une panne, pas un démarrage.
+        """
+        grace = self._cfg.engine_startup_grace_s
+        if view is None or grace <= 0:
+            return False
+        if view.engine_alive and view.engine_state == STATE_STARTING:
+            if self._starting_since is None:
+                self._starting_since = now
+            return now - self._starting_since < grace
+        if not view.engine_alive and not self._engine_ready_seen:
+            return now - self._started_at < grace
+        return False
+
     async def step(self) -> list[str]:
         """Un cycle : lit le moteur, décide, publie ce qui doit l'être. Renvoie les publications faites (« instrument:dir:pct:raison »)."""
         now = self._clock()
@@ -309,9 +337,13 @@ class PlatformBridge:
             _log.warning("bridge_engine_state_unreadable %s: %s", type(exc).__name__, exc)
             view = None
 
-        healthy = view is not None and view.engine_alive
+        healthy = view is not None and view.engine_alive and view.engine_state != STATE_STARTING
         if healthy:
-            self._unhealthy_since = None
+            self._engine_ready_seen = True
+            self._starting_since = None
+        starting = self._starting_within_grace(view, now)
+        if healthy or starting:
+            self._unhealthy_since = None  # un moteur qui s'initialise n'est pas un moteur muet : le compteur de silence ne tourne pas
         elif self._unhealthy_since is None:
             self._unhealthy_since = now
         down_for = 0.0 if self._unhealthy_since is None else now - self._unhealthy_since
@@ -320,6 +352,14 @@ class PlatformBridge:
         if view is not None and not view.system_safe and self._cfg.flatten_on_halt:
             flatten_reason = "kill_switch"
             self._begin("kill_switch", f"KILL SWITCH du moteur actif : le pont publie FLAT sur tous les instruments. Tenu avant : {self._held_exposure()}.")
+        elif starting:
+            if now - self._last_starting_log >= 15.0:
+                self._last_starting_log = now
+                _log.warning(
+                    "bridge_engine_starting : moteur en initialisation (état %s), rien n'est publié ni aucune alerte envoyée ; borne %.0fs",
+                    "STARTING" if view is not None and view.engine_state == STATE_STARTING else "jamais vu", self._cfg.engine_startup_grace_s,
+                )
+            return []  # la kill switch a déjà été traitée au-dessus : seul le silence d'un moteur qui démarre est toléré
         elif not healthy and down_for >= self._cfg.engine_grace_s and self._cfg.flatten_when_engine_down:
             flatten_reason = "engine_down"
             self._begin(
@@ -387,14 +427,26 @@ class RedisEngineReader:
         self._system_safe = system_safe  # coroutine ``core.security.is_system_safe``
 
     async def read(self) -> EngineView:
-        raw_positions, raw_equity, heartbeat = await asyncio.gather(
+        raw_positions, raw_equity, heartbeat, raw_state = await asyncio.gather(
             self._client.execute("get", ACTIVE_POSITIONS_KEY),
             self._client.execute("lindex", EQUITY_CURVE_KEY, 0),
             self._client.execute("exists", ENGINE_HEARTBEAT_KEY),
+            self._client.execute("get", ENGINE_STATE_KEY),
         )
         positions = tuple(_parse_positions(raw_positions))
         equity = _parse_equity(raw_equity)
-        return EngineView(positions, equity, bool(heartbeat), bool(await self._system_safe()))
+        return EngineView(positions, equity, bool(heartbeat), bool(await self._system_safe()), _parse_engine_state(raw_state))
+
+
+def _parse_engine_state(raw: Any) -> str | None:
+    """``engine:state`` (JSON ``{"state": ...}``) -> l'état, ou ``None`` si la clé est absente ou illisible (traité comme « prêt »)."""
+    if raw in (None, ""):
+        return None
+    try:
+        state = json.loads(raw)["state"]
+    except (ValueError, KeyError, TypeError):
+        return None
+    return state if isinstance(state, str) else None
 
 
 def _parse_positions(raw: Any) -> Sequence[EnginePosition]:

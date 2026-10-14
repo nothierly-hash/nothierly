@@ -65,9 +65,11 @@ import zmq.asyncio
 
 from core.config import ConfigurationError, get_settings
 from core.exception_manager import install_global_exception_handler
+from core.heartbeat import HeartbeatConfig, ThreadedHeartbeat, redis_client_factory
 from core.logger import configure_logging, get_logger
 from core.notifier import TelegramNotifier
 from core.redis_client import RedisClient
+from core.schemas import HEARTBEAT_REDIS_KEY_PREFIX
 from core.zmq_broker import ZmqBroker
 from src.agents.archivist.agent import ArchivistAgent
 from src.agents.execution.agent import ExecutionAgent
@@ -315,6 +317,11 @@ async def main() -> None:
     configure_logging(log_level="INFO", log_dir=None, service_name="trading-backend")
 
     settings = get_settings()
+    # Armement : l'état STARTING est écrit dans Redis AVANT le chargement lourd des modèles (les agents ci-dessous chargent XGBoost, la
+    # politique PPO et le méta-modèle dans leurs constructeurs). Le pont lit cet état et ne conclut pas « moteur muet » pendant que le moteur
+    # s'initialise ; l'ExecutionAgent le passe à ACTIVE quand il peut décider. Le battement tourne sur un thread dédié (core/heartbeat.py).
+    engine_heartbeat = ThreadedHeartbeat(HeartbeatConfig(key=f"{HEARTBEAT_REDIS_KEY_PREFIX}execution-agent"), redis_client_factory(settings.redis))
+    engine_heartbeat.start()
     zmq_settings = settings.zmq
     if zmq_settings.broker_frontend_address is None or zmq_settings.broker_backend_address is None:
         raise ConfigurationError(
@@ -432,6 +439,7 @@ async def main() -> None:
             zmq_context=shared_zmq_context,
             manage_own_redis=False,
             meta_label_model_path=_resolve_meta_label_model_path(),
+            engine_heartbeat=engine_heartbeat,
         ),
         ArchivistAgent(
             manage_own_signals=False,

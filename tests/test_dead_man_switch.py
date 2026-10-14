@@ -362,3 +362,80 @@ def test_real_zmq_loop_trips_when_the_engine_goes_silent(tmp_path: Path) -> None
 
     tripped, positions = asyncio.run(scenario(), loop_factory=asyncio.SelectorEventLoop)
     assert tripped and positions == {"BTC": D(0)}
+
+
+# --- Délai de grâce : avertissement, pas oubli ; plancher du timeout en CLI ------------------------
+
+
+def test_a_trip_suspended_by_the_startup_grace_is_warned_once_not_silently_swallowed(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    before = _worker(tmp_path)
+    _feed(before, _signal())
+    before.state.close()
+    after = _worker(tmp_path, dead_man_startup_grace_s=30.0)
+    after.positions["BTC"] = D(1)
+    after._started_ms = T0 + 3_600_000
+    with caplog.at_level("WARNING"):
+        assert _check(after, T0 + 3_600_000 + 5_000) == "ok"
+        assert _check(after, T0 + 3_600_000 + 10_000) == "ok"
+    warned = [r for r in caplog.records if "dead_man_startup_grace" in r.getMessage()]
+    assert len(warned) == 1 and "asset=BTC" in warned[0].getMessage()  # une seule fois, avec l'actif
+    assert after.flatten_calls == [] and not after.dead_man_tripped
+
+
+def test_no_grace_warning_when_the_signal_is_recent_enough(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    w = _worker(tmp_path, dead_man_startup_grace_s=30.0)
+    w._started_ms = T0
+    w.positions["BTC"] = D(1)
+    _feed(w, _signal())
+    with caplog.at_level("WARNING"):
+        assert _check(w, T0 + 5_000) == "ok"
+    assert not [r for r in caplog.records if "dead_man_startup_grace" in r.getMessage()]
+
+
+def test_the_grace_warning_does_not_extend_the_grace(tmp_path: Path) -> None:
+    before = _worker(tmp_path)
+    _feed(before, _signal())
+    before.state.close()
+    after = _worker(tmp_path, dead_man_startup_grace_s=30.0)
+    after.positions["BTC"] = D(1)
+    after._started_ms = T0 + 3_600_000
+    assert _check(after, T0 + 3_600_000 + 1_000) == "ok"
+    assert _check(after, T0 + 3_600_000 + 30_001) == "tripped"  # l'avertissement n'a rien repoussé
+
+
+@pytest.mark.parametrize("timeout", [0.0, 30.0, 60.0, 300.0])
+def test_acceptable_dead_man_timeouts_raise_no_error(timeout: float) -> None:
+    from workers.common.base import dead_man_timeout_problem
+
+    assert dead_man_timeout_problem(timeout) is None  # 0 = désactivé, jugé ailleurs
+
+
+@pytest.mark.parametrize("timeout", [0.1, 10.0, 29.9])
+def test_a_timeout_under_three_bridge_beats_is_refused(timeout: float) -> None:
+    from workers.common.base import dead_man_timeout_problem
+
+    problem = dead_man_timeout_problem(timeout)
+    assert problem is not None and "30s" in problem
+
+
+def test_a_timeout_between_30_and_60_seconds_is_accepted_with_a_warning(caplog: pytest.LogCaptureFixture) -> None:
+    from workers.common.base import dead_man_timeout_problem
+
+    with caplog.at_level("WARNING"):
+        assert dead_man_timeout_problem(45.0) is None
+    assert any("dead_man_timeout_short" in r.getMessage() for r in caplog.records)
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        assert dead_man_timeout_problem(60.0) is None
+    assert not caplog.records
+
+
+@pytest.mark.parametrize("module", ["workers.bybit.worker", "workers.binance.worker", "workers.darwinex.worker", "workers.hyperliquid.worker"])
+def test_every_worker_cli_refuses_a_dead_man_timeout_under_30_seconds(module: str, capsys: pytest.CaptureFixture[str]) -> None:
+    import importlib
+
+    mod = importlib.import_module(module)
+    with pytest.raises(SystemExit) as exc:
+        mod.main(["--dead-man-timeout", "10"])
+    assert exc.value.code == 2
+    assert "--dead-man-timeout" in capsys.readouterr().err

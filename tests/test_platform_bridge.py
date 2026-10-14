@@ -18,7 +18,9 @@ from contracts.secure_signal_bus import open_envelope
 from src.bridge.platform_bridge import (
     ACTIVE_POSITIONS_KEY,
     ENGINE_HEARTBEAT_KEY,
+    ENGINE_STATE_KEY,
     EQUITY_CURVE_KEY,
+    STATE_STARTING,
     BridgeConfig,
     EnginePosition,
     EngineView,
@@ -37,8 +39,8 @@ def _pos(instrument: str = "BTC/USDT", status: str = "LONG", units: str = "0.01"
     return EnginePosition(instrument, status, D(units), D(price))
 
 
-def _view(*positions: EnginePosition, equity: str | None = "10000", alive: bool = True, safe: bool = True) -> EngineView:
-    return EngineView(tuple(positions), None if equity is None else D(equity), alive, safe)
+def _view(*positions: EnginePosition, equity: str | None = "10000", alive: bool = True, safe: bool = True, state: str | None = None) -> EngineView:
+    return EngineView(tuple(positions), None if equity is None else D(equity), alive, safe, state)
 
 
 class FakeReader:
@@ -580,3 +582,99 @@ def test_a_bridged_signal_is_accepted_by_a_real_worker_check() -> None:
         verdict = open_envelope(build_envelope(sink.signals[0], secret), secret, venue=venue)
         assert verdict.accepted, venue
     assert open_envelope(build_envelope(sink.signals[0], secret), secret, venue=TargetVenue.NUMERAI_SIGNALS).reject_reason == "wrong_venue"
+
+
+# --- Démarrage à froid du moteur (séquence d'armement) ---------------------------------------
+
+
+def test_a_never_seen_engine_is_tolerated_during_the_startup_grace_without_flat_or_alert() -> None:
+    """Lancement à froid : le pont part avant le moteur. Pas de heartbeat du tout = avertissement, pas d'ordre FLAT ni d'alerte."""
+    rec = RecordingAlerter()
+    bridge, _, sink, clock = _bridge(_view(alive=False, equity=None), instruments=("BTC/USDT",), engine_grace_s=30.0, engine_startup_grace_s=180.0, alerter=rec)
+    for _ in range(17):  # 170 s de silence, bien au-delà de engine_grace_s
+        assert _step(bridge) == []
+        clock.now += 10
+    assert sink.signals == [] and rec.alerts == []
+
+
+def test_a_never_seen_engine_becomes_an_outage_once_the_startup_grace_is_over() -> None:
+    rec = RecordingAlerter()
+    bridge, reader, sink, clock = _bridge(_view(alive=False), instruments=("BTC/USDT",), engine_grace_s=30.0, engine_startup_grace_s=180.0, alerter=rec)
+    reader.view = _view(alive=False)
+    clock.now += 181
+    _step(bridge)  # la borne est passée : le silence compte à partir de maintenant
+    assert rec.alerts == []
+    clock.now += 31
+    _step(bridge)
+    assert rec.keys == ["engine_down"] and sink.signals and sink.signals[-1].direction is SignalDirection.FLAT
+
+
+def test_a_starting_engine_publishes_nothing_then_the_active_state_resumes_normal_publication() -> None:
+    rec = RecordingAlerter()
+    bridge, reader, sink, clock = _bridge(_view(_pos(), state=STATE_STARTING), instruments=("BTC/USDT",), engine_startup_grace_s=180.0, alerter=rec)
+    assert _step(bridge) == [] and sink.signals == []  # des positions lues pendant le chargement des modèles ne sont pas fiables
+    clock.now += 60
+    assert _step(bridge) == [] and sink.signals == []
+    reader.view = _view(_pos(), state="ACTIVE")
+    clock.now += 3
+    assert _step(bridge) and sink.signals[-1].direction is SignalDirection.LONG
+    assert rec.alerts == []
+
+
+def test_a_starting_engine_that_never_becomes_active_is_treated_as_down_after_the_grace() -> None:
+    rec = RecordingAlerter()
+    bridge, _, sink, clock = _bridge(_view(_pos(), state=STATE_STARTING), instruments=("BTC/USDT",), engine_grace_s=30.0, engine_startup_grace_s=60.0, alerter=rec)
+    _step(bridge)
+    clock.now += 61
+    _step(bridge)  # borne dépassée : plus toléré, le décompte du silence démarre
+    clock.now += 31
+    _step(bridge)
+    assert rec.keys == ["engine_down"] and sink.signals[-1].direction is SignalDirection.FLAT
+
+
+def test_the_startup_grace_never_applies_to_an_engine_that_was_ready_and_then_went_silent() -> None:
+    rec = RecordingAlerter()
+    bridge, reader, _, clock = _bridge(_view(_pos()), instruments=("BTC/USDT",), engine_grace_s=30.0, engine_startup_grace_s=180.0, alerter=rec)
+    _step(bridge)  # vu prêt
+    reader.view = _view(_pos(), alive=False)
+    clock.now += 10
+    _step(bridge)
+    clock.now += 31
+    _step(bridge)
+    assert rec.keys == ["engine_down"]  # une panne en régime établi garde sa tolérance habituelle de 30 s
+
+
+def test_the_kill_switch_wins_over_the_startup_grace() -> None:
+    bridge, _, sink, _ = _bridge(_view(_pos(), alive=False, safe=False), instruments=("BTC/USDT",), engine_startup_grace_s=180.0)
+    _step(bridge)
+    assert sink.signals and all(sg.direction is SignalDirection.FLAT for sg in sink.signals)
+
+
+def test_an_unreadable_redis_is_not_a_startup() -> None:
+    rec = RecordingAlerter()
+    bridge, reader, _, clock = _bridge(_view(_pos()), instruments=("BTC/USDT",), engine_grace_s=30.0, engine_startup_grace_s=180.0, alerter=rec)
+    reader.error = ConnectionError("redis injoignable")
+    _step(bridge)
+    clock.now += 31
+    _step(bridge)
+    assert rec.keys == ["engine_down"]
+
+
+def test_a_zero_startup_grace_restores_the_strict_behaviour() -> None:
+    rec = RecordingAlerter()
+    bridge, _, _, clock = _bridge(_view(alive=False), instruments=("BTC/USDT",), engine_grace_s=30.0, engine_startup_grace_s=0.0, alerter=rec)
+    _step(bridge)
+    clock.now += 31
+    _step(bridge)
+    assert rec.keys == ["engine_down"]
+
+
+def test_the_redis_reader_reads_the_engine_state_and_tolerates_garbage() -> None:
+    async def safe() -> bool:
+        return True
+
+    for raw, expected in ((json.dumps({"state": "STARTING", "since": 1.0, "pid": 1}), "STARTING"), (json.dumps({"state": "ACTIVE"}), "ACTIVE"), ("pas du json", None), (json.dumps({"state": 3}), None), (json.dumps([1]), None), (None, None)):
+        store: dict[str, Any] = {ENGINE_HEARTBEAT_KEY: "1.0"}
+        if raw is not None:
+            store[ENGINE_STATE_KEY] = raw
+        assert asyncio.run(RedisEngineReader(FakeRedis(store), safe).read()).engine_state == expected, raw

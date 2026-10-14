@@ -252,6 +252,7 @@ import zmq.asyncio
 
 from core.base_agent import AgentControlState, BaseAgent
 from core.config import AppSettings
+from core.heartbeat import STATE_ACTIVE, HeartbeatConfig, ThreadedHeartbeat, redis_client_factory
 from core.logger import get_logger
 from core.quant_math import (
     denoise_correlation_matrix_mp,
@@ -270,6 +271,7 @@ from core.quant_math import (
 from core.redis_client import RedisUnavailableError
 from core.schemas import (
     EMERGENCY_HALT_TOPIC,
+    HEARTBEAT_REDIS_KEY_PREFIX,
     ONCHAIN_TSUNAMI_LOCK_REDIS_KEY,
     ORDER_AUDIT_EVENTS_TOPIC,
     ORDER_SLICING_PROGRESS_REDIS_KEY_PREFIX,
@@ -439,12 +441,12 @@ DRAWDOWN_THRESHOLD_OVERRIDE_REDIS_KEY: Final[str] = "DRAWDOWN_ALERT_THRESHOLD_PC
 _MINDRAWDOWN_ALERT_THRESHOLD_PCT: Final[float] = 0.01
 _MAXDRAWDOWN_ALERT_THRESHOLD_PCT: Final[float] = 0.5
 
-# See _run_heartbeat_loop: this agent is purely event-driven (no tick
-# loop), so BaseAgent._write_heartbeat's own TTL formula
-# (max(3 * tick_interval_seconds, 5.0), and this agent never sets
-# tick_interval_seconds to anything meaningful) resolves to a flat 5.0s
-# floor -- written well inside that margin, not derived from it.
-_HEARTBEAT_WRITE_INTERVAL_SECONDS: Final[float] = 2.0
+# Liveness heartbeat (see core/heartbeat.py): written by a DEDICATED THREAD with its own Redis client, not by a task of the shared
+# event loop, so a blocking calculation (ML inference, Lyapunov, sizing) cannot make it late. 3 s interval, 10 s TTL: the key
+# survives two lost or delayed beats (ratio 3.3; core.heartbeat refuses anything under 3x). Before this change the heartbeat was an
+# asyncio task writing every 2 s with a 5 s TTL (ratio 2.5): about 3 s of blocked loop was enough to expire it.
+_HEARTBEAT_INTERVAL_SECONDS: Final[float] = 3.0
+_HEARTBEAT_TTL_SECONDS: Final[float] = 10.0
 
 # Trigger 4 ("Collision", signal flip-flop): more than 3 conflicting
 # consensus outcomes (see _evaluate_consensus's "conflict" outcome) for
@@ -800,6 +802,7 @@ class ExecutionAgent(BaseAgent):
         slicing_jitter_seconds: float = DEFAULT_JITTER_SECONDS,
         meta_label_model_path: str | Path | None = None,
         meta_label_scaler_path: str | Path | None = None,
+        engine_heartbeat: ThreadedHeartbeat | None = None,
     ) -> None:
         """Wire up the OANDA trading client and risk manager; subscribe to signals + prices.
 
@@ -953,6 +956,9 @@ class ExecutionAgent(BaseAgent):
         # Defaults to that module's own untrained skeleton, which always multiplies sizing by exactly
         # 1.0 -- no behavior change until a real model is trained and loaded here.
         self._meta_label_model = MetaLabelModel.load_or_skeleton(meta_label_model_path, meta_label_scaler_path)
+        # The liveness heartbeat. ``scripts/run_backend.py`` creates and STARTS it (state STARTING) before loading any model and hands it
+        # here; run() switches it to ACTIVE once this agent can decide. Standalone use: run() builds and starts its own.
+        self._engine_heartbeat = engine_heartbeat
         # "Protocole Stealth Slicing" (2026-09-16): real TWAP + jitter slicing for any entry whose
         # real notional exceeds slicing_notional_threshold_usd -- see _execute_sliced_entry's own
         # docstring for the real wiring (this is *not* the Almgren-Chriss scheduler above, which
@@ -1095,23 +1101,31 @@ class ExecutionAgent(BaseAgent):
         self._main_task = asyncio.current_task()
         self._install_signal_handlers()
 
+        if self._engine_heartbeat is None:  # standalone launch: nobody armed it earlier, so do it now (state STARTING until ACTIVE below)
+            self._engine_heartbeat = ThreadedHeartbeat(
+                HeartbeatConfig(key=f"{HEARTBEAT_REDIS_KEY_PREFIX}{self.agent_id}", interval_s=_HEARTBEAT_INTERVAL_SECONDS, ttl_s=_HEARTBEAT_TTL_SECONDS),
+                redis_client_factory(self._settings.redis),
+            )
+        self._engine_heartbeat.start()  # idempotent; the first beat is written before returning
+
         try:
             await self._connect_redis()
             await self.on_start()
 
             self._running = True
             self._log.info("agent_started", agent_id=self.agent_id, instruments=sorted(self._instruments))
+            self._engine_heartbeat.set_state(STATE_ACTIVE)  # this agent can now decide: the bridge may trust the positions it publishes
 
             await asyncio.gather(
                 self._listen_for_bus_messages(),
                 self._listen_for_manual_trade_requests(),
-                self._run_heartbeat_loop(),
                 self._listen_for_control_commands(),
             )
         except asyncio.CancelledError:
             self._log.info("agent_run_loop_cancelled_for_shutdown", agent_id=self.agent_id)
         finally:
             self._running = False
+            self._engine_heartbeat.stop()
             await self._shutdown()
 
     async def _listen_for_bus_messages(self) -> None:
@@ -1158,24 +1172,6 @@ class ExecutionAgent(BaseAgent):
             # remains as a deprecated alias) -- types-redis' stub hasn't
             # caught up to redis-py 5.x yet.
             await pubsub.aclose()  # type: ignore[attr-defined]
-
-    async def _run_heartbeat_loop(self) -> None:
-        """Write this agent's liveness heartbeat on a fixed interval, forever.
-
-        Every other :class:`~core.base_agent.BaseAgent` subclass writes
-        its heartbeat from inside a periodic tick/poll loop already
-        calling :meth:`~core.base_agent.BaseAgent._write_heartbeat`
-        once per cycle -- this agent has no such loop (see :meth:`run`'s
-        docstring: purely event-driven, reacting to bus/Redis messages,
-        not a timer), so without this it would never write one at all
-        (a real gap this exists to close, not a hypothetical one --
-        confirmed absent before this change). Runs as a third listener
-        alongside the two message loops in :meth:`run`'s
-        ``asyncio.gather``.
-        """
-        while self._running:
-            await self._write_heartbeat()
-            await asyncio.sleep(_HEARTBEAT_WRITE_INTERVAL_SECONDS)
 
     async def _handle_manual_trade_request(self, raw: str | bytes) -> None:
         """Validate and (if legitimate) act on one manual request from the dashboard.
