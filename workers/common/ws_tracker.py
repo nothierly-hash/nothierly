@@ -38,6 +38,7 @@ import hashlib
 import hmac
 import json
 import logging
+import socket
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -63,6 +64,10 @@ _ZERO: Final[Decimal] = Decimal(0)
 
 class FeedError(RuntimeError):
     """Le flux a refusé l'authentification ou l'abonnement. Le message ne contient jamais de clé."""
+
+
+class FeedStaleError(RuntimeError):
+    """Aucun message reçu depuis trop longtemps : connexion probablement semi-ouverte (TCP mort sans erreur). Provoque une reconnexion."""
 
 
 class WsConnection(Protocol):
@@ -321,6 +326,32 @@ class _WebsocketsConnection:
         await self._ws.close()
 
 
+_KEEPALIVE_IDLE_S: Final[int] = 30
+_KEEPALIVE_INTERVAL_S: Final[int] = 10
+_KEEPALIVE_PROBES: Final[int] = 3
+
+
+def enable_tcp_keepalive(ws: Any) -> bool:
+    """Active le keepalive TCP du système (sonde après 30 s d'inactivité, 3 essais à 10 s) : un lien mort sans fermeture propre (cas fréquent
+    sur un VPS) finit par lever une erreur au lieu de laisser ``recv`` attendre indéfiniment. Ne dépend d'aucune coopération du serveur,
+    contrairement à un ping : c'est ce qui protège les flux où le client n'envoie rien (Binance). Renvoie ``False`` si la prise n'est pas
+    accessible (le watchdog de fraîcheur du suiveur reste alors la seule défense). Les options absentes d'une plateforme sont ignorées."""
+    try:
+        transport = getattr(ws, "transport", None)
+        sock = None if transport is None else transport.get_extra_info("socket")
+        if sock is None:
+            return False
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        for name, value in (("TCP_KEEPIDLE", _KEEPALIVE_IDLE_S), ("TCP_KEEPINTVL", _KEEPALIVE_INTERVAL_S), ("TCP_KEEPCNT", _KEEPALIVE_PROBES)):
+            option = getattr(socket, name, None)
+            if option is not None:
+                sock.setsockopt(socket.IPPROTO_TCP, option, value)
+        return True
+    except (OSError, AttributeError):
+        _log.warning("ws_tcp_keepalive_unavailable", exc_info=True)
+        return False
+
+
 async def websockets_connect(url: str) -> WsConnection:
     """Connexion réelle (paquet ``websockets``, importé à l'usage). Le ping de protocole est coupé : les deux plateformes
     veulent leur propre message de ping applicatif, que le tracker envoie."""
@@ -329,6 +360,7 @@ async def websockets_connect(url: str) -> WsConnection:
     except ImportError as exc:  # pragma: no cover - dépend de l'environnement
         raise RuntimeError("le paquet websockets n'est pas installé : pip install websockets") from exc
     ws = await websockets.connect(url, open_timeout=10, ping_interval=None, max_size=4 * 1024 * 1024)
+    enable_tcp_keepalive(ws)
     return _WebsocketsConnection(ws)
 
 
@@ -350,6 +382,7 @@ class FillTracker:
         alert_after_failures: int = 5,
         clock_ms: Callable[[], int] = lambda: int(time.time() * 1000),
         intent_retention_ms: int = 7 * 24 * 3600 * 1000,
+        stale_after_s: float | None = None,
     ) -> None:
         self._feed = feed
         self._db = db
@@ -363,9 +396,14 @@ class FillTracker:
         self._clock_ms = clock_ms
         self._retention_ms = intent_retention_ms
         self._pending: dict[str, tuple[FillEvent, int]] = {}  # fill_id -> (fill, instant de première réception)
+        # Un flux de fills est silencieux tant qu'on ne trade pas : on ne peut juger « mort » que celui qui reçoit au moins des pongs. Défaut :
+        # 3 intervalles de ping du flux (Hyperliquid, Bybit) ; ``None`` pour un flux sans ping client (Binance) : le keepalive TCP le couvre.
+        interval = float(feed.heartbeat_interval_s)
+        self._stale_after_s: float | None = stale_after_s if stale_after_s is not None else (3 * interval if interval > 0 else None)
+        self._stale_alerted = False
         self._alerted = False
         self.connected = False
-        self.stats: dict[str, int] = {"received": 0, "matched": 0, "unmatched": 0, "duplicates": 0, "malformed": 0, "reconnects": 0}
+        self.stats: dict[str, int] = {"received": 0, "matched": 0, "unmatched": 0, "duplicates": 0, "malformed": 0, "reconnects": 0, "stale": 0}
 
     # --- boucle -----------------------------------------------------------------------------
 
@@ -418,15 +456,25 @@ class FillTracker:
         interval = self._feed.heartbeat_interval_s
         keepalive = getattr(self._feed, "keepalive", None)
         keepalive_interval = float(getattr(self._feed, "keepalive_interval_s", 0.0))
-        last_heartbeat = last_keepalive = time.monotonic()
+        last_heartbeat = last_keepalive = last_frame = time.monotonic()
         while not stop.is_set():
             try:
                 raw: str | None = await asyncio.wait_for(conn.recv(), self._recv_timeout_s)
             except asyncio.TimeoutError:
                 raw = None
             if raw is not None:
+                last_frame = time.monotonic()
+                if self._stale_alerted:
+                    self._stale_alerted = False
+                    self._alert("fill_feed_stale_end", "le flux de fills reçoit de nouveau des messages.", Severity.INFO)
                 await self._ingest(raw)
             now = time.monotonic()
+            if self._stale_after_s is not None and now - last_frame > self._stale_after_s:
+                self.stats["stale"] += 1
+                if not self._stale_alerted:
+                    self._stale_alerted = True
+                    self._alert("fill_feed_stale", f"le flux de fills {self._feed.venue} est muet depuis {now - last_frame:.0f}s (pongs compris) : connexion semi-ouverte probable, reconnexion forcée.")
+                raise FeedStaleError(f"aucun message depuis {now - last_frame:.0f}s")
             if interval and now - last_heartbeat >= interval:
                 heartbeat = self._feed.heartbeat_message()
                 if heartbeat is not None:

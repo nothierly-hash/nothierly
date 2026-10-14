@@ -22,6 +22,13 @@ les ``--refresh-s`` (30 s) TANT QUE la connexion vit : un marché calme qui ne f
 mort ou déconnecté la laisse expirer. Le moteur lit « clé absente » comme « pas de lecture », jamais comme une valeur. Pas de
 valeur du tout avant que la fenêtre soit pleine (voir ``vpin.py``).
 
+**Flux muet (connexion semi-ouverte).** Un lien TCP mort sans fermeture propre ne lève aucune erreur : ``recv`` attend sans fin, et la ré-écriture
+périodique garderait vivante une valeur gelée que le moteur lirait comme fraîche. Deux défenses : le keepalive TCP du système (activé par
+``websockets_connect``, voir ``ws_tracker.enable_tcp_keepalive``) et un watchdog de fraîcheur ici (``--stale-after-s``, 60 s) : aucun message depuis
+ce délai -> la clé Redis est SUPPRIMÉE (le moteur lit « pas de lecture », il se sait aveugle), une alerte part, la socket est fermée et la reconnexion
+suit son backoff. La clé n'est ré-écrite qu'à partir du moment où un message est reçu de nouveau. Marché très calme (altcoin peu liquide) : relever
+le délai, car 60 s sans le moindre trade y est normal.
+
 **Trou dans le flux.** Après une coupure de plus de ``--max-gap-s`` (30 s), les trades manqués fausseraient les seaux en cours :
 la fenêtre est vidée et la clé supprimée, la mesure repart de zéro. Les identifiants de trade déjà vus sont ignorés.
 
@@ -56,7 +63,7 @@ from typing import Any, Final, Protocol
 
 from workers.common.alerts import AlertConfigError, Alerter, Severity, WebhookAlerter
 from workers.common.logging_setup import configure_logging
-from workers.common.ws_tracker import ConnectFn, WsConnection, websockets_connect
+from workers.common.ws_tracker import ConnectFn, FeedStaleError, WsConnection, websockets_connect
 from workers.market_data.vpin import VolumeBucketVpin
 from workers.market_data.vpin_archive import BucketRecord, VpinArchive, default_archive_path
 
@@ -224,6 +231,7 @@ class VpinTracker:
         alert_after_failures: int = 5,
         clock: Callable[[], float] = time.monotonic,
         archive: VpinArchive | None = None,
+        stale_after_s: float | None = 60.0,
     ) -> None:
         self._feed = feed
         self._calcs = dict(calculators)
@@ -239,6 +247,10 @@ class VpinTracker:
         self._alert_after = alert_after_failures
         self._clock = clock
         self._archive = archive
+        self._stale_after_s = stale_after_s if stale_after_s else None  # 0 ou None : watchdog coupé
+        self._last_activity = clock()  # dernier message reçu, ou début de la connexion tant qu'aucun n'est arrivé
+        self._data_seen = False  # un message est-il arrivé depuis la dernière connexion ? (sinon rien n'est ré-écrit dans Redis)
+        self._stale_alerted = False
         self._archive_errors_seen = 0
         self._archive_dropped_seen = 0
         self._archive_alerted = False
@@ -246,7 +258,7 @@ class VpinTracker:
         self._disconnected_at: float | None = None
         self._alerted = False
         self.connected = False
-        self.stats: dict[str, int] = {"trades": 0, "buckets": 0, "duplicates": 0, "malformed": 0, "reconnects": 0, "resets": 0, "sink_errors": 0}
+        self.stats: dict[str, int] = {"trades": 0, "buckets": 0, "duplicates": 0, "malformed": 0, "reconnects": 0, "resets": 0, "sink_errors": 0, "stale": 0}
 
     # --- boucle -----------------------------------------------------------------------------
 
@@ -273,7 +285,7 @@ class VpinTracker:
                     self._alert("vpin_feed_down", f"le flux de trades est coupé depuis {failures} tentatives ({type(exc).__name__}) : le VPIN n'est plus mis à jour.")
             finally:
                 if self.connected:
-                    self._disconnected_at = self._clock()
+                    self._disconnected_at = self._last_activity  # le trou commence au dernier message reçu, pas à la fermeture
                 self.connected = False
                 if conn is not None:
                     try:
@@ -309,15 +321,23 @@ class VpinTracker:
 
     async def _pump(self, conn: WsConnection, stop: asyncio.Event) -> None:
         interval = self._feed.heartbeat_interval_s
-        last_heartbeat = last_refresh = self._clock()
+        last_heartbeat = last_refresh = self._last_activity = self._clock()
+        self._data_seen = False
         while not stop.is_set():
             try:
                 raw: str | None = await asyncio.wait_for(conn.recv(), self._recv_timeout_s)
             except asyncio.TimeoutError:
                 raw = None
             if raw is not None:
+                self._last_activity = self._clock()
+                self._data_seen = True
+                if self._stale_alerted:
+                    self._stale_alerted = False
+                    self._alert("vpin_feed_stale_end", "le flux de trades reçoit de nouveau des messages.", Severity.INFO)
                 await self._ingest(raw)
             now = self._clock()
+            if self._stale_after_s is not None and now - self._last_activity > self._stale_after_s:
+                await self._on_stale(now - self._last_activity)
             if interval and now - last_heartbeat >= interval:
                 heartbeat = self._feed.heartbeat_message()
                 if heartbeat is not None:
@@ -326,6 +346,17 @@ class VpinTracker:
             if now - last_refresh >= self._refresh_s:
                 last_refresh = now
                 await self._refresh()
+
+    async def _on_stale(self, silent_s: float) -> None:
+        """Aveugle : supprime les clés (le moteur ne lit plus rien), alerte une fois, puis force la reconnexion."""
+        self.stats["stale"] += 1
+        _log.warning("vpin_feed_stale silent_s=%.0f : clés supprimées, reconnexion", silent_s)
+        for symbol in self._calcs:
+            await self._safe_sink(self._sink.clear(symbol))
+        if not self._stale_alerted:
+            self._stale_alerted = True
+            self._alert("vpin_feed_stale", f"le flux de trades est muet depuis {silent_s:.0f}s (connexion semi-ouverte probable) : le VPIN est retiré de Redis, reconnexion forcée.")
+        raise FeedStaleError(f"aucun message depuis {silent_s:.0f}s")
 
     async def _ingest(self, raw: str) -> None:
         try:
@@ -381,6 +412,8 @@ class VpinTracker:
     async def _refresh(self) -> None:
         """Ré-écrit la dernière valeur pour prolonger sa durée de vie : un marché calme ne ferme pas de seau."""
         self._check_archive()
+        if not self._data_seen:
+            return  # rien reçu depuis la (re)connexion : on ne ré-écrit jamais une valeur dont on n'a plus de nouvelles
         for symbol, calc in self._calcs.items():
             value = calc.vpin
             if value is not None:
@@ -423,6 +456,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--max-gap-s", type=float, default=30.0, help="coupure au-delà de laquelle la fenêtre est remise à zéro")
     parser.add_argument("--archive-db", default=None, help="base SQLite de l'historique des seaux (défaut : <NOTHIERLY_DATA_DIR ou data/>/vpin_history.sqlite3)")
     parser.add_argument("--no-archive", action="store_true", help="n'écrit pas l'historique SQLite (déconseillé : c'est la matière première de l'entraînement)")
+    parser.add_argument("--stale-after-s", type=float, default=60.0, help="aucun message depuis ce délai : clé Redis supprimée, alerte, reconnexion (0 = coupé)")
     parser.add_argument("--dry-run", action="store_true", help="journalise les valeurs sans écrire dans Redis ni dans l'archive")
     parser.add_argument("--log-dir", default=None, help="dossier d'un fichier de journal tournant (10 Mo x 5) en plus de stdout")
     args = parser.parse_args(argv)
@@ -432,6 +466,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--window doit être >= 1")
     if args.refresh_s <= 0 or args.ttl_s <= args.refresh_s:
         parser.error("--ttl-s doit être strictement supérieur à --refresh-s (sinon la clé expire entre deux ré-écritures)")
+    if args.stale_after_s < 0:
+        parser.error("--stale-after-s doit être >= 0")
     symbols = [s.upper() for s in args.symbols]
     bad = [s for s in symbols if not _SYMBOL_RE.match(s)]
     if bad:
@@ -457,7 +493,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             archive = VpinArchive(args.archive_db or default_archive_path())  # échec rapide : pas de collecte sans archive, sauf --no-archive
         except (OSError, sqlite3.Error) as exc:
             parser.error(f"archive VPIN inutilisable ({type(exc).__name__}: {exc}) ; corriger NOTHIERLY_DATA_DIR / --archive-db, ou --no-archive")
-    tracker = VpinTracker(feed, calculators, sink, ttl_s=args.ttl_s, refresh_s=args.refresh_s, max_gap_s=args.max_gap_s, alerter=alerter, archive=archive)
+    tracker = VpinTracker(feed, calculators, sink, ttl_s=args.ttl_s, refresh_s=args.refresh_s, max_gap_s=args.max_gap_s, alerter=alerter, archive=archive, stale_after_s=args.stale_after_s)
     _log.info(
         "vpin_tracker_start source=%s symbols=%s bucket=%s window=%d mode=%s archive=%s", args.source, symbols, args.bucket_size, args.window,
         "DRY-RUN" if args.dry_run else "REDIS", "off" if archive is None else archive.path,
