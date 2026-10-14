@@ -37,7 +37,7 @@ Options utiles (les valeurs ci-dessous sont les valeurs par défaut) :
 | `--instruments` | `BTC/USDT ETH/USDT` | paires suivies (seules les paires crypto `BASE/USDT` sont traduites) |
 | `--max-position-pct` | `20` | plafond de la taille publiée, en % de l'equity du moteur |
 | `--min-hold-s` | `60` | durée minimale avant de publier la fermeture/inversion d'une position publiée ; `0` = aucune |
-| `--size-bucket-pct` | `2.5` | pas de quantification de la taille ; `0` publie la taille exacte (pour comparer) |
+| `--size-bucket-pct` | `2.5` | pas de quantification de la taille ; `0` publie la taille exacte et exige `--allow-exact-size` (comparaisons seulement : c'est la conviction du moteur) |
 | `--poll-s` / `--refresh-s` | `2` / `10` | lecture du moteur / republication périodique |
 | `--engine-grace-s` | `30` | délai avant de publier `FLAT` si le moteur se tait |
 

@@ -37,6 +37,7 @@ _ARCHIVED_TOPICS: Final[tuple[str, ...]] = (
     "MACRO_DATA_UPDATE",
     "NLP_SIGNAL",
     "TRADE_EXECUTED",
+    "META_LABEL_DECISION",  # features + sizing of each consensus entry: the meta-label training log
     TRADING_SIGNALS_TOPIC,
 )
 

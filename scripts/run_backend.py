@@ -131,6 +131,16 @@ _SUPERVISOR_MODEL_PATH: Final[Path] = Path(__file__).resolve().parent.parent / "
 _SUPERVISOR_SCALER_PATH: Final[Path] = Path(__file__).resolve().parent.parent / "models" / "supervisor_scaler_20260910_010746.pkl"
 
 
+# Trained meta-label model (Gate 3 sizing), written by scripts/train_metalabel.py together with its ``.meta.json``
+# sidecar. Optional: absent -> the agent's untrained skeleton, which sizes exactly as before (see risk/meta_labeling.py).
+_META_LABEL_MODEL_PATH: Final[Path] = Path(__file__).resolve().parent.parent / "models" / "metalabel_weights.json"
+
+
+def _resolve_meta_label_model_path() -> Path | None:
+    """The trained meta-label weights if the file exists, else ``None`` (neutral 0.5, multiplier 1.0)."""
+    return _META_LABEL_MODEL_PATH if _META_LABEL_MODEL_PATH.is_file() else None
+
+
 def _resolve_supervisor_model_paths() -> tuple[Path | None, Path | None]:
     """``(model_path, scaler_path)`` if both real files exist on disk, else ``(None, None)``.
 
@@ -363,6 +373,7 @@ async def main() -> None:
             manage_own_signals=False,
             zmq_context=shared_zmq_context,
             manage_own_redis=False,
+            meta_label_model_path=_resolve_meta_label_model_path(),
         ),
         ArchivistAgent(
             manage_own_signals=False,

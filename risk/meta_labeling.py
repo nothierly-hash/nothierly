@@ -40,6 +40,10 @@ both are computed later in the same gate pipeline (Gate 7,
 either duplicate that computation or reorder the gate pipeline -- a
 real, separate, larger change, not made unasked as part of this one.
 
+**Update (2026-10-14)**: ``scripts/train_metalabel.py`` now exists (decision log + real round trips from the workers' fills, chronological
+split, strict acceptance gate) and :meth:`MetaLabelModel.load_or_skeleton` loads its artifact, falling back to the neutral skeleton
+when it is absent or unusable. It has never produced an artifact on real data: the history below is still the true state of the data.
+
 **Real, disclosed training status, following :class:`~src.agents.
 supervisor.ml_engine.SupervisorMLModel`'s own precedent exactly**: this
 project has no real, sufficiently-long live trade-outcome history to fit
@@ -60,8 +64,11 @@ untrained model's arbitrary output.
 
 from __future__ import annotations
 
+import json
+import math
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Final
+from typing import Any, Final
 
 import joblib
 import numpy as np
@@ -79,6 +86,26 @@ _log = get_logger(__name__)
 _DEFAULT_VETO_BELOW: Final[float] = 0.35
 _DEFAULT_MAX_MULTIPLIER: Final[float] = 1.5
 _NEUTRAL_CONFIDENCE: Final[float] = 0.5
+
+# Feature set "v2", produced by ``scripts/train_metalabel.py`` and recorded in the artifact's sidecar. Order is the
+# model's input order. ``imbalance_aligned`` is the signed order-book imbalance multiplied by the trade direction
+# (+1 buy / -1 sell): positive when the book's pressure agrees with the trade. ``volatility`` is the per-tick
+# standard deviation of recent log mid-price returns.
+FEATURES_V2: Final[tuple[str, ...]] = (
+    "ppo_confidence",
+    "xgb_confidence",
+    "confidence_gap",
+    "spread",
+    "volatility",
+    "imbalance_aligned",
+)
+METADATA_SUFFIX: Final[str] = ".meta.json"
+_DEFAULT_PAYOFF_RATIO: Final[float] = 1.0
+
+
+def metadata_path_for(model_path: str | Path) -> Path:
+    """``models/metalabel_weights.json`` -> ``models/metalabel_weights.meta.json`` (feature names, payoff ratio, metrics)."""
+    return Path(model_path).with_suffix(METADATA_SUFFIX)
 
 
 class MetaLabelModel:
@@ -100,6 +127,9 @@ class MetaLabelModel:
         self,
         model_path: str | Path | None = None,
         scaler_path: str | Path | None = None,
+        *,
+        feature_names: tuple[str, ...] | None = None,
+        payoff_ratio: float = _DEFAULT_PAYOFF_RATIO,
     ) -> None:
         """Load a pre-trained model+scaler, or build an untrained inference-ready skeleton.
 
@@ -117,12 +147,20 @@ class MetaLabelModel:
                 ``joblib.dump``. Only meaningful alongside
                 ``model_path``.
         """
+        self.feature_names: tuple[str, ...] = tuple(feature_names) if feature_names is not None else self.FEATURE_NAMES
+        self.payoff_ratio = payoff_ratio
         self._is_fitted: bool
         if model_path is not None:
             self._model = xgb.XGBClassifier()
             if not hasattr(self._model, "_estimator_type"):
                 self._model._estimator_type = "classifier"
             self._model.load_model(str(model_path))
+            expected = len(self.feature_names)
+            if self._model.get_booster().num_features() != expected:
+                raise ValueError(
+                    f"The model was fitted on {self._model.get_booster().num_features()} features, "
+                    f"but its feature set {self.feature_names} has {expected}."
+                )
             self._is_fitted = True
             _log.info("meta_label_model_loaded", model_path=str(model_path))
         else:
@@ -133,9 +171,12 @@ class MetaLabelModel:
                 reason="no model_path provided; no real trade-outcome training pipeline exists yet",
             )
 
+        self._scaler: Any
         if scaler_path is not None:
             self._scaler = joblib.load(scaler_path)
             _log.info("meta_label_scaler_loaded", scaler_path=str(scaler_path))
+        elif feature_names is not None and model_path is not None:
+            self._scaler = None  # trees are invariant to monotone scaling: a v2 artifact ships without one
         else:
             if model_path is not None:
                 _log.warning(
@@ -148,14 +189,14 @@ class MetaLabelModel:
     def _build_skeleton_model(self) -> xgb.XGBClassifier:
         """Same real "fit on 2 opposite-label all-zero rows" honest placeholder as ``SupervisorMLModel``'s own."""
         model = xgb.XGBClassifier(n_estimators=10, max_depth=3, objective="binary:logistic")
-        dummy_features = np.zeros((2, len(self.FEATURE_NAMES)), dtype=np.float64)
+        dummy_features = np.zeros((2, len(self.feature_names)), dtype=np.float64)
         dummy_labels = np.array([0, 1])
         model.fit(dummy_features, dummy_labels)
         return model
 
     def _build_skeleton_scaler(self) -> StandardScaler:
         scaler = StandardScaler()
-        dummy_features = np.zeros((2, len(self.FEATURE_NAMES)), dtype=np.float64)
+        dummy_features = np.zeros((2, len(self.feature_names)), dtype=np.float64)
         scaler.fit(dummy_features)
         return scaler
 
@@ -196,13 +237,70 @@ class MetaLabelModel:
         Raises:
             ValueError: If ``features`` doesn't have the expected shape.
         """
-        expected_shape = (len(self.FEATURE_NAMES),)
+        expected_shape = (len(self.feature_names),)
         if features.shape != expected_shape:
             raise ValueError(f"Expected feature vector of shape {expected_shape}, got {features.shape}.")
 
-        scaled = self._scaler.transform(features.reshape(1, -1))
+        row = features.reshape(1, -1)
+        scaled = row if self._scaler is None else self._scaler.transform(row)
         probabilities = self._model.predict_proba(scaled)[0]
         return float(probabilities[1])
+
+    @property
+    def is_fitted(self) -> bool:
+        """``False`` for the untrained skeleton, which always answers exactly 0.5."""
+        return self._is_fitted
+
+    def vectorize(self, values: Mapping[str, float]) -> npt.NDArray[np.float64] | None:
+        """This model's input vector from named values, in its own feature order; ``None`` if any is missing or not finite.
+
+        The caller decides what ``None`` means (the execution agent falls back to the neutral 0.5): a missing
+        input is never replaced by a made-up number here.
+        """
+        try:
+            row = [float(values[name]) for name in self.feature_names]
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not all(math.isfinite(v) for v in row):
+            return None
+        return np.array(row, dtype=np.float64)
+
+    @classmethod
+    def from_artifact(cls, model_path: str | Path, scaler_path: str | Path | None = None) -> MetaLabelModel:
+        """Strict load of a trained artifact and its ``.meta.json`` sidecar. Raises on any problem.
+
+        With a sidecar, the feature set and payoff ratio come from it. Without one the artifact is read as the legacy
+        v1 layout (4 features, scaler expected), exactly as before.
+        """
+        path = Path(model_path)
+        sidecar = metadata_path_for(path)
+        if not sidecar.is_file():
+            return cls(path, scaler_path)
+        metadata = json.loads(sidecar.read_text(encoding="utf-8"))
+        names = tuple(str(n) for n in metadata["feature_names"])
+        payoff = float(metadata.get("payoff_ratio", _DEFAULT_PAYOFF_RATIO))
+        if not names or payoff <= 0 or not math.isfinite(payoff):
+            raise ValueError("invalid metadata: empty feature_names or non-positive payoff_ratio")
+        return cls(path, scaler_path, feature_names=names, payoff_ratio=payoff)
+
+    @classmethod
+    def load_or_skeleton(cls, model_path: str | Path | None, scaler_path: str | Path | None = None) -> MetaLabelModel:
+        """Never raises: a missing, unreadable or inconsistent artifact gives the untrained skeleton (always 0.5).
+
+        The skeleton maps to a multiplier of exactly 1.0, so a deployment without a trained model, or with a broken
+        file, sizes exactly as before. A configured-but-unusable file is logged as an ERROR, not hidden.
+        """
+        if model_path is None:
+            return cls()
+        path = Path(model_path)
+        if not path.is_file():
+            _log.error("meta_label_artifact_missing", model_path=str(path), fallback="untrained skeleton (0.5, multiplier 1.0)")
+            return cls()
+        try:
+            return cls.from_artifact(path, scaler_path)
+        except Exception as exc:  # noqa: BLE001 -- a broken artifact must never stop the execution agent from starting
+            _log.error("meta_label_artifact_unusable", model_path=str(path), error=type(exc).__name__, fallback="untrained skeleton (0.5, multiplier 1.0)")
+            return cls()
 
 
 def size_multiplier_from_confidence(
@@ -250,3 +348,46 @@ def size_multiplier_from_confidence(
     if confidence < veto_below:
         return 0.0
     return min(confidence / _NEUTRAL_CONFIDENCE, max_multiplier)
+
+
+def kelly_size_multiplier(
+    probability: float,
+    *,
+    payoff_ratio: float = _DEFAULT_PAYOFF_RATIO,
+    kelly_fraction: float = 0.5,
+    veto_below: float = _DEFAULT_VETO_BELOW,
+    max_multiplier: float = _DEFAULT_MAX_MULTIPLIER,
+) -> float:
+    r"""Position-size multiplier from a success probability, as a fractional-Kelly slope around the neutral point.
+
+    For a bet that wins with probability :math:`p` and pays :math:`b` times what it risks, the Kelly fraction is
+    :math:`f^* = p - (1-p)/b`. The engine's own sizing (fixed-fractional risk, Gate 3) already fixes a base risk amount
+    whose Kelly-optimality nobody has measured, so ``f*`` is **not** used as an absolute allocation: at the neutral
+    :math:`p = 0.5` and :math:`b = 1` it is exactly zero, which would veto the untrained skeleton and break the
+    "no trained model yet -> sizing unchanged" property this module guarantees. What is used is the change in ``f*``
+    relative to that neutral point, scaled by a safety fraction:
+
+    .. math:: m = 1 + \lambda\,\bigl(f^*(p) - f^*(0.5)\bigr) = 1 + \lambda\,(1 + 1/b)\,(p - 0.5)
+
+    - :math:`p = 0.5` gives exactly ``1.0`` (neutral, by construction); below it the size shrinks, above it grows;
+    - the result is capped at ``max_multiplier`` and floored at ``0``; ``p`` strictly below ``veto_below`` is a hard
+      veto (``0.0``), same as :func:`size_multiplier_from_confidence`;
+    - ``kelly_fraction`` (default one half, "half Kelly") scales the slope; ``payoff_ratio`` is the average win over the
+      average loss measured at training time (``1.0`` when unknown).
+
+    The defaults are a disclosed starting point, not backtested values.
+    """
+    if not 0.0 <= probability <= 1.0:
+        raise ValueError("probability must be in [0, 1].")
+    if payoff_ratio <= 0.0 or not math.isfinite(payoff_ratio):
+        raise ValueError("payoff_ratio must be a positive finite number.")
+    if not 0.0 < kelly_fraction <= 1.0:
+        raise ValueError("kelly_fraction must be in (0, 1].")
+    if not 0.0 <= veto_below < _NEUTRAL_CONFIDENCE:
+        raise ValueError(f"veto_below must be in [0, {_NEUTRAL_CONFIDENCE}).")
+    if max_multiplier < 1.0:
+        raise ValueError("max_multiplier must be >= 1.0.")
+    if probability < veto_below:
+        return 0.0
+    slope = kelly_fraction * (1.0 + 1.0 / payoff_ratio)
+    return max(0.0, min(1.0 + slope * (probability - _NEUTRAL_CONFIDENCE), max_multiplier))

@@ -216,6 +216,19 @@ trained model exists yet (this project has no live trade-outcome history long en
 :attr:`_meta_label_model` defaults to :mod:`risk.meta_labeling`'s own untrained skeleton, which this
 module's own tests confirm round-trips to an exact ``1.0`` multiplier: wiring this in changes nothing
 about today's real sizing until a real model is trained and loaded via ``--meta-label-model-path``.
+
+**Trained model, Kelly sizing and decision log (2026-10-14).** ``scripts/train_metalabel.py`` fits the model on real round
+trips (see that script for the data contract and its refusal rules) and writes ``models/metalabel_weights.json`` plus a
+``.meta.json`` sidecar naming its features. :meth:`_meta_label_assess` builds that model's inputs *by name* (the two agents'
+confidences and their gap, the latest spread, the realized volatility of recent mid prices, and the order-book imbalance
+signed by trade direction), asks it for P(success) and turns that into a size multiplier with
+:func:`risk.meta_labeling.kelly_size_multiplier` (a fractional-Kelly slope around the neutral 0.5, so the untrained
+skeleton still maps to exactly 1.0). A missing or unusable artifact, or a feature the model needs that has no reading yet,
+falls back to the neutral 0.5 / multiplier 1.0, never to a made-up input. Every consensus-driven Gate 3 evaluation is
+published on the bus as ``META_LABEL_DECISION`` (features, probability, multiplier), archived by the Archivist: that log is
+what the training script joins to the realized outcomes. Position sizes still reach external venues only through the
+bridge, which quantizes them to price-bucket steps (``src/bridge/platform_bridge.py``): the dynamic multiplier is never
+published as such.
 """
 
 from __future__ import annotations
@@ -227,7 +240,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Final, Iterable, Literal
+from typing import Any, Final, Iterable, Literal, NamedTuple
 
 import numpy as np
 import numpy.typing as npt
@@ -278,7 +291,7 @@ from core.security import (
     safe_financial_call,
 )
 from execution.order_flow_liquidity_agent import OrderFlowLiquidityAgent
-from risk.meta_labeling import MetaLabelModel, size_multiplier_from_confidence
+from risk.meta_labeling import MetaLabelModel, kelly_size_multiplier
 from src.agents.execution.order_slicer import (
     DEFAULT_EXECUTION_HORIZON_SECONDS,
     DEFAULT_JITTER_SECONDS,
@@ -298,6 +311,9 @@ _log = get_logger(__name__)
 
 _AGENT_ID: Final[str] = "execution-agent"
 _TRADE_EXECUTED_TOPIC: Final[str] = "TRADE_EXECUTED"
+_META_LABEL_DECISION_TOPIC: Final[str] = "META_LABEL_DECISION"
+_RECENT_MIDS_MAXLEN: Final[int] = 120  # ticks of mid-price history behind the volatility feature
+_MIN_MIDS_FOR_VOLATILITY: Final[int] = 10
 _MARKET_DATA_TOPIC: Final[str] = "MARKET_DATA_L2"
 _DEFAULT_REQUIRED_AGENT_IDS: Final[frozenset[str]] = frozenset({"supervisor-agent", "rl-signal-agent"})
 
@@ -737,6 +753,14 @@ class _ConsensusResult:
     direction: int = 0
 
 
+class _MetaLabelAssessment(NamedTuple):
+    multiplier: float
+    confidence: float
+    features: dict[str, float]  # every named input available at this moment (the model uses the ones it declares)
+    fitted: bool
+    direction: int | None  # +1 / -1 of the consensus; ``None`` for a manual override (no consensus)
+
+
 class ExecutionAgent(BaseAgent):
     """Arbitrates consensus for entries, unilateral vetoes and risk limits for exits.
 
@@ -921,7 +945,7 @@ class ExecutionAgent(BaseAgent):
         # the real gap this closes (confidence was computed, threaded through, and only ever logged).
         # Defaults to that module's own untrained skeleton, which always multiplies sizing by exactly
         # 1.0 -- no behavior change until a real model is trained and loaded here.
-        self._meta_label_model = MetaLabelModel(meta_label_model_path, meta_label_scaler_path)
+        self._meta_label_model = MetaLabelModel.load_or_skeleton(meta_label_model_path, meta_label_scaler_path)
         # "Protocole Stealth Slicing" (2026-09-16): real TWAP + jitter slicing for any entry whose
         # real notional exceeds slicing_notional_threshold_usd -- see _execute_sliced_entry's own
         # docstring for the real wiring (this is *not* the Almgren-Chriss scheduler above, which
@@ -967,6 +991,9 @@ class ExecutionAgent(BaseAgent):
         self._tick_events: dict[str, deque[tuple[float, float]]] = {}
         self._latest_liquidity: dict[str, float] = {}
         self._last_spreads: dict[str, float] = {}
+        # Meta-label inputs (see _meta_label_assess): latest signed order-book imbalance and a short mid-price history.
+        self._last_imbalances: dict[str, float] = {}
+        self._recent_mids: dict[str, deque[float]] = {}
         # "Protocole AEGIS" real gap detection over _tick_events -- see _record_tick_event.
         self._last_tick_event_time: dict[str, float] = {}
         self._tick_events_ruptured: dict[str, bool] = {}
@@ -1407,6 +1434,9 @@ class ExecutionAgent(BaseAgent):
 
         self._last_prices[metrics.symbol] = metrics.mid_price
         self._last_spreads[metrics.symbol] = metrics.spread
+        self._last_imbalances[metrics.symbol] = metrics.order_book_imbalance
+        if metrics.mid_price > 0:
+            self._recent_mids.setdefault(metrics.symbol, deque(maxlen=_RECENT_MIDS_MAXLEN)).append(metrics.mid_price)
         if metrics.top_of_book_liquidity > 0:
             self._latest_liquidity[metrics.symbol] = metrics.top_of_book_liquidity
         self._record_tick_event(metrics.symbol, metrics.order_book_imbalance)
@@ -1644,7 +1674,10 @@ class ExecutionAgent(BaseAgent):
                 0.0,
             )
 
-        multiplier, meta_confidence = self._meta_label_size_multiplier(instrument, signals)
+        assessment = self._meta_label_assess(instrument, signals)
+        multiplier, meta_confidence = assessment.multiplier, assessment.confidence
+        if signals is not None:
+            await self._record_meta_label_decision(instrument, current_price, assessment)
         if multiplier <= 0.0:
             return (
                 GateResult(
@@ -1660,28 +1693,69 @@ class ExecutionAgent(BaseAgent):
         )
         return GateResult(3, _GATE_NAMES[2], "PASSED", detail), sized_units
 
-    def _meta_label_size_multiplier(
-        self, instrument: str, signals: dict[str, TradingSignal] | None,
-    ) -> tuple[float, float]:
-        """Real ``(size_multiplier, meta_confidence)`` for this consensus event -- see module docstring addendum.
+    def _meta_label_assess(self, instrument: str, signals: dict[str, TradingSignal] | None) -> _MetaLabelAssessment:
+        """The meta-label's probability and size multiplier for this consensus event, plus the inputs it was given.
 
-        ``signals is None`` (a manual operator override, see Gate 1) has
-        no real per-agent confidence to build a meta-label from --
-        returns a neutral ``(1.0, 0.5)``, the skeleton model's own
-        uninformative midpoint, never a fabricated confidence for a
-        signal source that does not exist on this path.
+        ``signals is None`` (a manual operator override, see Gate 1) has no per-agent confidence to build a
+        meta-label from: neutral ``(1.0, 0.5)``, never a fabricated confidence. Same neutral answer when the model is
+        fitted but one input it needs has no reading yet (e.g. fewer than a few mid prices for the volatility): the
+        missing input is reported, not replaced.
         """
         if signals is None:
-            return 1.0, 0.5
+            return _MetaLabelAssessment(1.0, 0.5, {}, self._meta_label_model.is_fitted, None)
         confidences = [signal.confidence for signal in signals.values()]
-        features = MetaLabelModel.build_feature_vector(
-            min_confidence=min(confidences),
-            confidence_spread=max(confidences) - min(confidences),
-            spread=self._last_spreads.get(instrument, 0.0),
-            recent_conflict_count=len(self._conflict_history.get(instrument, [])),
-        )
-        meta_confidence = self._meta_label_model.predict_confidence(features)
-        return size_multiplier_from_confidence(meta_confidence), meta_confidence
+        direction = next(iter(signals.values())).signal
+        values: dict[str, float] = {
+            "min_confidence": min(confidences),
+            "confidence_spread": max(confidences) - min(confidences),
+            "spread": self._last_spreads.get(instrument, 0.0),
+            "recent_conflict_count": float(len(self._conflict_history.get(instrument, []))),
+        }
+        ppo, xgb = signals.get("rl-signal-agent"), signals.get("supervisor-agent")
+        if ppo is not None:
+            values["ppo_confidence"] = ppo.confidence
+        if xgb is not None:
+            values["xgb_confidence"] = xgb.confidence
+        if ppo is not None and xgb is not None:
+            values["confidence_gap"] = abs(ppo.confidence - xgb.confidence)
+        mids = self._recent_mids.get(instrument)
+        if mids is not None and len(mids) >= _MIN_MIDS_FOR_VOLATILITY:
+            returns = np.diff(np.log(np.asarray(mids, dtype=np.float64)))
+            if returns.size >= 2:
+                values["volatility"] = float(np.std(returns, ddof=1))
+        if instrument in self._last_imbalances:
+            values["imbalance_aligned"] = self._last_imbalances[instrument] * float(direction)
+        features = self._meta_label_model.vectorize(values)
+        if features is None:
+            missing = [n for n in self._meta_label_model.feature_names if n not in values]
+            self._log.warning(
+                "meta_label_features_unavailable", agent_id=self.agent_id, instrument=instrument, missing=missing,
+                fallback="neutral confidence 0.5, multiplier 1.0",
+            )
+            return _MetaLabelAssessment(1.0, 0.5, values, self._meta_label_model.is_fitted, direction)
+        confidence = self._meta_label_model.predict_confidence(features)
+        multiplier = kelly_size_multiplier(confidence, payoff_ratio=self._meta_label_model.payoff_ratio)
+        return _MetaLabelAssessment(multiplier, confidence, values, self._meta_label_model.is_fitted, direction)
+
+    async def _record_meta_label_decision(self, instrument: str, price: float, assessment: _MetaLabelAssessment) -> None:
+        """Publish this evaluation as ``META_LABEL_DECISION`` (archived: the training log). Never raises, never blocks Gate 3."""
+        if assessment.direction is None:  # manual override: no consensus, nothing to learn from
+            return
+        try:
+            await self.publish(_META_LABEL_DECISION_TOPIC, {
+                "decision_time": time.time(),
+                "instrument": instrument,
+                "direction": assessment.direction,
+                "price": price,
+                "features": {k: v for k, v in assessment.features.items() if math.isfinite(v)},
+                "meta_confidence": assessment.confidence,
+                "multiplier": assessment.multiplier,
+                "vetoed": assessment.multiplier <= 0.0,
+                "model_fitted": assessment.fitted,
+                "model_features": list(self._meta_label_model.feature_names),
+            })
+        except Exception:  # noqa: BLE001 -- the training log is an aid: it must never alter or delay an entry
+            self._log.warning("meta_label_decision_not_published", agent_id=self.agent_id, instrument=instrument, exc_info=True)
 
     def _gate_4_margin(
         self, instrument: str, raw_units: float, current_price: float, available_margin: float

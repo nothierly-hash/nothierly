@@ -98,7 +98,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--venue", choices=_CRYPTO_VENUES, default="ALL", help="ALL = toutes les plateformes crypto")
     parser.add_argument("--instruments", nargs="+", default=["BTC/USDT", "ETH/USDT"])
     parser.add_argument("--max-position-pct", type=float, default=20.0)
-    parser.add_argument("--size-bucket-pct", type=float, default=2.5, help="pas de quantification de la taille publiée (masque la conviction du moteur) ; 0 = taille exacte")
+    parser.add_argument("--size-bucket-pct", type=float, default=2.5, help="pas de quantification de la taille publiée (masque la conviction du moteur) ; 0 exige --allow-exact-size")
+    parser.add_argument("--allow-exact-size", action="store_true", help="autorise --size-bucket-pct 0 : publie la taille exacte du moteur, donc sa conviction (comparaisons et tests seulement)")
     parser.add_argument("--min-hold-s", type=float, default=60.0, help="durée minimale de maintien d'une position publiée avant sa fermeture/inversion ; 0 = aucune")
     parser.add_argument("--poll-s", type=float, default=2.0)
     parser.add_argument("--refresh-s", type=float, default=10.0)
@@ -111,6 +112,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.min_hold_s < 0:
         parser.error("--min-hold-s doit être >= 0")
+    if args.size_bucket_pct < 0 or (args.size_bucket_pct == 0 and not args.allow_exact_size):
+        parser.error("--size-bucket-pct 0 publierait la taille exacte du moteur, donc sa conviction : il faut --allow-exact-size pour le demander explicitement")
     if args.publish_failure_threshold < 1:
         parser.error("--publish-failure-threshold doit être >= 1")
     configure_logging("platform-bridge", log_dir=args.log_dir)
