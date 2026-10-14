@@ -333,13 +333,15 @@ def check_brain_models() -> list[Check]:
     except Exception as exc:  # noqa: BLE001
         return [failed(group, "Lanceur du moteur (run_backend)", f"import impossible : {type(exc).__name__}: {str(exc)[:200]}")]
     checks = [passed(group, "Lanceur du moteur (run_backend)", "importable : tous les agents se chargent")]
-    model, scaler = module._SUPERVISOR_MODEL_PATH, module._SUPERVISOR_SCALER_PATH
-    if model.is_file() and scaler.is_file():
+    # Les mêmes résolveurs que le moteur : ce que le diagnostic annonce est ce que le moteur chargera réellement (artefact le plus récent
+    # et chargeable, ou celui désigné par l'environnement), pas un nom de fichier supposé.
+    model, scaler = module._resolve_supervisor_model_paths()
+    if model is not None and scaler is not None:
         checks.append(passed(group, "XGBoost primaire (artefact)", f"{model.name} + {scaler.name}"))
     else:
-        checks.append(warned(group, "XGBoost primaire (artefact)", f"fichier(s) absent(s) ({model.name}) : le squelette neutre tourne (jamais de signal XGBoost informatif)"))
-    ppo = sorted((ROOT / "models").glob("ppo_policy_*.pt"))
-    checks.append(passed(group, "PPO (politique)", f"{len(ppo)} politique(s) dans models/") if ppo else warned(group, "PPO (politique)", "aucun models/ppo_policy_*.pt : politique non entraînée"))
+        checks.append(warned(group, "XGBoost primaire (artefact)", "aucune paire modèle + scaler chargeable : le squelette neutre tourne (il répond toujours 0,5 : aucun consensus, donc aucune entrée)"))
+    policy = module._resolve_rl_policy_model_path()
+    checks.append(passed(group, "PPO (politique)", policy.name) if policy is not None else warned(group, "PPO (politique)", "aucune politique chargeable dans models/ : politique non entraînée (squelette uniforme)"))
     return checks
 
 

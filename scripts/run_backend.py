@@ -55,7 +55,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import asyncio
 import functools
+import os
+import re
 import signal
+from collections.abc import Callable, Mapping
 from typing import Any, Final
 
 import zmq.asyncio
@@ -114,94 +117,149 @@ _SIGNAL_AGENT_REDIS_LATENCY_THRESHOLD_MS: Final[float] = 15000.0
 # deployment's own measured tuning was missing until now.
 _SIGNAL_AGENT_MAX_MARKET_METRICS_AGE_MS: Final[float] = 8000.0
 
-# Real, trained artifacts (scripts/train_model.py, trained 2026-09-10 against this exact
-# deployment's own real archived MARKET_DATA_L2/MACRO_DATA_UPDATE/NLP_SIGNAL history --
-# 414,253 usable labeled rows, holdout accuracy 0.691, ROC-AUC 0.758) -- see that script's own
-# module docstring for the pipeline. Without these, XgboostSignalAgent runs SupervisorMLModel's
-# honest untrained-skeleton fallback (always ~0.5 probability, i.e. permanently neutral -- see
-# that class's own docstring) instead of a real prediction; wiring them in here is the one thing
-# that was missing, not a change to the pipeline itself. Re-run scripts/train_model.py and update
-# these two filenames to retrain on more recent data.
+# Trained model artifacts are RESOLVED AT STARTUP, not named in code.
 #
-# XGBClassifier.load_model/joblib.load both raise on a missing file (unlike SupervisorMLModel's own
-# model_path=None fallback) -- _resolve_supervisor_model_paths below turns "file not found" into the
-# same honest untrained-skeleton fallback instead of crashing this whole backend over one missing
-# optional artifact (e.g. a redeploy whose build context didn't carry models/ this time).
-_SUPERVISOR_MODEL_PATH: Final[Path] = Path(__file__).resolve().parent.parent / "models" / "supervisor_model_20260910_010746.json"
-_SUPERVISOR_SCALER_PATH: Final[Path] = Path(__file__).resolve().parent.parent / "models" / "supervisor_scaler_20260910_010746.pkl"
-
-
-# Trained meta-label model (Gate 3 sizing), written by scripts/train_metalabel.py together with its ``.meta.json``
-# sidecar. Optional: absent -> the agent's untrained skeleton, which sizes exactly as before (see risk/meta_labeling.py).
-_META_LABEL_MODEL_PATH: Final[Path] = Path(__file__).resolve().parent.parent / "models" / "metalabel_weights.json"
-
-
-def _resolve_meta_label_model_path() -> Path | None:
-    """The trained meta-label weights if the file exists, else ``None`` (neutral 0.5, multiplier 1.0)."""
-    return _META_LABEL_MODEL_PATH if _META_LABEL_MODEL_PATH.is_file() else None
-
-
-def _resolve_supervisor_model_paths() -> tuple[Path | None, Path | None]:
-    """``(model_path, scaler_path)`` if both real files exist on disk, else ``(None, None)``.
-
-    Deliberately all-or-nothing: a real model with a skeleton (wrong-
-    distribution) scaler silently degrades prediction quality rather
-    than failing loudly (see SupervisorMLModel's own docstring) -- not
-    a state this backend should ever start into on its own.
-    """
-    if _SUPERVISOR_MODEL_PATH.exists() and _SUPERVISOR_SCALER_PATH.exists():
-        return _SUPERVISOR_MODEL_PATH, _SUPERVISOR_SCALER_PATH
-    _log.warning(
-        "supervisor_model_artifacts_missing_using_untrained_skeleton",
-        model_path=str(_SUPERVISOR_MODEL_PATH),
-        scaler_path=str(_SUPERVISOR_SCALER_PATH),
-    )
-    return None, None
-
-
-# Real, trained artifact (scripts/train_ppo.py, trained 2026-09-02 --
-# see that script's own module docstring for the PPO+GAE pipeline).
-# Real, disclosed gap this closes: scripts.train_ppo has in fact been
-# run (4 real torch.jit.script-exported checkpoints exist under
-# models/), but this backend never passed model_path to RlSignalAgent,
-# so it always ran RLPolicyModel's honest untrained skeleton (uniform
-# ~50/50/random action preference, no real trained knowledge) despite a
-# real trained policy sitting on disk unused. Wiring this in is the one
-# thing that was missing, not a change to the pipeline itself -- the
-# exact same shape of fix _resolve_supervisor_model_paths already made
-# for the XGBoost side. The latest (most recently trained) of the 4 real
-# checkpoints is used; re-run scripts/train_ppo.py and update this
-# filename to retrain on more recent data.
+# Rules (the same for the XGBoost pair, the PPO policy and the meta-label weights):
+#   1. An explicit path in the environment wins: NOTHIERLY_SUPERVISOR_MODEL + NOTHIERLY_SUPERVISOR_SCALER (both),
+#      NOTHIERLY_RL_POLICY, NOTHIERLY_META_LABEL_MODEL. If it is given but missing or unloadable, the answer is the untrained
+#      skeleton and an ERROR log: an operator who named a model must not silently get a different one.
+#   2. Otherwise the NEWEST artifact in the models directory (NOTHIERLY_MODELS_DIR, default <repo>/models), ordered by the
+#      YYYYMMDD_HHMMSS in its file name (file modification times do not survive a Docker COPY). For the XGBoost side only a COMPLETE
+#      pair (model + scaler with the same timestamp) counts: a model with a scaler from another training silently degrades.
+#   3. Nothing usable, or the newest file does not load: the honest untrained skeleton (XGBoost: always 0.5, which blocks every
+#      consensus entry; PPO: uniform) and a warning. Never a crash over an optional artifact, never an older file picked silently.
 #
-# No accuracy/live-PnL claim is made for this checkpoint -- confirmed
-# only that it loads correctly against the current ActorCritic
-# architecture and produces a valid, deterministic action-probability
-# distribution (see the manual verification this session's own notes
-# describe); an actual edge claim would need real backtesting this
-# project has not run against this exact checkpoint (see research/
-# evaluate_apprentice.py for what that real evaluation looks like on
-# the separate, research-only apprentice policy).
-_RL_POLICY_MODEL_PATH: Final[Path] = Path(__file__).resolve().parent.parent / "models" / "ppo_policy_20260902_110854.pt"
+# Every artifact has been checked to LOAD before it is handed to an agent: xgboost/joblib raise on a corrupt file, which would
+# otherwise crash the whole backend inside the agent's constructor.
+_MODELS_DIR_ENV: Final[str] = "NOTHIERLY_MODELS_DIR"
+_SUPERVISOR_MODEL_ENV: Final[str] = "NOTHIERLY_SUPERVISOR_MODEL"
+_SUPERVISOR_SCALER_ENV: Final[str] = "NOTHIERLY_SUPERVISOR_SCALER"
+_RL_POLICY_ENV: Final[str] = "NOTHIERLY_RL_POLICY"
+_META_LABEL_ENV: Final[str] = "NOTHIERLY_META_LABEL_MODEL"
+_ARTIFACT_TIMESTAMP: Final[re.Pattern[str]] = re.compile(r"_(\d{8}_\d{6})\.[A-Za-z0-9]+$")
 
 
-def _resolve_rl_policy_model_path() -> Path | None:
-    """The real PPO policy path if it exists on disk, else ``None`` (the honest untrained-skeleton fallback).
+def _models_dir(environ: Mapping[str, str] | None = None) -> Path:
+    configured = (os.environ if environ is None else environ).get(_MODELS_DIR_ENV, "").strip()
+    return Path(configured) if configured else Path(__file__).resolve().parent.parent / "models"
 
-    ``torch.jit.load`` raises on a missing/corrupt file (unlike
-    ``RLPolicyModel``'s own ``model_path=None`` fallback) -- checking
-    existence here turns "file not found" into the same honest
-    untrained-skeleton fallback instead of crashing this whole backend
-    over one missing optional artifact (e.g. a redeploy whose build
-    context didn't carry ``models/`` this time), the same real reasoning
-    :func:`_resolve_supervisor_model_paths` already applies.
+
+def _timestamped(models_dir: Path, prefix: str, suffix: str) -> dict[str, Path]:
+    """``{YYYYMMDD_HHMMSS: path}`` for the files ``<prefix>_<timestamp><suffix>`` of ``models_dir`` (others are ignored)."""
+    found: dict[str, Path] = {}
+    if not models_dir.is_dir():
+        return found
+    for path in models_dir.glob(f"{prefix}_*{suffix}"):
+        match = _ARTIFACT_TIMESTAMP.search(path.name)
+        if match is not None and path.name == f"{prefix}_{match.group(1)}{suffix}":
+            found[match.group(1)] = path
+    return found
+
+
+def _supervisor_pair_loads(model_path: Path, scaler_path: Path) -> bool:
+    try:
+        import joblib
+        import xgboost as xgb
+
+        classifier = xgb.XGBClassifier()
+        if not hasattr(classifier, "_estimator_type"):
+            # Même cale que SupervisorMLModel : sans elle, XGBClassifier.load_model lève sur ce couple xgboost / scikit-learn, et un
+            # modèle valide serait pris pour illisible (le moteur démarrerait sur le squelette sans le dire).
+            classifier._estimator_type = "classifier"
+        classifier.load_model(str(model_path))
+        load_scaler: Callable[[Path], object] = joblib.load  # joblib n'a pas de stubs : on type le point d'appel
+        load_scaler(scaler_path)
+    except Exception:  # noqa: BLE001 -- any failure to load means "not usable": the caller falls back to the skeleton
+        return False
+    return True
+
+
+def _policy_loads(path: Path) -> bool:
+    try:
+        import torch
+
+        load_policy: Callable[[str], object] = torch.jit.load  # torch.jit.load n'est pas annoté : on type le point d'appel
+        load_policy(str(path))
+    except Exception:  # noqa: BLE001
+        return False
+    return True
+
+
+def _resolve_supervisor_model_paths(environ: Mapping[str, str] | None = None) -> tuple[Path | None, Path | None]:
+    """``(model_path, scaler_path)`` of the XGBoost artifacts to use, or ``(None, None)`` for the untrained skeleton.
+
+    All-or-nothing: a real model with a skeleton (wrong-distribution) scaler silently degrades prediction quality
+    rather than failing loudly (see SupervisorMLModel's own docstring) -- not a state this backend should start into.
     """
-    if _RL_POLICY_MODEL_PATH.exists():
-        return _RL_POLICY_MODEL_PATH
-    _log.warning(
-        "rl_policy_model_artifact_missing_using_untrained_skeleton",
-        model_path=str(_RL_POLICY_MODEL_PATH),
-    )
-    return None
+    env = os.environ if environ is None else environ
+    explicit_model, explicit_scaler = env.get(_SUPERVISOR_MODEL_ENV, "").strip(), env.get(_SUPERVISOR_SCALER_ENV, "").strip()
+    if explicit_model or explicit_scaler:
+        model, scaler = Path(explicit_model), Path(explicit_scaler)
+        if explicit_model and explicit_scaler and model.is_file() and scaler.is_file() and _supervisor_pair_loads(model, scaler):
+            _log.info("supervisor_model_from_environment", model_path=str(model), scaler_path=str(scaler))
+            return model, scaler
+        _log.error(
+            "supervisor_model_from_environment_unusable_using_untrained_skeleton",
+            model_path=explicit_model, scaler_path=explicit_scaler,
+            detail=f"both {_SUPERVISOR_MODEL_ENV} and {_SUPERVISOR_SCALER_ENV} must name existing, loadable files",
+        )
+        return None, None
+    directory = _models_dir(env)
+    models = _timestamped(directory, "supervisor_model", ".json")
+    scalers = _timestamped(directory, "supervisor_scaler", ".pkl")
+    complete = sorted(models.keys() & scalers.keys())
+    if not complete:
+        _log.warning("supervisor_model_artifacts_missing_using_untrained_skeleton", models_dir=str(directory),
+                     models_found=len(models), scalers_found=len(scalers))
+        return None, None
+    newest = complete[-1]
+    if not _supervisor_pair_loads(models[newest], scalers[newest]):
+        _log.error("supervisor_model_newest_artifact_unloadable_using_untrained_skeleton", model_path=str(models[newest]), scaler_path=str(scalers[newest]))
+        return None, None
+    _log.info("supervisor_model_resolved", model_path=str(models[newest]), scaler_path=str(scalers[newest]), candidates=len(complete))
+    return models[newest], scalers[newest]
+
+
+def _resolve_rl_policy_model_path(environ: Mapping[str, str] | None = None) -> Path | None:
+    """The PPO policy to use (explicit environment path, else the newest ``ppo_policy_<timestamp>.pt``), or ``None`` for the untrained skeleton.
+
+    ``torch.jit.load`` raises on a missing/corrupt file (unlike ``RLPolicyModel``'s own ``model_path=None`` fallback), so the file is
+    loaded here first: "not found" and "corrupt" both become the skeleton instead of crashing the backend.
+    No accuracy or live-PnL claim is made for whichever checkpoint is loaded; scripts/train_ppo.py has no out-of-sample evaluation.
+    """
+    env = os.environ if environ is None else environ
+    explicit = env.get(_RL_POLICY_ENV, "").strip()
+    if explicit:
+        path = Path(explicit)
+        if path.is_file() and _policy_loads(path):
+            _log.info("rl_policy_from_environment", model_path=str(path))
+            return path
+        _log.error("rl_policy_from_environment_unusable_using_untrained_skeleton", model_path=explicit)
+        return None
+    directory = _models_dir(env)
+    policies = _timestamped(directory, "ppo_policy", ".pt")
+    if not policies:
+        _log.warning("rl_policy_model_artifact_missing_using_untrained_skeleton", models_dir=str(directory))
+        return None
+    newest = max(policies)
+    if not _policy_loads(policies[newest]):
+        _log.error("rl_policy_newest_artifact_unloadable_using_untrained_skeleton", model_path=str(policies[newest]))
+        return None
+    _log.info("rl_policy_resolved", model_path=str(policies[newest]), candidates=len(policies))
+    return policies[newest]
+
+
+def _resolve_meta_label_model_path(environ: Mapping[str, str] | None = None) -> Path | None:
+    """The trained meta-label weights (``models/metalabel_weights.json``, written by scripts/train_metalabel.py with its sidecar), or ``None``.
+
+    ``risk.meta_labeling.MetaLabelModel.load_or_skeleton`` already turns a missing or inconsistent file into the neutral skeleton
+    (probability 0.5, multiplier 1.0); this only decides which path to hand it.
+    """
+    env = os.environ if environ is None else environ
+    explicit = env.get(_META_LABEL_ENV, "").strip()
+    path = Path(explicit) if explicit else _models_dir(env) / "metalabel_weights.json"
+    return path if path.is_file() else None
+
 
 # Every instrument the signal/execution agents evaluate. Forex
 # instruments (OANDA-style, underscore) and crypto instruments

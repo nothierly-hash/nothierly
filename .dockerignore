@@ -22,10 +22,14 @@ __pycache__
 
 # Local-only artifacts not needed inside the image
 logs/
-models/
-# Real, trained artifacts the Dockerfile explicitly COPYs by name (see its own comment next to
-# those two COPY lines) -- re-included here despite the blanket models/ exclusion above, the same
-# negation pattern .gitignore already uses for models/.gitkeep.
-!models/supervisor_model_20260910_010746.json
-!models/supervisor_scaler_20260910_010746.pkl
+models/*
+# models/ is shipped as a directory (`COPY models/ ./models/`, see the Dockerfile): `models/*` excludes the CONTENTS (not the
+# directory itself, which must stay in the context so that COPY cannot fail), then only the artifact names the loaders recognise are
+# let back in. A build with no model at all is valid; it produces an image that runs the untrained neutral skeletons.
+!models/.gitkeep
+!models/supervisor_model_*.json
+!models/supervisor_scaler_*.pkl
+!models/ppo_policy_*.pt
+!models/metalabel_weights.json
+!models/metalabel_weights.meta.json
 .claude/

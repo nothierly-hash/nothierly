@@ -522,7 +522,8 @@ def test_the_backend_loads_the_trained_model_only_when_the_file_exists(monkeypat
     run_backend = importlib.util.module_from_spec(spec)
     sys.modules["run_backend_under_test"] = run_backend
     spec.loader.exec_module(run_backend)
-    monkeypatch.setattr(run_backend, "_META_LABEL_MODEL_PATH", tmp_path / "metalabel_weights.json")
+    monkeypatch.setenv("NOTHIERLY_MODELS_DIR", str(tmp_path))
+    monkeypatch.delenv("NOTHIERLY_META_LABEL_MODEL", raising=False)
     assert run_backend._resolve_meta_label_model_path() is None
     (tmp_path / "metalabel_weights.json").write_text("{}", encoding="utf-8")
     assert run_backend._resolve_meta_label_model_path() == tmp_path / "metalabel_weights.json"

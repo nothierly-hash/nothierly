@@ -146,17 +146,20 @@ COPY simulation/ ./simulation/
 # "Lancer le backtest" today will fail the same way this ModuleNotFoundError did, honestly, with a
 # real FileNotFoundError naming the missing path -- add the same one-file COPY pattern above for
 # btcusdt_book_snapshot_2020-01-01.csv if/when that's actually needed.
-# scripts/run_backend.py's real, trained XgboostSignalAgent model -- see that script's own
-# _SUPERVISOR_MODEL_PATH/_SUPERVISOR_SCALER_PATH comment for how/when this was trained. models/ is
-# gitignored (large, reproducible binary artifacts -- see .gitignore's own comment), so these two
-# specific files are named explicitly (COPY errors on a missing source, unlike a wildcard) rather
-# than COPY models/ ./models/. Small (< 500KB combined) -- no size trade-off like research/ above.
-# Retraining a new model: these two filenames must be updated here AND in run_backend.py's two
-# constants together, or the build fails (missing source) rather than silently keeping the old
-# model. _resolve_supervisor_model_paths() only handles the file missing at *runtime* (e.g. a build
-# from before this artifact existed at all), not a mismatch introduced here.
-COPY models/supervisor_model_20260910_010746.json ./models/supervisor_model_20260910_010746.json
-COPY models/supervisor_scaler_20260910_010746.pkl ./models/supervisor_scaler_20260910_010746.pkl
+# Trained model artifacts (XGBoost pair, PPO policy, meta-label weights) are shipped as a DIRECTORY, never by file name.
+# The previous version named one XGBoost model and its scaler (COPY errors on a missing source), which made every build depend on
+# an artifact that had to exist, and made retraining a two-place edit. Now:
+#   - `COPY models/ ./models/` cannot fail: models/ always exists in the context (models/.gitkeep is tracked and re-included in
+#     .dockerignore), and an empty or artifact-less directory simply copies nothing.
+#   - .dockerignore lets through only the artifact name patterns the loaders recognise (supervisor_model_<ts>.json,
+#     supervisor_scaler_<ts>.pkl, ppo_policy_<ts>.pt, metalabel_weights.json and its .meta.json), nothing else from models/.
+#   - scripts/run_backend.py resolves the newest valid artifact at startup (or the one named by NOTHIERLY_SUPERVISOR_MODEL /
+#     NOTHIERLY_SUPERVISOR_SCALER / NOTHIERLY_RL_POLICY / NOTHIERLY_META_LABEL_MODEL, or a directory from NOTHIERLY_MODELS_DIR, e.g. a
+#     mounted volume) and falls back to the untrained neutral skeleton when there is none: an image built with no model is a valid
+#     image that cannot trade (the XGBoost skeleton always answers 0.5, so no consensus entry is ever reached).
+# The consequence to remember: whatever sits in models/ at build time is baked into the image. Only vetted artifacts (the training
+# scripts refuse to write models that do not beat chance) belong there.
+COPY models/ ./models/
 # nothierly-p2p-api's own entrypoint (docker-compose.yml) -- see that module's own docstring.
 COPY p2p_api.py .
 COPY sandbox.py .
