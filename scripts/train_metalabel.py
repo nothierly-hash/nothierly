@@ -58,6 +58,12 @@ import xgboost as xgb
 from sklearn.metrics import accuracy_score, brier_score_loss, log_loss, roc_auc_score
 
 from risk.meta_labeling import FEATURES_V2, FEATURES_V3, kelly_size_multiplier, metadata_path_for
+from risk.model_validation import (  # noqa: F401 -- auc_lower_bound ré-exposé : les tests et d'autres scripts l'importent d'ici
+    auc_lower_bound,
+    evaluate_auc_significance,
+    non_overlapping_indices,
+    split_purged_intervals,
+)
 from workers.common.fills_db import BUY, Execution, FillsDatabase
 
 MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
@@ -290,14 +296,10 @@ def build_matrix(labeled: Sequence[LabeledTrade], feature_names: Sequence[str], 
 
 
 def chronological_split(kept: Sequence[LabeledTrade], test_fraction: float) -> tuple[int, int]:
-    """``(train_end, test_start)`` indices: the test set starts after every training trade has ended (embargo)."""
-    n = len(kept)
-    train_end = max(1, int(round(n * (1.0 - test_fraction))))
-    last_exit = max((t.trip.exit_ms for t in kept[:train_end]), default=0)
-    test_start = train_end
-    while test_start < n and kept[test_start].trip.entry_ms < last_exit:
-        test_start += 1
-    return train_end, test_start
+    """``(train_end, test_start)`` indices: the test set starts after every training trade has ended (purge by intervals, ``risk.model_validation``)."""
+    starts = np.array([t.trip.entry_ms for t in kept], dtype=np.int64)
+    ends = np.array([t.trip.exit_ms for t in kept], dtype=np.int64)
+    return split_purged_intervals(starts, ends, test_fraction)
 
 
 # --- Training and evaluation -----------------------------------------------------------------
@@ -320,28 +322,27 @@ def fit_model(x: npt.NDArray[np.float64], y: npt.NDArray[np.int64]) -> xgb.XGBCl
     return model
 
 
-def auc_lower_bound(auc: float, n_pos: int, n_neg: int, z: float = 2.326) -> float:
-    """One-sided 99% lower bound of an AUC (Hanley-McNeil standard error; a model that sizes real money gets a strict test). A model must beat 0.5 beyond what luck explains:
-    with a couple of hundred test trades an AUC of 0.55 is well within the noise of a coin flip."""
-    if n_pos < 2 or n_neg < 2:
-        return 0.0
-    q1, q2 = auc / (2.0 - auc), 2.0 * auc * auc / (1.0 + auc)
-    variance = (auc * (1.0 - auc) + (n_pos - 1) * (q1 - auc * auc) + (n_neg - 1) * (q2 - auc * auc)) / (n_pos * n_neg)
-    return auc - z * math.sqrt(max(variance, 0.0))
-
-
 def evaluate(model: xgb.XGBClassifier, x_test: npt.NDArray[np.float64], y_test: npt.NDArray[np.int64], train_rate: float,
              test_trades: Sequence[LabeledTrade], payoff: float) -> dict[str, float | None]:
     p = model.predict_proba(x_test)[:, 1]
-    both = len(set(y_test.tolist())) == 2
+    # Significativité : sur les trades qui ne se chevauchent pas seulement (deux trades ouverts en même temps subissent le même marché), via le
+    # module partagé : borne de Hanley-McNeil à 99 % ET test nul de Mann-Whitney.
+    starts = np.array([t.trip.entry_ms for t in test_trades], dtype=np.int64)
+    ends = np.array([t.trip.exit_ms for t in test_trades], dtype=np.int64)
+    keep = non_overlapping_indices(starts, ends)
+    significance = evaluate_auc_significance(y_test, p.astype(np.float64), starts, keep=keep)
     multipliers = np.array([kelly_size_multiplier(float(v), payoff_ratio=payoff) for v in p])
     pnl = np.array([t.trip.pnl for t in test_trades])
     baseline_p = np.full_like(p, train_rate)
     return {
         "accuracy": float(accuracy_score(y_test, p >= 0.5)),
         "baseline_accuracy": float(max(np.mean(y_test), 1 - np.mean(y_test))),
-        "auc": float(roc_auc_score(y_test, p)) if both else None,
-        "auc_lower_99": auc_lower_bound(float(roc_auc_score(y_test, p)), int(y_test.sum()), int(len(y_test) - y_test.sum())) if both else None,
+        "auc": significance.auc_independent,  # AUC du test statistique : trades sans chevauchement
+        "auc_all_test_trades": significance.auc_full,
+        "auc_lower_99": significance.lower_bound if significance.auc_independent is not None else None,
+        "null_z": significance.null_z,
+        "significant": 1.0 if significance.significant else 0.0,
+        "n_independent": float(significance.n_independent),
         "brier": float(brier_score_loss(y_test, p)),
         "baseline_brier": float(brier_score_loss(y_test, baseline_p)),
         "log_loss": float(log_loss(y_test, np.clip(p, 1e-6, 1 - 1e-6), labels=[0, 1])),
@@ -353,19 +354,24 @@ def evaluate(model: xgb.XGBClassifier, x_test: npt.NDArray[np.float64], y_test: 
 
 def acceptance_failures(metrics: Mapping[str, float | None], *, n_labeled: int, n_test: int, min_trades: int, min_test: int, min_auc: float,
                         test_has_both: bool) -> list[str]:
+    """Raisons de refuser l'artefact. ``min_test`` s'applique aux trades de test INDÉPENDANTS (sans chevauchement), pas à tous."""
     problems = []
+    n_independent = int(metrics.get("n_independent") or 0)
     if n_labeled < min_trades:
         problems.append(f"only {n_labeled} labeled trades, at least {min_trades} required")
-    if n_test < min_test:
-        problems.append(f"test set of {n_test} trades, at least {min_test} required")
+    if n_independent < min_test:
+        problems.append(f"{n_independent} independent (non-overlapping) test trades out of {n_test}, at least {min_test} required")
     if not test_has_both:
         problems.append("the test set contains a single outcome: AUC is undefined")
     auc = metrics.get("auc")
     if auc is not None and auc < min_auc:
         problems.append(f"AUC {auc:.3f} below {min_auc}")
     lower = metrics.get("auc_lower_99")
-    if lower is not None and lower <= 0.5:
-        problems.append(f"AUC {auc:.3f} is not significantly above chance (99% lower bound {lower:.3f} <= 0.5)")
+    if auc is not None and lower is not None and metrics.get("significant") != 1.0:
+        problems.append(
+            f"AUC {auc:.3f} is not significantly above chance (one-sided 99% Hanley-McNeil lower bound {lower:.3f}, Mann-Whitney z {metrics.get('null_z') or 0.0:.2f}; "
+            f"both must exceed 0.5 / 2.326)"
+        )
     brier, baseline = metrics.get("brier"), metrics.get("baseline_brier")
     if brier is not None and baseline is not None and brier >= baseline:
         problems.append(f"Brier score {brier:.4f} does not beat the base-rate baseline {baseline:.4f}")

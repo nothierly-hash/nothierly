@@ -117,6 +117,12 @@ def _fetch_fred_series(series_id: str) -> pd.Series:
     return frame.dropna(subset=[series_id]).set_index("observation_date")[series_id]
 
 
+# The audit's market series is ONE real instrument (FRED EUR/USD), not the multi-symbol MARKET_DATA_L2 archive: there is nothing to
+# filter on a command line. The records still carry their symbol and the frame builder selects it, so the one-symbol contract of
+# build_market_feature_frame holds here too instead of being silently skipped.
+AUDIT_SYMBOL: Final[str] = "EUR/USD"
+
+
 def build_real_audit_dataset() -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], pd.DataFrame]:
     """Build the (features, prices, aligned_frame) dataset used across every test below.
 
@@ -138,8 +144,11 @@ def build_real_audit_dataset() -> tuple[npt.NDArray[np.float64], npt.NDArray[np.
     macro_records = [{"time": ts, "data": {"indicator": "US_10Y_YIELD", "value": float(v)}} for ts, v in dgs10.items()]
     macro_frame = build_macro_feature_frame(macro_records)
 
-    market_records = [{"time": ts, "data": {"spread": 0.0, "order_book_imbalance": 0.0, "mid_price": float(p)}} for ts, p in eurusd.items()]
-    market_frame = build_market_feature_frame(market_records)
+    market_records = [
+        {"time": ts, "data": {"symbol": AUDIT_SYMBOL, "spread": 0.0, "order_book_imbalance": 0.0, "mid_price": float(p)}}
+        for ts, p in eurusd.items()
+    ]
+    market_frame = build_market_feature_frame(market_records, AUDIT_SYMBOL)
     labeled = label_future_returns(market_frame, pd.Timedelta(days=1))
     empty_sentiment = pd.DataFrame(
         {"time": pd.Series(dtype="datetime64[ns, UTC]"), "sentiment_score_signed": pd.Series(dtype=float)}

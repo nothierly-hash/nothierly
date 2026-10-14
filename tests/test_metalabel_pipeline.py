@@ -154,7 +154,7 @@ def test_vectorize_never_invents_a_missing_or_non_finite_input() -> None:
     assert model.vectorize(full) is not None
     assert model.vectorize({k: v for k, v in full.items() if k != "volatility"}) is None
     assert model.vectorize({**full, "spread": float("nan")}) is None
-    assert model.vectorize({**full, "spread": "abc"}) is None  # type: ignore[dict-item]
+    assert model.vectorize({**full, "spread": "abc"}) is None  # type: ignore[dict-item]  # valeur volontairement non numérique : le test vérifie qu'elle est refusée
 
 
 # --- Allers-retours (chiffres faits à la main) -----------------------------------------------
@@ -418,7 +418,7 @@ def _capture_publish(agent: ExecutionAgent) -> list[tuple[str, dict[str, Any]]]:
     async def fake(topic: str, data: dict[str, Any]) -> None:
         sent.append((topic, data))
 
-    agent.publish = fake  # type: ignore[method-assign]
+    agent.publish = fake  # type: ignore[method-assign]  # double de test : méthode remplacée sur l'instance pour espionner ou simuler une panne
     return sent
 
 
@@ -559,3 +559,47 @@ def test_publishing_exact_sizes_needs_an_explicit_flag(monkeypatch: pytest.Monke
     assert "--allow-exact-size" in capsys.readouterr().err
     with pytest.raises(SystemExit):
         module.main(["--dry-run", "--size-bucket-pct", "-1"])
+
+
+# --- Validation partagée : trades sans chevauchement et garde de Mann-Whitney -------------------
+
+
+def _overlapping_world(n: int, seed: int = 2) -> tuple[list[dict[str, Any]], list[Any]]:
+    """Trois actifs en rotation, un trade tous les 100 s qui dure 250 s : les trades d'actifs voisins se chevauchent (jamais ceux du même actif)."""
+    rng = np.random.default_rng(seed)
+    decisions: list[dict[str, Any]] = []
+    fills: list[Any] = []
+    for i in range(n):
+        asset = ("BTC", "ETH", "SOL")[i % 3]
+        entry = T0 + i * 100
+        ppo = float(rng.uniform(0.3, 1.0))
+        features = {name: float(rng.uniform(0, 1)) for name in FEATURES_V2}
+        features["ppo_confidence"] = ppo
+        win = ppo + rng.normal(0, 0.08) > 0.65
+        decisions.append({"decision_time": entry - 10.0, "instrument": f"{asset}/USDT", "direction": 1, "features": features, "vetoed": False})
+        fills.append(_fill(entry * 1000, "BUY", 1, 100.0, fid=f"b{i}", symbol=f"{asset}USDT"))
+        fills.append(_fill((entry + 250) * 1000, "SELL", 1, 101.0 if win else 99.0, fid=f"s{i}", symbol=f"{asset}USDT"))
+    return decisions, fills
+
+
+def test_the_significance_test_runs_on_non_overlapping_trades_only(tmp_path: Path) -> None:
+    decisions, fills = _overlapping_world(900)
+    code, _, details = tm.run(decisions, fills, out=tmp_path / "w.json", min_trades=300, min_test=20)
+    metrics = details["metrics"]
+    assert details["n_test"] > 60 and 20 <= metrics["n_independent"] < details["n_test"] * 0.5  # environ un trade sur trois est indépendant
+    assert metrics["auc_all_test_trades"] is not None and metrics["null_z"] > 2.326 and metrics["significant"] == 1.0
+    assert code == 0 and (tmp_path / "w.json").is_file()
+
+
+def test_too_few_independent_trades_refuse_even_when_the_test_set_looks_large(tmp_path: Path) -> None:
+    decisions, fills = _overlapping_world(900)
+    code, _, details = tm.run(decisions, fills, out=tmp_path / "w.json", min_trades=300, min_test=10_000)
+    assert code == 1 and not (tmp_path / "w.json").exists()
+    assert any("independent (non-overlapping) test trades" in reason for reason in details["refusals"])
+
+
+def test_the_mann_whitney_guard_blocks_a_bound_that_hanley_mcneil_alone_would_accept() -> None:
+    base = {"auc": 1.0, "auc_lower_99": 1.0, "n_independent": 60.0, "brier": 0.1, "baseline_brier": 0.25}
+    assert tm.acceptance_failures({**base, "significant": 1.0, "null_z": 9.0}, n_labeled=500, n_test=60, min_trades=300, min_test=50, min_auc=0.55, test_has_both=True) == []
+    problems = tm.acceptance_failures({**base, "significant": 0.0, "null_z": 1.5}, n_labeled=500, n_test=60, min_trades=300, min_test=50, min_auc=0.55, test_has_both=True)
+    assert len(problems) == 1 and "Mann-Whitney" in problems[0] and "Hanley-McNeil" in problems[0]

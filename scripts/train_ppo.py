@@ -3,7 +3,16 @@
 Not part of the live trading system -- run manually or on a schedule,
 completely independent of every running agent::
 
-    python scripts/train_ppo.py --lookback-days 30 --total-timesteps 200000
+    python scripts/train_ppo.py --symbol BTCUSDT --lookback-days 30 --total-timesteps 200000
+
+``--symbol`` is REQUIRED: ``MARKET_DATA_L2`` archives every crypto symbol under one topic, and an
+environment built from interleaved BTC and ETH rows trains on a price series that jumps between
+two price levels. The rows are filtered to the chosen symbol before any alignment or training.
+
+**No hold-out, no significance test.** This script trains on the whole window and exports the
+policy; it does not evaluate it out of sample, so nothing here shows the policy beats chance. The
+chronological split and the Hanley-McNeil gate added to ``train_model.py`` do not apply to an RL
+rollout and have not been written for it.
 
 Pipeline: TimescaleDB (via :mod:`scripts.train_model`'s fetch/alignment
 helpers, reused rather than duplicated) -> :class:`~src.rl.trading_env.
@@ -379,11 +388,14 @@ def export_model(model: ActorCritic, models_dir: Path = MODELS_DIR) -> Path:
 
 async def _fetch_aligned_dataset(
     lookback_days: int,
+    symbol: str,
 ) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
-    """Fetch and align TimescaleDB data into ``(features, prices)`` arrays.
+    """Fetch and align TimescaleDB data into ``(features, prices)`` arrays for ONE symbol.
 
     Args:
         lookback_days: How many days of archived history to query.
+        symbol: The instrument to train on (``BTC/USDT`` or ``BTCUSDT``). Rows of every other
+            symbol are dropped before alignment (see :func:`scripts.train_model.build_market_feature_frame`).
 
     Returns:
         ``features`` (shape ``(T, 5)``, in
@@ -423,7 +435,7 @@ async def _fetch_aligned_dataset(
         nlp_rows=len(nlp_records),
     )
 
-    market_frame = build_market_feature_frame(market_records)
+    market_frame = build_market_feature_frame(market_records, symbol)
     if market_frame.empty:
         raise ValueError("No market data available for the requested window.")
 
@@ -487,11 +499,12 @@ def run_ppo_training(
 
 
 async def run_training_pipeline(
-    *, lookback_days: int, total_timesteps: int, rollout_length: int, models_dir: Path = MODELS_DIR
+    *, symbol: str, lookback_days: int, total_timesteps: int, rollout_length: int, models_dir: Path = MODELS_DIR
 ) -> Path:
     """Fetch data, train, export -- the full offline PPO pipeline.
 
     Args:
+        symbol: The single instrument to train on (required: the archive mixes symbols).
         lookback_days: How many days of archived history to train on.
         total_timesteps: Total environment steps to train for.
         rollout_length: Steps collected per rollout, before each update.
@@ -500,7 +513,7 @@ async def run_training_pipeline(
     Returns:
         Path to the exported TorchScript ``.pt`` file.
     """
-    features, prices = await _fetch_aligned_dataset(lookback_days)
+    features, prices = await _fetch_aligned_dataset(lookback_days, symbol)
     _log.info("ppo_dataset_ready", timesteps=len(features))
 
     config = PPOConfig(total_timesteps=total_timesteps, rollout_length=rollout_length)
@@ -514,6 +527,7 @@ async def run_training_pipeline(
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--symbol", required=True, help="Instrument to train on, e.g. BTCUSDT or BTC/USDT (the archive mixes symbols).")
     parser.add_argument("--lookback-days", type=int, default=30, help="Days of archived history to train on.")
     parser.add_argument("--total-timesteps", type=int, default=200_000, help="Total environment steps.")
     parser.add_argument("--rollout-length", type=int, default=2048, help="Steps collected per rollout.")
@@ -526,6 +540,7 @@ def main() -> None:
     args = _parse_args()
     asyncio.run(
         run_training_pipeline(
+            symbol=args.symbol,
             lookback_days=args.lookback_days,
             total_timesteps=args.total_timesteps,
             rollout_length=args.rollout_length,
