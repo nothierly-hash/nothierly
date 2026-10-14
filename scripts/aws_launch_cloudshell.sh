@@ -1,8 +1,8 @@
-#!/usr/bin/env bash
-# À COLLER DANS AWS CloudShell (console AWS, icône >_ ; AWS CLI v2 et vos droits de console y sont déjà). Région : Tokyo.
 # Crée : rôle SSM, groupe de sécurité SANS port entrant, route Internet si elle manque, instance Ubuntu 24.04 m6i.xlarge (100 Go gp3, sans clé SSH),
 # amorçage automatique (Docker, git, python3-zmq, clé de déploiement ed25519), puis affiche la clé PUBLIQUE à ajouter à votre dépôt.
-# Ne crée aucun secret, n'ouvre aucun port, ne touche à aucune clé d'exchange.
+# Ne crée aucun secret, #!/usr/bin/env bash
+# À COLLER DANS AWS CloudShell (console AWS, icône >_ ; AWS CLI v2 et vos droits de console y sont déjà). Région : Tokyo.
+n'ouvre aucun port, ne touche à aucune clé d'exchange.
 #
 # NON exécuté : écrit sans accès à un compte AWS (bash -n seulement). Lire avant de coller ; en cas d'erreur, la sortie dit laquelle.
 set -euo pipefail
