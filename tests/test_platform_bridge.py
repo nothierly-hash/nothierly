@@ -28,6 +28,7 @@ from src.bridge.platform_bridge import (
     quantize_size,
     to_internal_symbol,
 )
+from workers.common.alerts import Severity
 
 D = Decimal
 
@@ -76,7 +77,8 @@ def _bridge(view: EngineView | None = None, **cfg: Any) -> tuple[PlatformBridge,
     reader, sink, clock = FakeReader(view), FakeSink(), Clock()
     cfg.setdefault("size_bucket_pct", None)  # tailles exactes, sauf dans les tests de quantification
     cfg.setdefault("min_hold_s", 0.0)  # pas de délai de maintien, sauf dans ses propres tests
-    return PlatformBridge(reader, sink, BridgeConfig(**cfg), clock=clock), reader, sink, clock
+    alerter = cfg.pop("alerter", None)
+    return PlatformBridge(reader, sink, BridgeConfig(**cfg), clock=clock, alerter=alerter), reader, sink, clock
 
 
 def _step(bridge: PlatformBridge) -> list[str]:
@@ -243,6 +245,158 @@ def test_the_hold_is_counted_per_instrument_and_zero_disables_it() -> None:
     off_reader.view = _view()
     off_clock.now += 1
     assert _step(off) == ["BTC/USDT:FLAT:0:engine_state"]
+
+
+# --- Alertes -----------------------------------------------------------------------------------
+
+
+class RecordingAlerter:
+    def __init__(self, *, fail: bool = False) -> None:
+        self.alerts: list[tuple[str, str, Severity]] = []
+        self._fail = fail
+
+    def alert(self, text: str, *, key: str, severity: Severity = Severity.CRITICAL) -> bool:
+        if self._fail:
+            raise RuntimeError("l'alerteur plante")
+        self.alerts.append((key, text, severity))
+        return True
+
+    @property
+    def keys(self) -> list[str]:
+        return [k for k, _, _ in self.alerts]
+
+
+def test_ordinary_operation_never_alerts() -> None:
+    rec = RecordingAlerter()
+    bridge, reader, _, clock = _bridge(_view(_pos()), instruments=("BTC/USDT",), alerter=rec)
+    _step(bridge)
+    reader.view = _view(_pos(units="0.02"))  # changement de taille
+    clock.now += 11
+    _step(bridge)
+    reader.view = _view(_pos(status="SHORT"))  # inversion
+    clock.now += 11
+    _step(bridge)
+    reader.view = _view()  # fermeture
+    clock.now += 11
+    _step(bridge)
+    assert rec.alerts == []
+
+
+def test_a_kill_switch_flatten_alerts_once_with_what_was_held_and_announces_the_end() -> None:
+    rec = RecordingAlerter()
+    bridge, reader, _, clock = _bridge(_view(_pos()), instruments=("BTC/USDT",), alerter=rec)
+    _step(bridge)
+    reader.view = _view(_pos(), safe=False)
+    for _ in range(4):  # le kill switch dure plusieurs cycles : une seule alerte
+        clock.now += 2
+        _step(bridge)
+    assert rec.keys == ["kill_switch"] and rec.alerts[0][2] is Severity.CRITICAL
+    assert "BTC/USDT LONG 5.00%" in rec.alerts[0][1] and "KILL SWITCH" in rec.alerts[0][1]
+    reader.view = _view(_pos(), safe=True)
+    clock.now += 2
+    _step(bridge)
+    assert rec.keys == ["kill_switch", "end:kill_switch"] and rec.alerts[1][2] is Severity.INFO
+    reader.view = _view(_pos(), safe=False)  # un nouvel épisode réalerte
+    clock.now += 2
+    _step(bridge)
+    assert rec.keys[-1] == "kill_switch" and len(rec.alerts) == 3
+
+
+def test_a_silent_engine_alerts_only_once_the_grace_period_has_elapsed() -> None:
+    rec = RecordingAlerter()
+    bridge, reader, _, clock = _bridge(_view(_pos()), instruments=("BTC/USDT",), engine_grace_s=30.0, alerter=rec)
+    _step(bridge)
+    reader.view = _view(_pos(), alive=False)
+    clock.now += 10
+    _step(bridge)
+    clock.now += 19
+    _step(bridge)
+    assert rec.alerts == []  # dans le délai de grâce : pas d'alerte pour une coupure d'une seconde
+    clock.now += 12
+    _step(bridge)
+    clock.now += 5
+    _step(bridge)
+    assert rec.keys == ["engine_down"] and "MOTEUR muet" in rec.alerts[0][1] and "BTC/USDT LONG" in rec.alerts[0][1]
+    reader.view = _view(_pos(), alive=True)
+    clock.now += 2
+    _step(bridge)
+    assert rec.keys == ["engine_down", "end:engine_down"]
+
+
+def test_an_unreadable_engine_state_alerts_like_a_silent_engine_after_the_grace_period() -> None:
+    rec = RecordingAlerter()
+    bridge, reader, _, clock = _bridge(_view(_pos()), instruments=("BTC/USDT",), engine_grace_s=30.0, alerter=rec)
+    _step(bridge)
+    reader.error = ConnectionError("redis injoignable")
+    clock.now += 20
+    _step(bridge)
+    assert rec.alerts == []
+    clock.now += 31
+    _step(bridge)
+    assert rec.keys == ["engine_down"]
+
+
+def test_a_bus_that_refuses_publications_alerts_at_the_threshold_and_recovers() -> None:
+    rec = RecordingAlerter()
+    bridge, _, sink, clock = _bridge(_view(_pos()), instruments=("BTC/USDT",), publish_failure_threshold=3, refresh_s=1.0, alerter=rec)
+    sink.accept = False
+    for _ in range(2):
+        clock.now += 2
+        _step(bridge)
+    assert rec.alerts == []  # 2 refus : sous le seuil
+    for _ in range(3):
+        clock.now += 2
+        _step(bridge)
+    assert rec.keys == ["publish_failing"] and "ne reçoivent plus rien" in rec.alerts[0][1]  # une seule alerte pour 5 refus
+    sink.accept = True
+    clock.now += 2
+    _step(bridge)
+    assert rec.keys == ["publish_failing", "end:publish_failing"]
+
+
+def test_a_publication_that_succeeds_resets_the_failure_count() -> None:
+    rec = RecordingAlerter()
+    bridge, _, sink, clock = _bridge(_view(_pos()), instruments=("BTC/USDT",), publish_failure_threshold=3, refresh_s=1.0, alerter=rec)
+    for accept in (False, False, True, False, False, True):
+        sink.accept = accept
+        clock.now += 2
+        _step(bridge)
+    assert rec.alerts == []
+
+
+def test_an_open_position_without_equity_alerts_once_per_episode() -> None:
+    rec = RecordingAlerter()
+    bridge, reader, _, clock = _bridge(_view(_pos(), equity=None), instruments=("BTC/USDT",), alerter=rec)
+    for _ in range(3):
+        clock.now += 2
+        _step(bridge)
+    assert rec.keys == ["no_equity:BTC/USDT"] and "equity du moteur inconnue" in rec.alerts[0][1]
+    reader.view = _view(_pos())
+    clock.now += 2
+    _step(bridge)
+    assert rec.keys == ["no_equity:BTC/USDT", "end:no_equity:BTC/USDT"]
+
+
+def test_a_crashing_alerter_does_not_stop_the_bridge_and_without_one_nothing_changes() -> None:
+    bridge, reader, sink, clock = _bridge(_view(_pos()), instruments=("BTC/USDT",), alerter=RecordingAlerter(fail=True))
+    _step(bridge)
+    reader.view = _view(_pos(), safe=False)
+    clock.now += 2
+    assert _step(bridge) == ["BTC/USDT:FLAT:0:kill_switch"] and sink.signals[-1].direction is SignalDirection.FLAT
+    quiet, qreader, qsink, qclock = _bridge(_view(_pos()), instruments=("BTC/USDT",))
+    _step(quiet)
+    qreader.view = _view(_pos(), safe=False)
+    qclock.now += 2
+    assert _step(quiet) == ["BTC/USDT:FLAT:0:kill_switch"]
+
+
+def test_the_flatten_still_goes_out_when_the_kill_switch_alert_cannot_be_sent() -> None:
+    """L'ordre de réduire l'exposition ne dépend jamais de l'alerte."""
+    bridge, reader, sink, clock = _bridge(_view(_pos(), _pos("ETH/USDT", units="0.2", price="2500")), alerter=RecordingAlerter(fail=True))
+    _step(bridge)
+    reader.view = _view(_pos(), _pos("ETH/USDT", units="0.2", price="2500"), safe=False)
+    clock.now += 2
+    assert sorted(_step(bridge)) == ["BTC/USDT:FLAT:0:kill_switch", "ETH/USDT:FLAT:0:kill_switch"]
 
 
 # --- Publication -----------------------------------------------------------------------------

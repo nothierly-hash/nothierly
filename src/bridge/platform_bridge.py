@@ -35,6 +35,19 @@ visible, la magnitude de la conviction fuiterait l'alpha). Voir ``contracts.plat
   en deçà, on ne publie rien (pas de bascule sur une coupure d'une seconde) ;
 - equity inconnue ou nulle -> on ne publie rien pour une position ouverte (on ne devine pas une taille).
 
+**Alertes** (``alerter`` optionnel, ``workers.common.alerts`` : non bloquant, ne lève jamais). Le pont prévient l'opérateur
+quand il agit de sa propre initiative ou qu'il ne peut plus faire son travail, une fois par épisode, avec un message
+de fin d'épisode :
+
+- ``FLAT`` forcé par le kill switch du moteur ; ``FLAT`` forcé parce que le moteur est muet au-delà du délai de grâce
+  (le message liste les positions que le pont tenait publiées) ;
+- ``publish_failure_threshold`` publications consécutives refusées par le bus (``publish`` renvoie ``False``) : les
+  workers ne reçoivent plus rien ;
+- position ouverte du moteur dont la taille est indéterminable (equity inconnue) : rien n'est publié pour elle.
+
+Ni les ouvertures, ni les fermetures ordinaires, ni les republications n'alertent. Un pont arrêté ou tué n'alerte pas :
+c'est l'homme mort des workers qui protège alors (voir plus bas), et seule une surveillance extérieure le voit.
+
 **Limites connues, à ne pas ignorer :**
 
 - Seules les paires crypto ``BASE/USDT`` sont traduites. Le moteur n'a **aucun modèle d'actions** : rien ne peut
@@ -60,6 +73,7 @@ from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Final, Protocol
 
 from contracts.platform_signal import AssetClass, OrderType, PlatformSignal, SignalDirection, TargetVenue
+from workers.common.alerts import Alerter, Severity
 
 _log = logging.getLogger(__name__)
 
@@ -110,6 +124,7 @@ class BridgeConfig:
     engine_grace_s: float = 30.0
     ttl_ms: int = 10_000
     poll_s: float = 2.0
+    publish_failure_threshold: int = 3  # publications refusées d'affilée avant d'alerter
     flatten_on_halt: bool = True
     flatten_when_engine_down: bool = True
     symbol_overrides: Mapping[str, str] = field(default_factory=dict)
@@ -177,8 +192,11 @@ class _Published:
 class PlatformBridge:
     def __init__(
         self, reader: EngineStateReader, sink: SignalSink, config: BridgeConfig | None = None,
-        *, clock: Callable[[], float] = time.monotonic,
+        *, clock: Callable[[], float] = time.monotonic, alerter: Alerter | None = None,
     ) -> None:
+        self._alerter = alerter
+        self._episodes: set[str] = set()  # épisodes d'alerte en cours (une alerte au début, une à la fin)
+        self._publish_failures = 0
         self._reader = reader
         self._sink = sink
         self._cfg = config or BridgeConfig()
@@ -191,6 +209,30 @@ class PlatformBridge:
         for instrument, symbol in self._symbols.items():
             if symbol is None:
                 _log.warning("bridge_instrument_ignored instrument=%s : seules les paires crypto BASE/USDT sont traduites", instrument)
+
+    def _begin(self, key: str, text: str) -> None:
+        """Alerte critique au début d'un épisode ; silencieuse tant qu'il dure."""
+        if key in self._episodes:
+            return
+        self._episodes.add(key)
+        self._notify(key, text, Severity.CRITICAL)
+
+    def _end(self, key: str, text: str) -> None:
+        if key in self._episodes:
+            self._episodes.discard(key)
+            self._notify(f"end:{key}", text, Severity.INFO)
+
+    def _notify(self, key: str, text: str, severity: Severity) -> None:
+        if self._alerter is None:
+            return
+        try:
+            self._alerter.alert(text, key=key, severity=severity)
+        except Exception:  # noqa: BLE001 -- une alerte ne doit jamais arrêter le pont
+            _log.exception("bridge_alert_failed key=%s", key)
+
+    def _held_exposure(self) -> str:
+        held = [f"{i} {p.direction.value} {p.pct}%" for i, p in self._last.items() if p.direction is not SignalDirection.FLAT]
+        return ", ".join(held) if held else "aucune position publiée"
 
     def _build(self, symbol: str, direction: SignalDirection, pct: Decimal) -> PlatformSignal:
         return PlatformSignal(
@@ -241,7 +283,16 @@ class PlatformBridge:
         signal = self._build(symbol, direction, pct)
         if not self._sink.publish(signal):
             _log.warning("bridge_signal_dropped instrument=%s", instrument)
+            self._publish_failures += 1
+            if self._publish_failures >= self._cfg.publish_failure_threshold:
+                self._begin(
+                    "publish_failing",
+                    f"le bus refuse les publications ({self._publish_failures} d'affilée, dernier : {instrument}) : "
+                    "les workers ne reçoivent plus rien et gardent leur dernière cible jusqu'à leur homme mort.",
+                )
             return None
+        self._publish_failures = 0
+        self._end("publish_failing", "le bus accepte de nouveau les publications.")
         previous = self._last.get(instrument)
         opened_at = previous.opened_at if previous is not None and previous.direction is direction and direction is not SignalDirection.FLAT else now
         self._last[instrument] = _Published(direction, pct, now, opened_at)
@@ -268,10 +319,20 @@ class PlatformBridge:
         flatten_reason: str | None = None
         if view is not None and not view.system_safe and self._cfg.flatten_on_halt:
             flatten_reason = "kill_switch"
+            self._begin("kill_switch", f"KILL SWITCH du moteur actif : le pont publie FLAT sur tous les instruments. Tenu avant : {self._held_exposure()}.")
         elif not healthy and down_for >= self._cfg.engine_grace_s and self._cfg.flatten_when_engine_down:
             flatten_reason = "engine_down"
+            self._begin(
+                "engine_down",
+                f"MOTEUR muet depuis {down_for:.0f}s (grâce {self._cfg.engine_grace_s:.0f}s) : le pont publie FLAT sur tous les instruments. "
+                f"Tenu avant : {self._held_exposure()}.",
+            )
         elif not healthy:
             return []  # dans le délai de grâce : on garde la dernière cible, on ne publie rien
+        if view is not None and view.system_safe:
+            self._end("kill_switch", "kill switch levé : le pont republie l'état du moteur.")
+        if healthy:
+            self._end("engine_down", "le moteur est revenu : le pont republie son état.")
 
         published: list[str] = []
         by_instrument = {p.instrument: p for p in (view.positions if view is not None else ())}
@@ -290,8 +351,14 @@ class PlatformBridge:
                     if instrument not in self._warned:
                         self._warned.add(instrument)
                         _log.warning("bridge_no_equity instrument=%s : position ouverte mais equity inconnue, rien n'est publié", instrument)
+                    self._begin(
+                        f"no_equity:{instrument}",
+                        f"position ouverte sur {instrument} mais equity du moteur inconnue : taille indéterminable, rien n'est publié "
+                        "(les workers gardent leur dernière cible).",
+                    )
                     continue
                 self._warned.discard(instrument)
+                self._end(f"no_equity:{instrument}", f"equity du moteur de nouveau connue : {instrument} republié.")
                 (direction, pct), reason = self._apply_min_hold(instrument, *target, now), "engine_state"
             if self._should_publish(instrument, direction, pct, now):
                 entry = self._publish(instrument, direction, pct, reason, now)

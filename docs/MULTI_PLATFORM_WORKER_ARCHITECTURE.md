@@ -563,9 +563,20 @@ Le worker tombe seul, le Cerveau n'en sait rien.
 
 Rien d'autre : ni ordres exécutés, ni signaux périmés ou rejoués, ni tailles sous le minimum, ni mode simulé. Une série n'alerte qu'une fois, quelle que soit sa longueur.
 
+**Alertes du pont** (`src/bridge/platform_bridge.py`, même alerteur, source `platform-bridge`). Une alerte critique au début d'un épisode, une info à sa fin, jamais une par cycle :
+
+| Événement | Clé | Alerte quand |
+|---|---|---|
+| `FLAT` forcé par le kill switch du moteur | `kill_switch` | dès le premier cycle ; le message liste ce que le pont tenait publié |
+| `FLAT` forcé car le moteur est muet ou illisible | `engine_down` | après le délai de grâce (30 s), pas avant : une coupure d'une seconde ne réveille personne |
+| Le bus refuse les publications (`publish` renvoie `False`) | `publish_failing` | 3 refus d'affilée (`--publish-failure-threshold`) |
+| Position ouverte, equity inconnue : rien n'est publié | `no_equity:<instrument>` | dès qu'elle est constatée |
+
+Ni ouvertures, ni fermetures, ni inversions, ni republications n'alertent. L'alerte ne retarde ni n'empêche jamais le `FLAT` (testé : un alerteur qui plante laisse partir le `FLAT`). `--dry-run` n'alerte pas (observer sans effet) ; `--test-alert` envoie un message de test à `WEBHOOK_URL` puis quitte, sans Redis ni clés, pour valider la configuration avant un déploiement. Sans `WEBHOOK_URL`, le pont démarre quand même et l'écrit en avertissement.
+
 **Limites.**
 
-- **Le worker Numerai et le pont n'alertent pas.** Numerai n'est pas sur le socle (pas de positions, pas d'homme mort) ; le pont publie `FLAT` sur kill switch ou moteur muet sans prévenir personne. C'est le trou le plus utile à combler ensuite (un `FLAT` forcé est exactement ce qu'un opérateur veut savoir).
+- **Le worker Numerai n'alerte pas** : il n'est pas sur le socle (pas de positions, pas d'homme mort).
 - **« Connexion API coupée » n'est détectée que par ses effets** : cinq lectures ou ordres consécutifs en échec. Un exchange injoignable alors qu'aucun signal n'arrive n'est pas vu ; c'est l'homme mort qui parle alors, si le moteur se tait aussi.
 - **Un worker qui meurt ne s'alerte pas lui-même.** Un processus tué (mémoire, `kill -9`) n'envoie rien : seule une surveillance extérieure (un `healthcheck` Docker, un moniteur de disponibilité) le voit.
 - Le délai de 3 s ne borne pas la résolution DNS, ce qui n'a pas de conséquence ici : l'envoi se fait dans un thread à part.

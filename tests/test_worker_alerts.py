@@ -492,3 +492,59 @@ def test_without_a_directory_only_stdout_is_used_and_an_unusable_directory_does_
     blocker.write_text("pas un dossier", encoding="utf-8")
     assert configure_logging("w", log_dir=blocker / "sub") is None  # mkdir impossible : stdout seul, pas d'exception
     assert len(_our_handlers()) == 1
+
+
+# --- Pont : lanceur --------------------------------------------------------------------------
+
+
+def _load_bridge_script() -> Any:
+    import importlib.util
+    import sys
+
+    path = Path(__file__).resolve().parents[1] / "scripts" / "run_platform_bridge.py"
+    spec = importlib.util.spec_from_file_location("run_platform_bridge_alerts", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["run_platform_bridge_alerts"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_the_bridge_test_alert_flag_checks_the_webhook_end_to_end_without_redis_or_keys(monkeypatch: pytest.MonkeyPatch, hook: _Hook, capsys: pytest.CaptureFixture[str]) -> None:
+    module = _load_bridge_script()
+    monkeypatch.delenv("NOTHIERLY_ZMQ_SECRET", raising=False)
+    monkeypatch.setenv("WEBHOOK_URL", hook.url)
+    assert module.main(["--test-alert"]) == 0
+    assert len(hook.bodies) == 1 and hook.bodies[0]["text"].startswith("[INFO][platform-bridge] test d'alerte")
+    assert "envoyée" in capsys.readouterr().out
+
+
+def test_the_bridge_test_alert_flag_fails_clearly_when_the_webhook_is_missing_unreachable_or_unsafe(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    module = _load_bridge_script()
+    monkeypatch.delenv("WEBHOOK_URL", raising=False)
+    assert module.main(["--test-alert"]) == 1
+    monkeypatch.setenv("WEBHOOK_URL", f"http://127.0.0.1:{_free_port()}/hook/{TOKEN}")
+    assert module.main(["--test-alert"]) == 1
+    monkeypatch.setenv("WEBHOOK_URL", f"http://evil.example/{TOKEN}")
+    assert module.main(["--test-alert"]) == 2
+    captured = capsys.readouterr()
+    assert TOKEN not in captured.out + captured.err
+
+
+def test_the_bridge_only_gets_an_alerter_when_it_really_publishes(monkeypatch: pytest.MonkeyPatch, hook: _Hook) -> None:
+    module = _load_bridge_script()
+    seen: list[Any] = []
+
+    async def fake_amain(args: Any, alerter: Any = None) -> int:
+        seen.append(alerter)
+        return 0
+
+    monkeypatch.setattr(module, "_amain", fake_amain)
+    monkeypatch.setattr(module, "configure_logging", lambda *a, **k: None)
+    monkeypatch.setenv("WEBHOOK_URL", hook.url)
+    monkeypatch.setenv("NOTHIERLY_ZMQ_SECRET", SECRET)
+    monkeypatch.delenv("NOTHIERLY_ZMQ_ENCRYPTION", raising=False)
+    assert module.main(["--dry-run"]) == 0 and seen == [None]  # observer sans effet : un dry-run ne réveille personne
+    assert module.main([]) == 0 and isinstance(seen[1], WebhookAlerter)
+    monkeypatch.delenv("WEBHOOK_URL")
+    assert module.main([]) == 0 and seen[2] is None  # pas de webhook : pas d'alerte, avertissement au démarrage

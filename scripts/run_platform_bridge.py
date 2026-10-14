@@ -30,6 +30,7 @@ from core.config import get_settings
 from core.redis_client import RedisClient
 from core.security import is_system_safe
 from src.bridge.platform_bridge import BridgeConfig, PlatformBridge, RedisEngineReader
+from workers.common.alerts import AlertConfigError, Severity, WebhookAlerter
 from workers.common.logging_setup import configure_logging
 
 _log = logging.getLogger("platform_bridge")
@@ -47,7 +48,7 @@ def _curve_config(*, connect: bool) -> CurveServerConfig | CurveClientConfig | N
     return CurveClientConfig.from_env() if connect else CurveServerConfig.from_env()
 
 
-async def _amain(args: argparse.Namespace) -> int:
+async def _amain(args: argparse.Namespace, alerter: WebhookAlerter | None = None) -> int:
     settings = get_settings()
     if settings.mock_mode:
         _log.warning(
@@ -64,6 +65,7 @@ async def _amain(args: argparse.Namespace) -> int:
         refresh_s=args.refresh_s,
         engine_grace_s=args.engine_grace_s,
         poll_s=args.poll_s,
+        publish_failure_threshold=args.publish_failure_threshold,
     )
     reader = RedisEngineReader(client, is_system_safe)
     if args.dry_run:
@@ -72,8 +74,21 @@ async def _amain(args: argparse.Namespace) -> int:
     curve = _curve_config(connect=args.connect)
     with SecureSignalPublisher.from_env(args.endpoint, bind=not args.connect, curve=curve) as publisher:
         _log.info("platform_bridge_started endpoint=%s venue=%s instruments=%s encrypted=%s", publisher.endpoint, config.venue.value, list(config.instruments), publisher.encrypted)
-        await PlatformBridge(reader, publisher, config).run()
+        await PlatformBridge(reader, publisher, config, alerter=alerter).run()
     return 0
+
+
+def _test_alert(alerter: WebhookAlerter | None) -> int:
+    """Vérifie la configuration du webhook de bout en bout : 0 si le message est parti, 1 sinon."""
+    if alerter is None:
+        print("WEBHOOK_URL n'est pas définie.", file=sys.stderr)
+        return 1
+    alerter.alert("test d'alerte du pont : si vous lisez ceci, le webhook est bien configuré.", key="test", severity=Severity.INFO)
+    alerter.flush(10.0)
+    ok = alerter.delivered == 1
+    print("alerte de test envoyée." if ok else "échec de l'envoi (voir le journal ; l'URL n'y figure pas).", file=sys.stderr if not ok else sys.stdout)
+    alerter.close(2.0)
+    return 0 if ok else 1
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -89,12 +104,27 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--refresh-s", type=float, default=10.0)
     parser.add_argument("--engine-grace-s", type=float, default=30.0)
     parser.add_argument("--log-dir", default=None, help="dossier d'un fichier de journal tournant (10 Mo x 5) en plus de stdout ; défaut : NOTHIERLY_LOG_DIR")
-    parser.add_argument("--dry-run", action="store_true", help="journalise les signaux sans les publier")
+    parser.add_argument("--publish-failure-threshold", type=int, default=3, help="publications refusées d'affilée avant d'alerter")
+    parser.add_argument("--dry-run", action="store_true", help="journalise les signaux sans les publier (et sans alerter)")
+    parser.add_argument("--test-alert", action="store_true", help="envoie une alerte de test à WEBHOOK_URL puis quitte (ni Redis, ni bus)")
     parser.add_argument("--allow-plaintext-remote", action="store_true", help="autorise un endpoint non local SANS chiffrement CURVE")
     args = parser.parse_args(argv)
     if args.min_hold_s < 0:
         parser.error("--min-hold-s doit être >= 0")
+    if args.publish_failure_threshold < 1:
+        parser.error("--publish-failure-threshold doit être >= 1")
     configure_logging("platform-bridge", log_dir=args.log_dir)
+    try:
+        alerter = WebhookAlerter.from_env(source="platform-bridge")
+    except AlertConfigError as exc:
+        print(f"Erreur : {exc}", file=sys.stderr)
+        return 2
+    if args.test_alert:
+        return _test_alert(alerter)
+    if args.dry_run:
+        alerter = None  # observer sans effet : un dry-run ne réveille personne
+    elif alerter is None:
+        _log.warning("platform_bridge_alerts_off : WEBHOOK_URL absente, un FLAT forcé ou un bus muet ne préviendra personne")
     if not args.dry_run:
         try:
             load_secret_from_env()
@@ -107,10 +137,13 @@ def main(argv: list[str] | None = None) -> int:
             print(refusal, file=sys.stderr)
             return 2
     try:
-        return asyncio.run(_amain(args))
+        return asyncio.run(_amain(args, alerter))
     except KeyboardInterrupt:
         _log.info("platform_bridge_stopped")
         return 0
+    finally:
+        if alerter is not None:
+            alerter.close(2.0)
 
 
 if __name__ == "__main__":
