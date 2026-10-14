@@ -1,12 +1,12 @@
 # Architecture Hub-and-Spoke : Cerveau Alpha vers 6 plateformes de capital externe, en 3 pôles
 
-Statut : le **contrat** (`contracts/platform_signal.py`), le **transport signé** (`contracts/secure_signal_bus.py`) le **chiffrement du bus** (`contracts/curve_transport.py`, CURVE) et quatre workers (`workers/numerai`, `workers/hyperliquid`, `workers/bybit`, `workers/darwinex`, qui partagent le socle `workers/common`) sont implémentés et testés, mais **jamais exécutés contre les vraies plateformes**. Les 2 autres plateformes (Binance, Enzyme) ont leur nom réservé dans le contrat et **aucun worker**. Les faits sur les plateformes viennent de recherches web et sont marqués **[à vérifier]** quand les sources divergent ou manquent. Les éléments du repo cités existent réellement (chemins indiqués).
+Statut : le **contrat** (`contracts/platform_signal.py`), le **transport signé** (`contracts/secure_signal_bus.py`) le **chiffrement du bus** (`contracts/curve_transport.py`, CURVE) et cinq workers (`workers/numerai`, `workers/hyperliquid`, `workers/bybit`, `workers/binance`, `workers/darwinex`, qui partagent le socle `workers/common`) sont implémentés et testés, mais **jamais exécutés contre les vraies plateformes**. Les 2 autres plateformes (Binance, Enzyme) ont leur nom réservé dans le contrat et **aucun worker**. Les faits sur les plateformes viennent de recherches web et sont marqués **[à vérifier]** quand les sources divergent ou manquent. Les éléments du repo cités existent réellement (chemins indiqués).
 
 Périmètre : exactement 6 plateformes, celles du tableau ci-dessous.
 
 | Pôle | Plateformes | Exécution | Worker |
 |---|---|---|---|
-| Crypto | `HYPERLIQUID`, `BINANCE`, `BYBIT`, `ENZYME` | temps réel | Hyperliquid et Bybit écrits (dry-run) ; Binance et Enzyme non écrits |
+| Crypto | `HYPERLIQUID`, `BINANCE`, `BYBIT`, `ENZYME` | temps réel | Hyperliquid, Bybit et Binance écrits (dry-run) ; Enzyme non écrit |
 | Actions | `NUMERAI_SIGNALS` | batch quotidien | écrit (dry-run) |
 | Forex / CFD | `DARWINEX_ZERO` | pont MT5 (Windows) | écrit (dry-run) |
 
@@ -377,12 +377,28 @@ Rust ou C++ n'apportent rien ici. La latence est dominée par l'API de la venue 
 - **Garde-fous** : ≥100 tickers de l'univers du jour, 0 < signal < 1, pas de doublon, dérive de distribution (corrélation avec la soumission précédente) pour détecter un modèle cassé avant l'envoi.
 - **Sortie** : le seul worker dont la "fuite" (scores par ticker) est le produit lui-même.
 
-### 4.5 Worker Binance (lead trading) : non écrit
+### 4.5 Worker Binance (USDⓈ-M futures)
 
-- **API officielle documentée** : statut de lead trader futures (`isLeadTrader`) et liste blanche de symboles (`GET /sapi/v1/copyTrading/futures/leadSymbol`).
-- **Non confirmé** : qu'un compte lead puisse **passer des ordres par API** pour son portefeuille de copy trading. Je n'ai trouvé que des endpoints de lecture. À clarifier auprès de Binance **avant** d'écrire quoi que ce soit.
-- Éligibilité actuelle (futures) et disponibilité par région : non trouvées.
-- Le repo a un `CcxtBrokerAdapter` (`src/execution/broker_gateway.py`) à évaluer, mais il ne couvre pas les endpoints spécifiques au copy trading.
+*Implémenté et testé : `workers/binance/` (`planner`, `client`, `worker`) et `ws_tracker.BinanceFillFeed`. Dry-run sur le réseau de test par défaut ; jamais exécuté contre Binance, aucune clé utilisée. Les tests portent sur des réponses simulées.*
+
+**Ce que fait le worker.** Il hérite du socle commun (signature, file « dernier signal », drawdown, homme mort, alertes, suivi des fills) et traduit un `PlatformSignal` ciblant `BINANCE` (ou `ALL`) en ordre sur un perpétuel **USDT** (`BTCUSDT` ; les contrats USDC et à échéance sont ignorés). Précision par `exchangeInfo` : pas de quantité (`LOT_SIZE.stepSize`, arrondi vers zéro), pas de prix (`PRICE_FILTER.tickSize`), quantité et notionnel minimaux. Comme les autres workers, un signal `MARKET` part en **limite IOC** bornée par le glissement maximal (un vrai ordre `MARKET` n'a aucun plafond de prix). Client REST en stdlib, signé HMAC-SHA256 : pas de `binance-futures-connector`.
+
+**Sécurités au démarrage** (la CLI s'arrête avec le code 2 et un message, sans trace) :
+
+- **Droit de retrait** : lu sur `GET /sapi/v1/account/apiRestrictions` (hôte spot `api.binance.com`, champ `enableWithdrawals`). **Ce n'est pas `/fapi/v1/apiTradingStatus`**, qui ne renvoie que des indicateurs de règles quantitatives (verrous) et ne dit rien des permissions de la clé : la clé est refusée si le retrait est actif, et en **mainnet** aussi quand ses droits ne peuvent pas être lus (l'absence de retrait ne se prouve pas). Le réseau de test n'a pas cet endpoint : la vérification y est indisponible, journalisée, non bloquante.
+- **Mode de position** : `GET /fapi/v1/positionSide/dual` ; hedge = arrêt. En marche, une position `LONG`/`SHORT` hedge arrête l'ordre (`hedge_mode_unsupported`).
+- Mainnet live : `--live --network mainnet --i-understand-real-funds` et homme mort obligatoire, comme les autres.
+
+**Réponse d'ordre et erreurs.** `newOrderRespType=RESULT` : statut final `filled`, `partial`, `unfilled` ou `rejected`. Un refus de Binance (code négatif, par exemple `-2019` marge insuffisante) est `rejected` ; une réponse illisible, un délai dépassé ou `-1007` (statut inconnu) lèvent : pas de nouvel essai à l'aveugle, le signal suivant relit la position. Une dérive d'horloge (`-1021`) resynchronise sur `/fapi/v1/time` et retente une fois.
+
+**Flux de fills.** `POST /fapi/v1/listenKey` (clé prolongée toutes les 30 min, redemandée à chaque reconnexion), flux privé `wss://fstream.binance.com/private/ws?listenKey=<clé>&events=ORDER_TRADE_UPDATE` (le schéma `/public` `/market` `/private` remplace l'ancien `/ws/<clé>`, arrêté sur la production le 2026-04-23 selon la doc). **Chaque exécution (`x == "TRADE"`) est un fill**, partielle ou finale : ne retenir que `FILLED` perdrait les exécutions partielles. Rapprochement par `newClientOrderId` (champ `c`) puis `i`, avec l'intention enregistrée avant l'envoi.
+
+**Ce qui n'est pas vérifié, à contrôler avant tout argent réel.**
+
+- **Réseau de test** : la doc donne `demo-fapi.binance.com` (page générale) et, ailleurs, `testnet.binancefuture.com`, et aucune des deux pages consultées ne donne l'adresse WebSocket du test pour le nouveau schéma. L'adresse REST se surcharge (`--base-url`) et l'adresse WebSocket aussi (`--ws-base-url`) ; celle par défaut (`wss://demo-fstream.binance.com`) est la plus plausible, pas confirmée. Une source tierce dit que l'ancien chemin du test s'est arrêté le 2026-09-12.
+- **Schéma de `ORDER_TRADE_UPDATE`, filtres `exchangeInfo` et `bookTicker`** : la page officielle consultée ne les détaillait pas ; le code suit la forme historique de l'API.
+- `account` V3 : l'equity est `totalMarginBalance` (compte en marge mono-actif USDT) ; en mode multi-actifs ou portefeuille la lecture serait différente.
+- **Lien avec le copy trading de Binance : toujours inconnu.** L'API documentée du statut de lead trader futures (`isLeadTrader`) et de la liste de symboles autorisés (`/sapi/v1/copyTrading/futures/leadSymbol`) est de lecture ; on n'a pas confirmé qu'un compte lead puisse passer des ordres par API pour son portefeuille de copy trading, ni les conditions d'éligibilité. Ce worker ordonne sur un compte futures ordinaire ; que ses ordres soient ceux copiés par des followers dépend de ce point.
 
 ### 4.6 Worker Bybit (master trader)
 
@@ -636,7 +652,7 @@ Un fill sans intention connue (ordre passé à la main, intention perdue) est en
 | 4 | **Bybit** : API V5, perp USDT, clé sans retrait | **fait** (dry-run) ; testnet à faire ; compte des fonds et mode de position à confirmer ; critères master à confirmer |
 | 5 | **Darwinex Zero** : pont MT5 Windows, SL serveur, garde de compte, idempotence | **fait** (dry-run) ; test sur un vrai terminal à faire ; plateforme exacte du compte à vérifier ; abonnement |
 | 6 | **Enzyme** : vault EVM, relais anti-MEV | à écrire ; gas |
-| 7 | **Binance** : seulement après confirmation écrite des conditions et de l'API d'ordres | bloqué par des inconnues |
+| 7 | **Binance** : API USDⓈ-M futures, clé sans retrait, mode one-way | **fait** (dry-run, jamais connecté) ; testnet à faire ; **le lien avec le copy trading de Binance reste inconnu** (§4.5) |
 
 Ordre = choix de risque et d'information disponible (API documentée d'abord, inconnues en dernier), pas une promesse de délai (§0.4).
 

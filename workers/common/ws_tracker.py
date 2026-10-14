@@ -21,6 +21,10 @@ rapprochent d'une intention connue ; un fill d'instantané sans intention n'est 
 étranger). **Bybit ne rejoue rien** : les fills survenus pendant une coupure du flux sont perdus pour cette base (une
 réconciliation par l'API REST reste à écrire).
 
+**Flux dont l'adresse se prépare** (Binance) : un flux peut définir ``async prepare() -> str`` (renvoie l'adresse à
+ouvrir, appelée avant CHAQUE connexion, par exemple pour obtenir une clé de session) et ``async keepalive()`` avec
+``keepalive_interval_s`` (appelée dans la boucle d'écoute ; si elle échoue, la connexion est refaite avec une clé neuve).
+
 **Non vérifié contre les vrais services.** Les formats de messages viennent de la documentation officielle (abonnement
 ``userFills`` d'Hyperliquid ; authentification, ``ping`` et sujet ``execution`` du flux privé Bybit V5). Les adresses
 Hyperliquid et le rythme de ping de 50 s viennent de la documentation et de l'usage courant, pas de la page consultée.
@@ -49,6 +53,7 @@ HYPERLIQUID_WS: Final[dict[str, str]] = {
     "mainnet": "wss://api.hyperliquid.xyz/ws",
     "testnet": "wss://api.hyperliquid-testnet.xyz/ws",
 }
+BINANCE_PRIVATE_PATH: Final[str] = "/private/ws"  # schéma /public /market /private ; l'ancien /ws/<listenKey> est arrêté (doc Binance)
 BYBIT_PRIVATE_WS: Final[dict[str, str]] = {
     "mainnet": "wss://stream.bybit.com/v5/private",
     "testnet": "wss://stream-testnet.bybit.com/v5/private",
@@ -224,6 +229,80 @@ class BybitFillFeed:
         return events
 
 
+# --- Binance ---------------------------------------------------------------------------------
+
+
+class UserStreamApi(Protocol):
+    """Ce que le flux Binance demande à l'API REST : obtenir et prolonger la clé du flux privé (appels bloquants)."""
+
+    def start_user_stream(self) -> str: ...
+
+    def keepalive_user_stream(self) -> None: ...
+
+
+class BinanceFillFeed:
+    """Flux privé USDⓈ-M : événements ``ORDER_TRADE_UPDATE``.
+
+    L'adresse porte la clé de session : ``<base>/private/ws?listenKey=<clé>&events=ORDER_TRADE_UPDATE`` (schéma officiel ;
+    l'ancien ``/ws/<clé>`` ne délivre plus les données privées). La clé vit 60 minutes : elle est prolongée toutes les 30 et
+    redemandée à chaque reconnexion ; Binance coupe de toute façon une connexion après 24 h.
+
+    **Un fill = un événement ``x == "TRADE"``** (dernière exécution ``l`` à ``L``), qu'il soit partiel
+    (``X == PARTIALLY_FILLED``) ou final (``FILLED``) : ne retenir que ``FILLED`` perdrait les exécutions partielles et
+    fausserait le prix moyen. Le fill est rapproché par l'identifiant client ``c`` (notre ``newClientOrderId``) puis par ``i``.
+
+    Schéma de l'événement tiré de la connaissance de l'API (stable depuis des années) : la page officielle consultée ne le
+    détaillait pas. Les champs requis qui manqueraient font rejeter le message (compté ``malformed``), jamais inventer un prix.
+    """
+
+    venue = "BINANCE"
+    heartbeat_interval_s = 0.0  # Binance envoie des pings de protocole, auxquels la bibliothèque répond seule
+    keepalive_interval_s = 30 * 60.0
+
+    def __init__(self, *, api: UserStreamApi, ws_base_url: str = "wss://fstream.binance.com") -> None:
+        self._api = api
+        self._base = ws_base_url.rstrip("/")
+        self.url = f"{self._base}{BINANCE_PRIVATE_PATH}"
+
+    def __repr__(self) -> str:
+        return f"BinanceFillFeed(base={self._base!r})"  # l'adresse complète contient la clé de session
+
+    async def prepare(self) -> str:
+        listen_key = await asyncio.to_thread(self._api.start_user_stream)
+        self.url = f"{self._base}{BINANCE_PRIVATE_PATH}?listenKey={listen_key}&events=ORDER_TRADE_UPDATE"
+        return self.url
+
+    async def keepalive(self) -> None:
+        await asyncio.to_thread(self._api.keepalive_user_stream)
+
+    async def handshake(self, conn: WsConnection) -> None:
+        """Rien à envoyer : la clé et les événements voulus sont dans l'adresse."""
+
+    def heartbeat_message(self) -> str | None:
+        return None
+
+    def parse(self, raw: str) -> list[FillEvent]:
+        message = json.loads(raw)
+        if not isinstance(message, dict) or message.get("e") != "ORDER_TRADE_UPDATE":
+            return []
+        order = message["o"]
+        if order.get("x") != "TRADE":
+            return []
+        qty = _decimal(order["l"])
+        if qty <= 0:
+            return []
+        side = str(order["S"]).upper()
+        if side not in ("BUY", "SELL"):
+            raise ValueError(f"côté de fill inconnu : {side[:10]!r}")
+        commission = order.get("n")
+        symbol = str(order["s"])
+        return [FillEvent(
+            venue=self.venue, symbol=symbol, is_buy=side == "BUY", price=_decimal(order["L"]), qty=qty, time_ms=int(order["T"]),
+            fill_id=f"{symbol}:{order['t']}", order_id=str(order["i"]), client_id=str(order.get("c") or "") or None,
+            fee=None if commission in (None, "") else _decimal(commission), fee_currency=order.get("N") or None,
+        )]
+
+
 # --- Transport -------------------------------------------------------------------------------
 
 
@@ -298,7 +377,9 @@ class FillTracker:
         while not stop.is_set():
             conn: WsConnection | None = None
             try:
-                conn = await self._connect(self._feed.url)
+                prepare = getattr(self._feed, "prepare", None)
+                url = await prepare() if prepare is not None else self._feed.url
+                conn = await self._connect(url)
                 await self._feed.handshake(conn)
                 failures, backoff = 0, self._backoff_min
                 self.connected = True
@@ -335,7 +416,9 @@ class FillTracker:
 
     async def _pump(self, conn: WsConnection, stop: asyncio.Event) -> None:
         interval = self._feed.heartbeat_interval_s
-        last_heartbeat = time.monotonic()
+        keepalive = getattr(self._feed, "keepalive", None)
+        keepalive_interval = float(getattr(self._feed, "keepalive_interval_s", 0.0))
+        last_heartbeat = last_keepalive = time.monotonic()
         while not stop.is_set():
             try:
                 raw: str | None = await asyncio.wait_for(conn.recv(), self._recv_timeout_s)
@@ -349,6 +432,9 @@ class FillTracker:
                 if heartbeat is not None:
                     await conn.send(heartbeat)
                 last_heartbeat = now
+            if keepalive is not None and keepalive_interval and now - last_keepalive >= keepalive_interval:
+                await keepalive()  # échec : remonte, la connexion est refaite avec une clé neuve
+                last_keepalive = now
             if self._pending:
                 await self._flush_pending()
 

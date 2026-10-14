@@ -428,7 +428,8 @@ FAKE_KEY = "0x" + "ab" * 32  # valeur factice de test, sans lien avec une vraie 
 
 class _FakeInfo:
     def __init__(self, base_url: str, skip_ws: bool = False, timeout: float | None = None) -> None:
-        self.base_url, self.skip_ws, self.queried = base_url, skip_ws, []
+        self.base_url, self.skip_ws = base_url, skip_ws
+        self.queried: list[Any] = []
 
     def meta(self) -> dict[str, Any]:
         return {"universe": [{"name": "BTC", "szDecimals": 5}, {"name": "ETH", "szDecimals": 4}]}
@@ -448,7 +449,8 @@ class _FakeExchange:
     last: _FakeExchange | None = None
 
     def __init__(self, wallet: Any, base_url: str, **kwargs: Any) -> None:
-        self.wallet, self.base_url, self.kwargs, self.calls = wallet, base_url, kwargs, []
+        self.wallet, self.base_url, self.kwargs = wallet, base_url, kwargs
+        self.calls: list[Any] = []
         _FakeExchange.last = self
 
     def order(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
