@@ -34,6 +34,8 @@ from workers.common.alerts import AlertConfigError, Severity, WebhookAlerter, bu
 from workers.common.base import ExposureWorkerBase, ExposureWorkerConfig
 from workers.common.exposure import RiskLimits
 from workers.common.logging_setup import ENV_LOG_DIR, configure_logging
+from types import SimpleNamespace
+from workers.common.ratelimit import RateLimitGate
 
 SECRET = "test-secret-0123456789abcdef-0123456789abcdef"
 TOKEN = "SECRETTOKEN-abc123"
@@ -426,7 +428,7 @@ def test_the_alerter_from_the_environment_is_handed_to_the_worker_config(monkeyp
 
     monkeypatch.setenv("NOTHIERLY_ZMQ_SECRET", SECRET)
     monkeypatch.setenv("HL_ACCOUNT_ADDRESS", "0x" + "1" * 40)
-    monkeypatch.setattr(hl, "SdkHyperliquidClient", lambda **_: object())
+    monkeypatch.setattr(hl, "SdkHyperliquidClient", lambda **_: SimpleNamespace(rate_gate=RateLimitGate()))
     monkeypatch.setattr(hl, "HyperliquidWorker", factory)
     monkeypatch.setattr(hl, "configure_logging", lambda *a, **k: None)
     monkeypatch.delenv("WEBHOOK_URL", raising=False)

@@ -21,6 +21,7 @@ import time
 from collections.abc import Callable, Coroutine
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -34,6 +35,7 @@ from workers.common.fills_db import (
     slippage_bps,
     summarize,
 )
+from workers.common.ratelimit import RateLimitGate
 from workers.common.ws_tracker import (
     BybitFillFeed,
     FeedError,
@@ -653,7 +655,7 @@ def _hl_cli_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *args: str) 
     monkeypatch.setenv("HL_ACCOUNT_ADDRESS", "0x" + "1" * 40)
     monkeypatch.setenv("HL_AGENT_SECRET", "a" * 64)
     monkeypatch.delenv("WEBHOOK_URL", raising=False)
-    monkeypatch.setattr(hl, "SdkHyperliquidClient", lambda **_: object())
+    monkeypatch.setattr(hl, "SdkHyperliquidClient", lambda **_: SimpleNamespace(rate_gate=RateLimitGate()))
     monkeypatch.setattr(hl, "HyperliquidWorker", factory)
     monkeypatch.setattr(hl, "configure_logging", lambda *a, **k: None)
     with pytest.raises(_Stop):

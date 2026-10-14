@@ -28,9 +28,11 @@ from contracts.curve_transport import CurveClientConfig, CurveConfigError, trans
 from contracts.platform_signal import PlatformSignal, TargetVenue
 from contracts.secure_signal_bus import load_secret_from_env
 from workers.common.paths import default_db_path, ensure_parent
+from workers.common.ratelimit import RateLimitError
 from workers.common.alerts import AlertConfigError, WebhookAlerter
 from workers.common.base import (
     DEFAULT_MAX_AGE_MS,
+    RATE_LIMITED,
     EmergencyOrder,
     ExposureWorkerBase,
     ExposureWorkerConfig,
@@ -95,6 +97,9 @@ class HyperliquidWorker(ExposureWorkerBase):
             snapshot, mids = await asyncio.gather(
                 asyncio.to_thread(self._client.snapshot), asyncio.to_thread(self._client.mids)
             )
+        except RateLimitError as exc:  # limite de débit : rien n'est envoyé, le worker attend la fin de la pause (ratelimit.py)
+            self._record(signal, asset, RATE_LIMITED, now, None, f"status={exc.status} pause={exc.retry_after_s:.0f}s")
+            return RATE_LIMITED
         except Exception as exc:  # noqa: BLE001 -- lecture réseau : on n'ordonne pas à l'aveugle
             _log.exception("hl_read_failed")
             self._record(signal, asset, "read_error", now, None, repr(exc)[:200])
@@ -132,6 +137,9 @@ class HyperliquidWorker(ExposureWorkerBase):
         self._intent_before_send(plan.cloid, asset, plan.is_buy, mid, plan.size)
         try:
             outcome = await asyncio.to_thread(self._client.place_order, request)
+        except RateLimitError as exc:  # refusé avant traitement (429/418) : l'ordre n'existe pas, il sera renvoyé après la pause
+            self._record(signal, asset, RATE_LIMITED, now, plan, f"status={exc.status} pause={exc.retry_after_s:.0f}s")
+            return RATE_LIMITED
         except Exception as exc:  # noqa: BLE001 -- ambigu : pas de nouvel essai, le prochain signal relit la position
             _log.exception("hl_place_order_failed")
             self._record(signal, asset, "error", now, plan, repr(exc)[:200])
@@ -150,6 +158,9 @@ class HyperliquidWorker(ExposureWorkerBase):
             snapshot, mids = await asyncio.gather(
                 asyncio.to_thread(self._client.snapshot), asyncio.to_thread(self._client.mids)
             )
+        except RateLimitError as exc:  # pause de débit : aucune requête, réessayé au cycle suivant sans compter de tentative
+            self._record_emergency(asset, RATE_LIMITED, now_ms, None, f"status={exc.status} pause={exc.retry_after_s:.0f}s")
+            return RATE_LIMITED
         except Exception as exc:  # noqa: BLE001 -- lecture réseau : on réessaiera au prochain cycle
             _log.exception("hl_dead_man_read_failed")
             self._record_emergency(asset, "read_error", now_ms, None, repr(exc)[:200])
@@ -174,6 +185,9 @@ class HyperliquidWorker(ExposureWorkerBase):
         self._intent_before_send(cloid, asset, is_buy, mid, order.size, "emergency")
         try:
             outcome = await asyncio.to_thread(self._client.place_order, request)
+        except RateLimitError as exc:  # refusé avant traitement : la fermeture sera retentée après la pause
+            self._record_emergency(asset, RATE_LIMITED, now_ms, order, f"status={exc.status} pause={exc.retry_after_s:.0f}s")
+            return RATE_LIMITED
         except Exception as exc:  # noqa: BLE001 -- ambigu : la position est relue au prochain cycle, qui décide
             _log.exception("hl_dead_man_place_order_failed")
             self._record_emergency(asset, "error", now_ms, order, repr(exc)[:200])
@@ -243,7 +257,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         feed = HyperliquidFillFeed(user=os.environ.get("HL_VAULT_ADDRESS") or account, network=network.value)
         tracker = FillTracker(feed, fills_db, alerter=alerter)
     config = HyperliquidWorkerConfig(
-        address=args.address, secret_key=load_secret_from_env(), db_path=args.db, dry_run=not args.live,
+        rate_gate=client.rate_gate, address=args.address, secret_key=load_secret_from_env(), db_path=args.db, dry_run=not args.live,
         dead_man_timeout_s=args.dead_man_timeout or None, curve=curve, alerter=alerter, fills_db=fills_db, fill_tracker=tracker,
     )
     worker = HyperliquidWorker(config, client)

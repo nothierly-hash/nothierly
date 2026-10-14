@@ -38,6 +38,7 @@ from enum import Enum
 from typing import Any, Final, Protocol
 
 from workers.bybit.planner import InstrumentSpec
+from workers.common.ratelimit import RATE_LIMITED_STATUSES, HttpRateLimited, RateLimitGate, guard_transport
 
 _META_TTL_S: Final[float] = 600.0
 _PAGE_GUARD: Final[int] = 50  # pagination bornée : jamais de boucle infinie sur un curseur défaillant
@@ -146,6 +147,8 @@ def _urllib_transport(method: str, url: str, headers: Mapping[str, str], body: b
         with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 -- URLs fixes https (_BASE_URLS)
             return int(response.status), bytes(response.read())
     except urllib.error.HTTPError as exc:
+        if exc.code in RATE_LIMITED_STATUSES:  # 429 (418 : IP bannie, Binance) : on garde l'en-tête Retry-After pour la pause (voir ratelimit.py)
+            raise HttpRateLimited(int(exc.code), exc.headers.get("Retry-After") if exc.headers is not None else None) from exc
         return int(exc.code), bytes(exc.read())
 
 
@@ -164,6 +167,7 @@ class BybitRestClient:
         timeout: float = 10.0,
         transport: Transport | None = None,
         clock_ms: Callable[[], int] | None = None,
+        rate_gate: RateLimitGate | None = None,
     ) -> None:
         if not api_key or not api_secret:
             raise ValueError("api_key et api_secret sont requis.")
@@ -172,7 +176,8 @@ class BybitRestClient:
         self._base = _BASE_URLS[network]
         self._recv = str(recv_window_ms)
         self._timeout = timeout
-        self._transport = transport or _urllib_transport
+        self.rate_gate = rate_gate or RateLimitGate()  # partagée par tous les appels du client ; le worker l'attend avant d'exécuter (voir ratelimit.py)
+        self._transport = guard_transport(transport or _urllib_transport, self.rate_gate)
         self._clock_ms = clock_ms or (lambda: int(time.time() * 1000))
         self._specs: dict[str, InstrumentSpec] = {}
         self._specs_at = 0.0

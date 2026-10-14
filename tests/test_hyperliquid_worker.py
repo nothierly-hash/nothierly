@@ -43,6 +43,8 @@ from workers.hyperliquid.planner import (
 )
 from workers.hyperliquid.state import HlState
 from workers.hyperliquid.worker import HyperliquidWorker, HyperliquidWorkerConfig
+from types import SimpleNamespace
+from workers.common.ratelimit import RateLimitGate
 
 SECRET = "test-secret-0123456789abcdef-0123456789abcdef"
 OTHER_SECRET = "another-secret-9876543210fedcba-9876543210fedcba"
@@ -692,7 +694,7 @@ def test_cli_dead_man_timeout_defaults_to_300_and_zero_is_refused_on_mainnet_liv
         seen.append(config.dead_man_timeout_s)
         raise _Stop
 
-    monkeypatch.setattr(worker_module, "SdkHyperliquidClient", lambda **_: object())
+    monkeypatch.setattr(worker_module, "SdkHyperliquidClient", lambda **_: SimpleNamespace(rate_gate=RateLimitGate()))
     monkeypatch.setattr(worker_module, "HyperliquidWorker", worker_factory)
     for args, expected in ((["--address", "tcp://127.0.0.1:1"], 300.0), (["--address", "tcp://127.0.0.1:1", "--dead-man-timeout", "45"], 45.0),
                            (["--address", "tcp://127.0.0.1:1", "--dead-man-timeout", "0"], None)):

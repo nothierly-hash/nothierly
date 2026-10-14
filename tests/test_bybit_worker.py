@@ -46,6 +46,7 @@ from workers.bybit.planner import (
 )
 from workers.bybit.worker import BybitWorker, BybitWorkerConfig
 from workers.common.exposure import floor_to_step, size_for_pct_step
+from workers.common.ratelimit import RateLimitGate
 
 SECRET = "test-secret-0123456789abcdef-0123456789abcdef"
 OTHER_SECRET = "another-secret-9876543210fedcba-9876543210fedcba"
@@ -557,6 +558,7 @@ def _env(monkeypatch: pytest.MonkeyPatch, **env: str) -> None:
 class _KeyOnly:
     def __init__(self, info: KeyInfo) -> None:
         self._info = info
+        self.rate_gate = RateLimitGate()
 
     def key_info(self) -> KeyInfo:
         return self._info

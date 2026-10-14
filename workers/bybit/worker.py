@@ -46,8 +46,9 @@ from workers.bybit.client import (
 )
 from workers.bybit.planner import ZERO, OrderPlan, bybit_symbol, plan_order, round_price, size_for_pct_step
 from workers.common.paths import default_db_path, ensure_parent
+from workers.common.ratelimit import RateLimitError
 from workers.common.alerts import AlertConfigError, WebhookAlerter
-from workers.common.base import EmergencyOrder, ExposureWorkerBase, ExposureWorkerConfig, clear_execution_halt, dead_man_timeout_problem
+from workers.common.base import RATE_LIMITED, EmergencyOrder, ExposureWorkerBase, ExposureWorkerConfig, clear_execution_halt, dead_man_timeout_problem
 from workers.common.exposure import emergency_slippage_bps
 from workers.common.fills_db import FillsDatabase
 from workers.common.logging_setup import configure_logging
@@ -122,6 +123,9 @@ class BybitWorker(ExposureWorkerBase):
             _log.error("bybit_hedge_mode_unsupported %s", exc)
             self._record(signal, asset, "hedge_mode_unsupported", now, None, str(exc)[:200])
             return "hedge_mode_unsupported"
+        except RateLimitError as exc:  # limite de débit : rien n'est envoyé, le worker attend la fin de la pause (ratelimit.py)
+            self._record(signal, asset, RATE_LIMITED, now, None, f"status={exc.status} pause={exc.retry_after_s:.0f}s")
+            return RATE_LIMITED
         except Exception as exc:  # noqa: BLE001 -- lecture réseau : on n'ordonne pas à l'aveugle
             _log.exception("bybit_read_failed")
             self._record(signal, asset, "read_error", now, None, repr(exc)[:200])
@@ -158,6 +162,9 @@ class BybitWorker(ExposureWorkerBase):
         self._intent_before_send(plan.order_link_id, plan.symbol, plan.is_buy, mid, plan.size)
         try:
             outcome = await asyncio.to_thread(self._client.place_order, request)
+        except RateLimitError as exc:  # refusé avant traitement (429/418) : l'ordre n'existe pas, il sera renvoyé après la pause
+            self._record(signal, asset, RATE_LIMITED, now, plan, f"status={exc.status} pause={exc.retry_after_s:.0f}s")
+            return RATE_LIMITED
         except Exception as exc:  # noqa: BLE001 -- ambigu : pas de nouvel essai, le prochain signal relit la position
             _log.exception("bybit_place_order_failed")
             self._record(signal, asset, "error", now, plan, repr(exc)[:200])
@@ -182,6 +189,9 @@ class BybitWorker(ExposureWorkerBase):
             _log.critical("bybit_dead_man_hedge_mode_unsupported %s : FERMER LA POSITION À LA MAIN", exc)
             self._record_emergency(asset, "hedge_mode_unsupported", now_ms, None, str(exc)[:200])
             return "hedge_mode_unsupported"
+        except RateLimitError as exc:  # pause de débit : aucune requête, réessayé au cycle suivant sans compter de tentative
+            self._record_emergency(asset, RATE_LIMITED, now_ms, None, f"status={exc.status} pause={exc.retry_after_s:.0f}s")
+            return RATE_LIMITED
         except Exception as exc:  # noqa: BLE001 -- lecture réseau : on réessaiera au prochain cycle
             _log.exception("bybit_dead_man_read_failed")
             self._record_emergency(asset, "read_error", now_ms, None, repr(exc)[:200])
@@ -205,6 +215,9 @@ class BybitWorker(ExposureWorkerBase):
         self._intent_before_send(link_id, asset, is_buy, mid, order.size, "emergency")
         try:
             outcome = await asyncio.to_thread(self._client.place_order, request)
+        except RateLimitError as exc:  # refusé avant traitement : la fermeture sera retentée après la pause
+            self._record_emergency(asset, RATE_LIMITED, now_ms, order, f"status={exc.status} pause={exc.retry_after_s:.0f}s")
+            return RATE_LIMITED
         except Exception as exc:  # noqa: BLE001 -- ambigu : la position est relue au prochain cycle, qui décide
             _log.exception("bybit_dead_man_place_order_failed")
             self._record_emergency(asset, "error", now_ms, order, repr(exc)[:200])
@@ -275,6 +288,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         fills_db = FillsDatabase(args.fills_db or Path(args.db).with_name("bybit_fills.sqlite3"))
         tracker = FillTracker(BybitFillFeed(api_key=key, api_secret=secret, network=network.value), fills_db, alerter=alerter)
     config = BybitWorkerConfig(
+        rate_gate=client.rate_gate,
         address=args.address,
         secret_key=load_secret_from_env(),
         db_path=args.db,

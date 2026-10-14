@@ -84,6 +84,7 @@ from contracts.curve_transport import CurveClientConfig, apply_client, is_local_
 from contracts.platform_signal import PlatformSignal, TargetVenue
 from contracts.secure_signal_bus import DEFAULT_TOPIC, ReplayGuard, open_envelope, verify_signature
 from workers.common.alerts import Alerter, Severity
+from workers.common.ratelimit import RateLimitGate
 from workers.common.exposure import RiskLimits
 from workers.common.fills_db import FillsDatabase, OrderIntent
 from workers.common.state import ExecutionRecord, ExecutionState
@@ -121,7 +122,8 @@ def dead_man_timeout_problem(timeout_s: float) -> str | None:
 # Résultats d'``emergency_flatten`` qui terminent le travail sur un actif (les autres sont réessayés).
 _FLATTEN_DONE = frozenset({"no_position", "dry_run"})
 # Codes d'``execute_signal`` qui signalent une panne côté exchange (lecture ou envoi), par opposition à un rejet ordinaire.
-_API_FAILURE_STATUSES = frozenset({"read_error", "error"})
+RATE_LIMITED = "rate_limited"  # limite de débit (HTTP 429/418) : rien n'est parti, le signal attend la fin de la pause
+_API_FAILURE_STATUSES = frozenset({"read_error", "error", RATE_LIMITED})
 # Une fermeture d'urgence envoyée attend sa vérification au cycle suivant (normal) : on n'alerte qu'à la tentative N.
 _FLATTEN_ALERT_ATTEMPTS = 3
 _STREAK_MESSAGES = {
@@ -200,6 +202,8 @@ class ExposureWorkerConfig:
     # Alertes webhook sur les urgences opérationnelles (homme mort, drawdown, pannes répétées). ``None`` = aucune.
     alerter: Alerter | None = None
     api_failure_threshold: int = 5
+    # Porte de débit du client REST du worker (la MÊME instance que ``client.rate_gate``) : le worker dort exactement la pause demandée par l'exchange.
+    rate_gate: RateLimitGate | None = None
     # Mesure du slippage : base des intentions/fills et tracker du flux privé (``None`` = pas de mesure).
     fills_db: FillsDatabase | None = None
     fill_tracker: FillTrackerLike | None = None
@@ -457,6 +461,8 @@ class ExposureWorkerBase(ABC):
             for asset in self._expired_assets(now):
                 self._flatten_attempts[asset] = self._flatten_attempts.get(asset, 0) + 1
                 result = await self.emergency_flatten(asset, attempt=self._flatten_attempts[asset], now_ms=now)
+                if result == RATE_LIMITED:
+                    self._flatten_attempts[asset] -= 1  # rien n'a été tenté : la tentative ne compte pas (elle élargirait l'écart de prix pour rien)
                 if result == "no_position":
                     self._flatten_attempts.pop(asset, None)
                     self._flat_until_ms[asset] = now + int(max(timeout, _FLAT_RECHECK_MIN_S) * 1000)
@@ -492,6 +498,8 @@ class ExposureWorkerBase(ABC):
                 continue
             self._flatten_attempts[asset] = self._flatten_attempts.get(asset, 0) + 1
             result = await self.emergency_flatten(asset, attempt=self._flatten_attempts[asset], now_ms=now_ms)
+            if result == RATE_LIMITED:
+                self._flatten_attempts[asset] -= 1  # pause de débit en cours : ni tentative comptée, ni requête partie ; réessayé au cycle suivant
             if result in _FLATTEN_DONE:
                 self._flatten_attempts.pop(asset, None)
             else:
@@ -514,6 +522,13 @@ class ExposureWorkerBase(ABC):
             await wake.wait()
             wake.clear()
             while self._pending and not stop.is_set() and not self.dead_man_tripped:
+                gate = self._cfg.rate_gate
+                if gate is not None and gate.remaining() > 0:
+                    # Limite de débit : on dort la pause EXACTE de l'exchange avant de toucher à quoi que ce soit, sans verrou d'ordre ni signal retiré de la
+                    # file (le plus récent pour l'actif l'emporte à la reprise) ; la boucle asyncio, le bus et l'homme mort continuent de tourner.
+                    _log.warning("%s_rate_limited_pause remaining_s=%.0f status=%s", self._tag, gate.remaining(), gate.last_status)
+                    await gate.wait(stop)
+                    continue  # on réévalue tout : arrêt demandé, homme mort déclenché, signal plus récent
                 asset = next(iter(self._pending))
                 signal = self._pending.pop(asset)
                 try:
@@ -522,6 +537,11 @@ class ExposureWorkerBase(ABC):
                             break
                         status = await self.execute_signal(signal, asset)
                     self._track("execute", status not in _API_FAILURE_STATUSES, status)
+                    if status == RATE_LIMITED and gate is not None and gate.remaining() > 0:
+                        self._pending.setdefault(asset, signal)  # refusé avant traitement : réessayé après la pause, sauf signal plus récent
+                        if gate.last_status == 418:
+                            self._alert("rate_limit_ban", f"l'exchange a répondu 418 (adresse IP bannie) : le worker se met en pause {gate.remaining():.0f}s et ne renverra rien avant."
+                                        )
                 except Exception as exc:  # noqa: BLE001 -- un signal ne doit jamais arrêter l'exécuteur
                     _log.exception("%s_execute_failed asset=%s", self._tag, asset)
                     self._track("execute", False, type(exc).__name__)

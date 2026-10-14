@@ -44,6 +44,8 @@ from contracts.secure_signal_bus import DEFAULT_TOPIC, SECRET_ENV_VAR, SecureSig
 from workers.common.base import ExposureWorkerBase, ExposureWorkerConfig
 from workers.numerai.client import DryRunClient
 from workers.numerai.worker import NumeraiWorker, NumeraiWorkerConfig
+from types import SimpleNamespace
+from workers.common.ratelimit import RateLimitGate
 
 SECRET = "test-secret-0123456789abcdef-0123456789abcdef"
 MARKER = b"CRYPTO_BTC_USD"
@@ -394,7 +396,7 @@ def test_worker_command_lines_refuse_a_remote_address_without_curve_and_pass_the
             raise _Stop
         return factory
 
-    monkeypatch.setattr(hl_module, "SdkHyperliquidClient", lambda **_: object())
+    monkeypatch.setattr(hl_module, "SdkHyperliquidClient", lambda **_: SimpleNamespace(rate_gate=RateLimitGate()))
     monkeypatch.setattr(hl_module, "HyperliquidWorker", capture("hl"))
     for var, value in ((ENV_SERVER_PUBLIC, keys.server.public), (ENV_CLIENT_PUBLIC, keys.client.public), (ENV_CLIENT_SECRET, keys.client.secret)):
         monkeypatch.setenv(var, value)

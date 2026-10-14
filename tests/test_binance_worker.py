@@ -50,6 +50,7 @@ from workers.binance.worker import BinanceWorker, BinanceWorkerConfig
 from workers.common.exposure import RiskLimits, size_for_pct_step
 from workers.common.fills_db import FillsDatabase
 from workers.common.ws_tracker import BinanceFillFeed, FillTracker
+from workers.common.ratelimit import RateLimitGate
 
 SECRET = "test-secret-0123456789abcdef-0123456789abcdef"
 API_KEY = "KEY-abc123"
@@ -685,6 +686,7 @@ def test_a_working_keepalive_extends_the_key_without_reconnecting() -> None:
 class _CliClient:
     def __init__(self, *, permissions: KeyPermissions, hedge: bool = False, boom: Exception | None = None, **_: Any) -> None:
         self._permissions, self._hedge, self._boom = permissions, hedge, boom
+        self.rate_gate = RateLimitGate()
 
     def key_permissions(self) -> KeyPermissions:
         if self._boom:

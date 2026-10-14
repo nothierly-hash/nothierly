@@ -19,11 +19,13 @@ from __future__ import annotations
 
 import re
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import Enum
 from typing import Any, Final, Protocol
+
+from workers.common.ratelimit import RateLimitError, RateLimitGate, rate_limit_status
 
 
 class Network(str, Enum):
@@ -109,6 +111,7 @@ class SdkHyperliquidClient:
         agent_secret: str | None = None,
         vault_address: str | None = None,
         timeout: float = 10.0,
+        rate_gate: RateLimitGate | None = None,
     ) -> None:
         if not _ADDRESS_RE.match(account_address):
             raise ValueError("account_address doit être une adresse 0x de 40 caractères hexadécimaux.")
@@ -135,6 +138,7 @@ class SdkHyperliquidClient:
             )
         self._decimals: dict[str, int] = {}
         self._decimals_at = 0.0
+        self.rate_gate = rate_gate or RateLimitGate()
 
     @property
     def read_only(self) -> bool:
@@ -143,29 +147,44 @@ class SdkHyperliquidClient:
     def __repr__(self) -> str:
         return f"SdkHyperliquidClient(read_only={self.read_only})"
 
+    def _sdk(self, call: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        """Appel du SDK sous la porte de débit : refusé localement pendant une pause, et un 429/418 (``status_code`` + ``header`` de l'erreur du SDK)
+        arme la pause. Toute autre erreur est relancée telle quelle."""
+        self.rate_gate.check()
+        try:
+            result = call(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001 -- les erreurs du SDK n'ont pas de classe commune typée ; relancée si ce n'est pas une limite de débit
+            limited = rate_limit_status(exc)
+            if limited is None:
+                raise
+            raise RateLimitError(limited[0], self.rate_gate.block(*limited)) from exc
+        self.rate_gate.note_success()
+        return result
+
     def asset_decimals(self) -> Mapping[str, int]:
         if not self._decimals or time.monotonic() - self._decimals_at > _META_TTL_S:
-            universe = self._info.meta()["universe"]
+            universe = self._sdk(self._info.meta)["universe"]
             self._decimals = {str(a["name"]): int(a["szDecimals"]) for a in universe}
             self._decimals_at = time.monotonic()
         return self._decimals
 
     def snapshot(self) -> AccountSnapshot:
-        state = self._info.user_state(self._query_address)
+        state = self._sdk(self._info.user_state, self._query_address)
         positions = {
             str(p["position"]["coin"]): Decimal(str(p["position"]["szi"])) for p in state.get("assetPositions", [])
         }
         return AccountSnapshot(Decimal(str(state["marginSummary"]["accountValue"])), positions)
 
     def mids(self) -> Mapping[str, Decimal]:
-        return {str(coin): Decimal(str(px)) for coin, px in self._info.all_mids().items()}
+        return {str(coin): Decimal(str(px)) for coin, px in self._sdk(self._info.all_mids).items()}
 
     def place_order(self, request: OrderRequest) -> OrderOutcome:
         if self._exchange is None:
             raise RuntimeError("Client en lecture seule : aucune clé d'agent, aucun ordre possible.")
         from hyperliquid.utils.types import Cloid  # SDK optionnel, sans stubs (override mypy « hyperliquid.* »)
 
-        response = self._exchange.order(
+        response = self._sdk(
+            self._exchange.order,
             request.asset,
             request.is_buy,
             float(request.size),
