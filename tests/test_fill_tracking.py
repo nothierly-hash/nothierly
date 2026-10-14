@@ -166,7 +166,7 @@ def test_the_hyperliquid_urls_and_subscription() -> None:
             self.sent.append(text)
 
     rec = Recorder()
-    asyncio.run(HyperliquidFillFeed(user="0xUSER").handshake(rec))  # type: ignore[arg-type]
+    asyncio.run(HyperliquidFillFeed(user="0xUSER").handshake(rec))  # type: ignore[arg-type]  # le faux ne fournit que send(), seule méthode appelée par le handshake
     assert json.loads(rec.sent[0]) == {"method": "subscribe", "subscription": {"type": "userFills", "user": "0xUSER"}}
 
 
@@ -428,7 +428,7 @@ def test_the_event_loop_keeps_running_while_the_database_is_slow() -> None:
         time.sleep(0.4)
         return original(execution, now_ms=now_ms)
 
-    h.db.insert_execution = slow_insert  # type: ignore[method-assign]
+    h.db.insert_execution = slow_insert  # type: ignore[method-assign]  # double de test : méthode remplacée sur l'instance pour espionner ou simuler une panne
     h.script(_hl_message(HL_FILL))
     gaps: list[float] = []
 
@@ -468,7 +468,7 @@ def test_a_failing_database_does_not_stop_the_listener() -> None:
             raise OSError("disque plein")
         return original(execution, now_ms=now_ms)
 
-    h.db.insert_execution = flaky  # type: ignore[method-assign]
+    h.db.insert_execution = flaky  # type: ignore[method-assign]  # double de test : méthode remplacée sur l'instance pour espionner ou simuler une panne
     h.script(_hl_message(HL_FILL), _hl_message({**HL_FILL, "tid": 99}))
     _go(h.run_until(lambda: len(h.db.executions()) == 1))
     assert [e.fill_id for e in h.db.executions()] == ["99"]  # le premier a échoué, le suivant est passé
@@ -534,7 +534,7 @@ def test_the_hyperliquid_worker_records_the_intent_before_sending_and_attaches_t
         seen_before_send.append(db.find_intent("HYPERLIQUID", client_id=request.cloid))  # l'intention doit déjà exister ici
         return original(request)
 
-    client.place_order = spy  # type: ignore[method-assign]
+    client.place_order = spy  # type: ignore[method-assign]  # double de test : méthode remplacée sur l'instance pour espionner ou simuler une panne
     w = _worker(tmp_path, client, fills_db=db)
     assert _run(w, _signal()) == "filled"
     (before,) = seen_before_send

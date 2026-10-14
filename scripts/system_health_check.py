@@ -27,8 +27,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import argparse
 import asyncio
+import functools
 import importlib
 import importlib.util
+import io
 import json
 import math
 import os
@@ -609,7 +611,7 @@ def run_all(args: argparse.Namespace, env: Mapping[str, str]) -> list[Check]:
             checks.append(skipped("Plateformes", venue, "--no-network : appels REST non effectués"))
             continue
         runner = {"hyperliquid": check_hyperliquid, "bybit": check_bybit, "binance": check_binance}[venue]
-        guard("Plateformes", venue, lambda r=runner: r(env, args.network, live=args.live))  # type: ignore[misc]
+        guard("Plateformes", venue, functools.partial(runner, env, args.network, live=args.live))
     return checks
 
 
@@ -635,10 +637,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     for stream in (sys.stdout, sys.stderr):
-        try:
-            stream.reconfigure(encoding=_ENCODING_FIX, errors="replace")  # type: ignore[union-attr]
-        except (AttributeError, OSError):
-            pass
+        if isinstance(stream, io.TextIOWrapper):  # redirigé vers un fichier ou un tube : pas de reconfigure
+            try:
+                stream.reconfigure(encoding=_ENCODING_FIX, errors="replace")
+            except OSError:
+                pass
     args = parse_args(argv)
     env = build_env(ROOT, args.env_file)
     # les clés sont lues dans ce dictionnaire ; les bibliothèques du projet lisent os.environ : on y met ce que le diagnostic a trouvé

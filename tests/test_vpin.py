@@ -189,7 +189,7 @@ def test_hyperliquid_subscribes_to_each_coin_and_pings() -> None:
 
     feed = HyperliquidTradesFeed(["BTCUSDT", "ETHUSDT"])
     rec = Recorder()
-    asyncio.run(feed.handshake(rec))  # type: ignore[arg-type]
+    asyncio.run(feed.handshake(rec))  # type: ignore[arg-type]  # le faux ne fournit que send(), seule méthode appelée par le handshake
     assert [json.loads(m)["subscription"] for m in rec.sent] == [{"type": "trades", "coin": "BTC"}, {"type": "trades", "coin": "ETH"}]
     assert json.loads(feed.heartbeat_message() or "{}") == {"method": "ping"}
 

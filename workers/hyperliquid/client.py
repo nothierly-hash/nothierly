@@ -117,8 +117,8 @@ class SdkHyperliquidClient:
         if agent_secret is not None and not _SECRET_RE.match(agent_secret):
             raise ValueError("agent_secret n'a pas le format d'une clé privée (64 caractères hexadécimaux).")
         try:
-            from hyperliquid.exchange import Exchange  # type: ignore[import-not-found,unused-ignore]
-            from hyperliquid.info import Info  # type: ignore[import-not-found,unused-ignore]
+            from hyperliquid.exchange import Exchange  # SDK optionnel, sans stubs (voir pyproject : override mypy « hyperliquid.* »)
+            from hyperliquid.info import Info
         except ImportError as exc:  # pragma: no cover - dépend de l'environnement
             raise RuntimeError("hyperliquid-python-sdk n'est pas installé : pip install hyperliquid-python-sdk") from exc
         base_url = _BASE_URLS[network]
@@ -127,7 +127,7 @@ class SdkHyperliquidClient:
         self._info: Any = Info(base_url, skip_ws=True, timeout=timeout)
         self._exchange: Any = None
         if agent_secret is not None:
-            from eth_account import Account  # type: ignore[import-not-found,unused-ignore]
+            from eth_account import Account
 
             wallet = Account.from_key(agent_secret)  # la clé n'est pas conservée au-delà de cet appel
             self._exchange = Exchange(
@@ -163,7 +163,7 @@ class SdkHyperliquidClient:
     def place_order(self, request: OrderRequest) -> OrderOutcome:
         if self._exchange is None:
             raise RuntimeError("Client en lecture seule : aucune clé d'agent, aucun ordre possible.")
-        from hyperliquid.utils.types import Cloid  # type: ignore[import-not-found,unused-ignore]
+        from hyperliquid.utils.types import Cloid  # SDK optionnel, sans stubs (override mypy « hyperliquid.* »)
 
         response = self._exchange.order(
             request.asset,

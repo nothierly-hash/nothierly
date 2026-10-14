@@ -465,7 +465,7 @@ def test_stale_unknown_unreadable_and_unpriced_signals_never_order(tmp_path: Pat
     client.fail_read = False
     client.prices.pop("BTCUSDT")
     client.prices["BTCUSDT"] = D(50000)
-    client.mid = lambda symbol: None  # type: ignore[method-assign]
+    client.mid = lambda symbol: None  # type: ignore[method-assign]  # double de test : méthode remplacée sur l'instance pour espionner ou simuler une panne
     assert _run(w, _signal()) == "no_price" and client.place_calls == 0
 
 
@@ -537,7 +537,7 @@ def test_the_worker_records_the_intent_before_sending_and_attaches_the_order_id(
         seen.append(db.find_intent("BINANCE", client_id=request.client_order_id))
         return original(request)
 
-    client.place_order = spy  # type: ignore[method-assign]
+    client.place_order = spy  # type: ignore[method-assign]  # double de test : méthode remplacée sur l'instance pour espionner ou simuler une panne
     w = _worker(tmp_path, client, fills_db=db)
     assert _run(w, _signal()) == "filled"
     assert seen[0] is not None and seen[0].order_id is None  # écrite AVANT l'envoi

@@ -169,9 +169,10 @@ class MetaTrader5Client:
                     "lancer ce worker sur la machine Windows qui héberge le terminal MT5."
                 )
             try:
-                import MetaTrader5 as mt5_module  # type: ignore[import-not-found,no-redef,unused-ignore]
+                import MetaTrader5  # Windows seulement, sans stubs (voir pyproject : override mypy « MetaTrader5.* »)
             except ImportError as exc:
                 raise Mt5NotInstalledError("MetaTrader5 n'est pas installé : pip install MetaTrader5 (Windows uniquement).") from exc
+            mt5_module = MetaTrader5
         self._mt5: Any = mt5_module
         self._expected_login = expected_login
         self._magic = magic

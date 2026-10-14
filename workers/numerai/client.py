@@ -46,7 +46,7 @@ class NumerapiClient:
 
     def __init__(self, public_id: str, secret_key: str, model_id: str) -> None:
         try:
-            import numerapi  # type: ignore[import-not-found,unused-ignore]
+            import numerapi  # paquet optionnel, sans stubs (voir pyproject : override mypy « numerapi.* »)
         except ImportError as exc:  # pragma: no cover - dépend de l'environnement
             raise RuntimeError("numerapi n'est pas installé : pip install numerapi") from exc
         if not (public_id and secret_key and model_id):

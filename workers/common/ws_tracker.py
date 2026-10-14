@@ -325,7 +325,7 @@ async def websockets_connect(url: str) -> WsConnection:
     """Connexion réelle (paquet ``websockets``, importé à l'usage). Le ping de protocole est coupé : les deux plateformes
     veulent leur propre message de ping applicatif, que le tracker envoie."""
     try:
-        import websockets  # type: ignore[import-not-found,unused-ignore]
+        import websockets  # importé à l'usage : dépendance optionnelle des seuls workers qui suivent les fills (le paquet est typé)
     except ImportError as exc:  # pragma: no cover - dépend de l'environnement
         raise RuntimeError("le paquet websockets n'est pas installé : pip install websockets") from exc
     ws = await websockets.connect(url, open_timeout=10, ping_interval=None, max_size=4 * 1024 * 1024)

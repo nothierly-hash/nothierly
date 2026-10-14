@@ -19,6 +19,14 @@ exclude = ["\\.venv", "venv", "_archive"]
 module = "zmq.*"
 ignore_missing_imports = true
 
+# Paquets d'exchange et de données importés À L'USAGE (dépendances optionnelles des workers) : ils n'ont ni stubs tiers ni marqueur
+# py.typed, ou ne s'installent pas partout (MetaTrader5 : Windows seulement ; le SDK Hyperliquid n'est pas dans toutes les venv).
+# Un override par module remplace des `# type: ignore[import-...]` en ligne, qui devaient en plus se taire quand le paquet est
+# présent (`unused-ignore`). Les paquets typés (websockets, eth-account) n'ont besoin d'aucune exception.
+[[tool.mypy.overrides]]
+module = ["hyperliquid.*", "MetaTrader5.*", "MetaTrader5", "numerapi.*", "numerapi"]
+ignore_missing_imports = true
+
 [[tool.mypy.overrides]]
 module = "ccxt.*"
 ignore_missing_imports = true

@@ -205,13 +205,14 @@ class FillsDatabase:
             return self._db.execute("SELECT 1 FROM executions WHERE venue = ? AND fill_id = ?", (venue, fill_id)).fetchone() is not None
 
     def executions(self, *, venue: str | None = None, symbol: str | None = None, since_ms: int = 0, limit: int = 1000) -> list[Execution]:
-        clauses, params = ["timestamp >= ?"], [since_ms]
+        clauses = ["timestamp >= ?"]
+        params: list[int | str] = [since_ms]
         if venue:
             clauses.append("venue = ?")
-            params.append(venue)  # type: ignore[arg-type]
+            params.append(venue)
         if symbol:
             clauses.append("symbol = ?")
-            params.append(symbol)  # type: ignore[arg-type]
+            params.append(symbol)
         with self._lock:
             rows = self._db.execute(
                 "SELECT timestamp, venue, symbol, direction, intended_price, fill_price, fill_qty, slippage_bps, order_id, fill_id, kind, fee, fee_currency"

@@ -353,7 +353,7 @@ def test_a_failing_dead_man_loop_alerts_after_the_threshold(tmp_path: Path) -> N
     async def broken(now_ms: int | None = None) -> str:
         raise RuntimeError("surveillance cassée")
 
-    w.check_dead_man = broken  # type: ignore[method-assign]
+    w.check_dead_man = broken  # type: ignore[method-assign]  # double de test : méthode remplacée sur l'instance pour espionner ou simuler une panne
 
     async def run() -> None:
         stop = asyncio.Event()
