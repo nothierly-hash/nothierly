@@ -102,3 +102,6 @@ next-env.d.ts.bak
 *.spec
 pip-log.txt
 pip-delete-this-directory.txt
+
+# Lanceur global (scripts/launch_nothierly_full.sh) : PID et bases locales des workers
+run/
