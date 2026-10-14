@@ -26,7 +26,10 @@ cd "$(dirname "$0")/.."
 log() { printf '[deploy] %s\n' "$*"; }
 die() { printf '[deploy] ÉCHEC : %s\n' "$*" >&2; exit 1; }
 
-COMPOSE_FILES=(-f docker-compose.yml -f docker-compose.platform.yml -f docker-compose.prod.yml -f docker-compose.shadow.yml)
+# docker-compose.prod.yml est VOLONTAIREMENT absent : il met redis-broker, timescaledb et le moteur sur le seul réseau `internal_core`, alors que les services de la
+# plateforme et du Shadow Run (pont, tracker VPIN, reporter, maintenance, exporteur) n'en déclarent aucun et resteraient sur le réseau par défaut, donc sans accès à Redis
+# ni à TimescaleDB. L'empiler exige d'ajouter `networks: [internal_core]` à tous ces services (non fait, non testé sous Docker).
+COMPOSE_FILES=(-f docker-compose.yml -f docker-compose.platform.yml -f docker-compose.shadow.yml)
 VOLUMES=(nothierly_shadow_data nothierly_shadow_logs nothierly_timescaledb_data nothierly_redis_data)
 
 # --- 1. Système --------------------------------------------------------------------------------

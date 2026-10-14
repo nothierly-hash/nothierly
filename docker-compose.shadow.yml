@@ -7,7 +7,9 @@
 #   docker volume create nothierly_redis_data       # Redis (AOF)
 #
 #   docker compose -p nothierly-${CLIENT_ID} --env-file .env.${CLIENT_ID} \
-#       -f docker-compose.yml -f docker-compose.platform.yml -f docker-compose.prod.yml -f docker-compose.shadow.yml up -d --build
+#       -f docker-compose.yml -f docker-compose.platform.yml -f docker-compose.shadow.yml up -d --build
+#   (SANS docker-compose.prod.yml : cet overlay isole redis-broker/timescaledb/moteur sur `internal_core`, que les services de la plateforme et de ce fichier ne rejoignent pas ;
+#    les empiler ensemble coupe leur accès à Redis et à TimescaleDB tant que `networks: [internal_core]` n'y est pas ajouté.)
 #
 #   # Extraction, quelques semaines plus tard (écrit dans ./research/exports/ ; ne modifie rien) :
 #   docker compose ... -f docker-compose.shadow.yml run --rm nothierly-exporter --symbol BTCUSDT --since-days 30
