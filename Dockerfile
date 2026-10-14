@@ -118,6 +118,10 @@ ENV PATH=/root/.local/bin:$PATH
 COPY core/ ./core/
 COPY src/ ./src/
 COPY scripts/ ./scripts/
+# scripts/maintenance_cron.py and scripts/export_training_data.py use workers.common.{alerts,paths} (stdlib only: no exchange SDK, no key). The execution
+# workers themselves ship in Dockerfile.platform, not here.
+COPY workers/__init__.py ./workers/__init__.py
+COPY workers/common/ ./workers/common/
 COPY api_middleware/ ./api_middleware/
 COPY risk/ ./risk/
 COPY network/ ./network/

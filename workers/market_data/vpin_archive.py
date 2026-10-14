@@ -66,6 +66,7 @@ CREATE TABLE IF NOT EXISTS {TABLE} (
     recorded_ms INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_{TABLE}_symbol_time ON {TABLE}(symbol, timestamp_ms);
+CREATE INDEX IF NOT EXISTS idx_{TABLE}_time ON {TABLE}(timestamp_ms);  -- purge par lots de scripts/maintenance_cron.py
 """
 
 _INSERT: Final[str] = (

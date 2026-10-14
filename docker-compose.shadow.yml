@@ -26,6 +26,7 @@
 # **Ce qui n'est PAS persistant ici (à savoir).**
 #  - La clé Redis `market:vpin:<SYMBOLE>` : dernière valeur avec expiration, aucun historique. L'historique du VPIN est écrit à part, seau par
 #    seau, par nothierly-vpin-tracker dans /data/vpin_history.sqlite3 (même volume que les fills).
+#  - Rien ne purgeait ces données avant nothierly-maintenance (ci-dessous) : ses rétentions sont des choix, à ajuster.
 #  - Les journaux du moteur (nothierly-agents) : stdout, pilote json-file (20 Mo x 5). Seuls les workers écrivent des fichiers (/logs).
 #  - Les anciens volumes `platform_*_data` (un par worker) ne sont plus montés : les workers écrivent dans le volume commun. Les fichiers
 #    ont des noms distincts par plateforme (`bybit.sqlite3`, `bybit_fills.sqlite3`, ...), sans collision.
@@ -55,6 +56,43 @@ services:
   # conteneur. C'est le seul producteur de données de marché continues du Shadow Run tant qu'aucun modèle ne décide.
   nothierly-vpin-tracker:
     <<: *shadow-worker-storage
+
+  # Maintenance (scripts/maintenance_cron.py) : purge des SQLite par lots + VACUUM conditionnel + rétention/compression de TimescaleDB, toutes les 24 h.
+  # Sans elle, rien ne borne la croissance : aucun autre service ne purge (les workers ne purgent qu'à leur démarrage). Rétentions par défaut :
+  # VPIN 180 j, bus_messages 120 j (compressé après 7 j) ; l'entraînement lit 30 j. Premier réglage à valider sur le serveur :
+  #   docker compose ... -f docker-compose.shadow.yml run --rm nothierly-maintenance --once --dry-run
+  # Même volume de données que les workers/le tracker (locks SQLite partagés via le volume : non vérifié sous Docker) ; mêmes réglages TIMESCALE_*
+  # et WEBHOOK_URL que le moteur (une panne de maintenance alerte comme une panne de worker).
+  nothierly-maintenance:
+    build: .
+    container_name: nothierly-${CLIENT_ID:?Set CLIENT_ID}-maintenance
+    command: ["python", "scripts/maintenance_cron.py", "--heartbeat-file", "/tmp/maintenance.heartbeat"]
+    restart: unless-stopped
+    env_file:
+      - ${CLIENT_ENV_FILE:-.env}
+    environment:
+      CLIENT_ID: ${CLIENT_ID:?Set CLIENT_ID}
+      NOTHIERLY_DATA_DIR: /data
+      TIMESCALE_HOST: timescaledb
+      TIMESCALE_PORT: "5432"
+      WEBHOOK_URL: ${WEBHOOK_URL:-}
+    volumes:
+      - nothierly_shadow_data:/data
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    healthcheck:
+      # Le démon touche ce fichier chaque minute, même pendant ses 24 h de sommeil : un fichier de plus de 5 minutes = process figé.
+      test: ["CMD", "python", "-c", "import os,sys,time; sys.exit(0 if time.time() - os.path.getmtime('/tmp/maintenance.heartbeat') < 300 else 1)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 180s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   # Outil d'extraction : hors `up` (profil `tools`), lancé à la demande avec `run --rm`. Même image que le moteur (scripts/ y est), mêmes
   # réglages TIMESCALE_* / REDIS_* que nothierly-agents. Le volume de données est monté en lecture-écriture parce qu'une base SQLite en
