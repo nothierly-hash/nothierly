@@ -82,6 +82,9 @@ EQUITY_CURVE_KEY: Final[str] = "NOTHIERLY_EQUITY_CURVE"
 ENGINE_HEARTBEAT_KEY: Final[str] = "heartbeat:execution-agent"
 ENGINE_STATE_KEY: Final[str] = "engine:state"  # écrit par core.heartbeat avec le heartbeat
 STATE_STARTING: Final[str] = "STARTING"
+STATE_RECONCILING: Final[str] = "RECONCILING"  # le moteur adopte les positions réelles de l'exchange (voir src/agents/execution/reconciliation.py)
+# États où le moteur est vivant mais ne tient pas encore ses positions : le pont ne publie RIEN (ni cible, ni FLAT) et la tolérance est bornée.
+HOLD_STATES: Final[frozenset[str]] = frozenset({STATE_STARTING, STATE_RECONCILING})
 _QUOTES: Final[frozenset[str]] = frozenset({"USDT", "USD"})
 _MIN_PCT: Final[Decimal] = Decimal("0.01")
 
@@ -127,7 +130,7 @@ class BridgeConfig:
     engine_grace_s: float = 30.0
     # Démarrage à froid : tant que le moteur n'a jamais été vu prêt (ou qu'il annonce STARTING), son silence est un AVERTISSEMENT, pas un
     # ordre FLAT ni une alerte. Borné : passé ce délai le silence redevient une panne (délai ``engine_grace_s`` ensuite).
-    engine_startup_grace_s: float = 180.0
+    engine_startup_grace_s: float = 300.0  # chargement des modèles puis adoption des positions : les deux phases se cumulent
     ttl_ms: int = 10_000
     poll_s: float = 2.0
     publish_failure_threshold: int = 3  # publications refusées d'affilée avant d'alerter
@@ -319,7 +322,7 @@ class PlatformBridge:
         grace = self._cfg.engine_startup_grace_s
         if view is None or grace <= 0:
             return False
-        if view.engine_alive and view.engine_state == STATE_STARTING:
+        if view.engine_alive and view.engine_state in HOLD_STATES:
             if self._starting_since is None:
                 self._starting_since = now
             return now - self._starting_since < grace
@@ -337,7 +340,7 @@ class PlatformBridge:
             _log.warning("bridge_engine_state_unreadable %s: %s", type(exc).__name__, exc)
             view = None
 
-        healthy = view is not None and view.engine_alive and view.engine_state != STATE_STARTING
+        healthy = view is not None and view.engine_alive and view.engine_state not in HOLD_STATES
         if healthy:
             self._engine_ready_seen = True
             self._starting_since = None
@@ -357,7 +360,7 @@ class PlatformBridge:
                 self._last_starting_log = now
                 _log.warning(
                     "bridge_engine_starting : moteur en initialisation (état %s), rien n'est publié ni aucune alerte envoyée ; borne %.0fs",
-                    "STARTING" if view is not None and view.engine_state == STATE_STARTING else "jamais vu", self._cfg.engine_startup_grace_s,
+                    view.engine_state if view is not None and view.engine_state in HOLD_STATES else "jamais vu", self._cfg.engine_startup_grace_s,
                 )
             return []  # la kill switch a déjà été traitée au-dessus : seul le silence d'un moteur qui démarre est toléré
         elif not healthy and down_for >= self._cfg.engine_grace_s and self._cfg.flatten_when_engine_down:

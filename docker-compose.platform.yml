@@ -175,6 +175,37 @@ services:
       redis-broker:
         condition: service_healthy
 
+  # Réconciliation d'état (src/agents/execution/reconciliation.py) : publie les positions RÉELLES de chaque plateforme dans Redis (exchange:positions:<PLATEFORME>)
+  # pour que le moteur les ADOPTE au redémarrage au lieu de repartir à plat (ce qui ferait fermer toutes les positions au marché). N'a AUCUN droit de trading :
+  # Hyperliquid n'exige aucune clé (adresse publique) ; Bybit/Binance : clés *_READONLY_* créées SANS droit de trading ni de retrait (voir reporter.env.example).
+  # Pour l'activer côté moteur : NOTHIERLY_RECONCILE_VENUES=HYPERLIQUID,BYBIT dans l'environnement de nothierly-agents (même ordre = priorité d'adoption).
+  nothierly-position-reporter:
+    <<: *platform-hardening
+    build: *platform-build
+    image: nothierly-platform:local
+    container_name: nothierly-${CLIENT_ID:?Set CLIENT_ID}-position-reporter
+    command:
+      - python
+      - -m
+      - workers.reconciliation.reporter
+      - --venues
+      - hyperliquid
+      - bybit
+      - --network
+      - testnet
+      - --interval-s
+      - "30"
+    env_file:
+      - reporter.env   # PAS platform.env : ce service ne doit recevoir aucune clé de trading (modèle : reporter.env.example)
+    environment:
+      REDIS_HOST: redis-broker
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD}
+      WEBHOOK_URL: ${WEBHOOK_URL:-}
+    depends_on:
+      redis-broker:
+        condition: service_healthy
+
 volumes:
   platform_hyperliquid_data:
   platform_bybit_data:

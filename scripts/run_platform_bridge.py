@@ -105,7 +105,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--poll-s", type=float, default=2.0)
     parser.add_argument("--refresh-s", type=float, default=10.0)
     parser.add_argument("--engine-grace-s", type=float, default=30.0)
-    parser.add_argument("--engine-startup-grace-s", type=float, default=180.0, help="tolérance au démarrage à froid du moteur : tant qu'il n'a jamais été vu prêt (ou annonce STARTING), son silence est un avertissement, pas un FLAT ; 0 = aucune")
+    parser.add_argument("--engine-startup-grace-s", type=float, default=300.0, help="tolérance au démarrage à froid du moteur : tant qu'il n'a jamais été vu prêt (ou annonce STARTING ou RECONCILING), son silence est un avertissement, pas un FLAT ; 0 = aucune")
     parser.add_argument("--log-dir", default=None, help="dossier d'un fichier de journal tournant (10 Mo x 5) en plus de stdout ; défaut : NOTHIERLY_LOG_DIR")
     parser.add_argument("--publish-failure-threshold", type=int, default=3, help="publications refusées d'affilée avant d'alerter")
     parser.add_argument("--dry-run", action="store_true", help="journalise les signaux sans les publier (et sans alerter)")

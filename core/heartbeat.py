@@ -43,6 +43,7 @@ _log = logging.getLogger(__name__)
 
 ENGINE_STATE_KEY: Final[str] = "engine:state"
 STATE_STARTING: Final[str] = "STARTING"
+STATE_RECONCILING: Final[str] = "RECONCILING"  # modèles chargés, positions réelles de l'exchange en cours d'adoption : le pont ne publie encore rien
 STATE_ACTIVE: Final[str] = "ACTIVE"
 DEFAULT_INTERVAL_S: Final[float] = 3.0
 DEFAULT_TTL_S: Final[float] = 10.0

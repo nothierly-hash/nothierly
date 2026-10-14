@@ -73,6 +73,7 @@ from core.schemas import HEARTBEAT_REDIS_KEY_PREFIX
 from core.zmq_broker import ZmqBroker
 from src.agents.archivist.agent import ArchivistAgent
 from src.agents.execution.agent import ExecutionAgent
+from src.agents.execution.reconciliation import ReconcilerConfig
 from src.agents.macro.agent import MacroAgent
 from src.agents.macro_order_execution.agent import MacroOrderExecutionAgent
 from src.agents.market_data.agent import MarketDataAgent
@@ -440,6 +441,9 @@ async def main() -> None:
             manage_own_redis=False,
             meta_label_model_path=_resolve_meta_label_model_path(),
             engine_heartbeat=engine_heartbeat,
+            # Adoption des positions réelles au démarrage : active seulement si NOTHIERLY_RECONCILE_VENUES est défini (ex. « HYPERLIQUID,BYBIT »),
+            # c'est-à-dire quand nothierly-position-reporter tourne ; sinon le moteur repart à plat, comme avant.
+            position_reconciler=ReconcilerConfig.from_env(),
         ),
         ArchivistAgent(
             manage_own_signals=False,

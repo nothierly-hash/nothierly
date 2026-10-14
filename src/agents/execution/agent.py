@@ -252,7 +252,7 @@ import zmq.asyncio
 
 from core.base_agent import AgentControlState, BaseAgent
 from core.config import AppSettings
-from core.heartbeat import STATE_ACTIVE, HeartbeatConfig, ThreadedHeartbeat, redis_client_factory
+from core.heartbeat import STATE_ACTIVE, STATE_RECONCILING, HeartbeatConfig, ThreadedHeartbeat, redis_client_factory
 from core.logger import get_logger
 from core.quant_math import (
     denoise_correlation_matrix_mp,
@@ -305,6 +305,7 @@ from src.agents.execution.order_slicer import (
     OrderSlicer,
     SlicingAbortedError,
 )
+from src.agents.execution.reconciliation import ReconcilerConfig, ExchangeReport, is_fresh, plan_adoption, read_reports, reference_report
 from src.agents.guardian_ai import TriggerType, assess_risk
 from src.agents.supervisor.broker_client import OandaClient
 from src.agents.supervisor.optimal_execution_scheduler import OptimalExecutionScheduler
@@ -803,6 +804,7 @@ class ExecutionAgent(BaseAgent):
         meta_label_model_path: str | Path | None = None,
         meta_label_scaler_path: str | Path | None = None,
         engine_heartbeat: ThreadedHeartbeat | None = None,
+        position_reconciler: ReconcilerConfig | None = None,
     ) -> None:
         """Wire up the OANDA trading client and risk manager; subscribe to signals + prices.
 
@@ -959,6 +961,8 @@ class ExecutionAgent(BaseAgent):
         # The liveness heartbeat. ``scripts/run_backend.py`` creates and STARTS it (state STARTING) before loading any model and hands it
         # here; run() switches it to ACTIVE once this agent can decide. Standalone use: run() builds and starts its own.
         self._engine_heartbeat = engine_heartbeat
+        # Réconciliation au démarrage (src/agents/execution/reconciliation.py) : ``None`` = coupée, le moteur repart à plat comme avant.
+        self._reconciler = position_reconciler
         # "Protocole Stealth Slicing" (2026-09-16): real TWAP + jitter slicing for any entry whose
         # real notional exceeds slicing_notional_threshold_usd -- see _execute_sliced_entry's own
         # docstring for the real wiring (this is *not* the Almgren-Chriss scheduler above, which
@@ -1080,6 +1084,71 @@ class ExecutionAgent(BaseAgent):
         """Disconnect the trading client."""
         await self._trading_client.close()
 
+    async def _reconcile_until_done(self, config: ReconcilerConfig) -> None:
+        """Réessaie :meth:`_reconcile_positions` jusqu'à l'adoption. Ne rend jamais la main sans positions vérifiées (annulable : arrêt du processus)."""
+        attempt = 0
+        while not await self._reconcile_positions(config):
+            attempt += 1
+            self._log.critical(
+                "execution_reconciliation_blocked",
+                agent_id=self.agent_id,
+                attempt=attempt,
+                venues=list(config.venues),
+                detail="aucun rapport frais : le moteur ne décide rien et le pont retient tout ; vérifier nothierly-position-reporter",
+            )
+
+    async def _reconcile_positions(self, config: ReconcilerConfig) -> bool:
+        """Attend (au plus ``wait_s``) les rapports de positions des plateformes, adopte ceux de la première fraîche. ``False`` : aucun rapport frais."""
+        if self._redis_client is None:
+            return False
+        reports: dict[str, ExchangeReport] = {}
+        deadline = time.monotonic() + config.wait_s
+        while True:
+            try:
+                reports = await read_reports(self._redis_client.execute, config.venues)
+            except RedisUnavailableError:
+                reports = {}
+            now_ms = int(time.time() * 1000)
+            fresh = {venue: r for venue, r in reports.items() if is_fresh(r, now_ms, config.max_age_s)}
+            if len(fresh) == len(config.venues) or time.monotonic() >= deadline:  # tous les rapports sont là, ou le délai est écoulé : on prend ce qu'il y a
+                break
+            await asyncio.sleep(config.poll_s)
+        reference = reference_report(reports, config.venues, now_ms, config.max_age_s)
+        if reference is None:
+            return False
+        if any(p.status != "FLAT" for p in self._positions.values()):
+            self._log.warning("execution_reconciliation_skipped", agent_id=self.agent_id, detail="le moteur tient déjà des positions")
+            return True
+        plan = plan_adoption(reference, self._instruments, self._mock_balance, others=[r for v, r in fresh.items() if v != reference.venue])
+        now = time.time()
+        for adoption in plan.adoptions:
+            position = self._position_for(adoption.instrument)
+            status: Literal["LONG", "SHORT"] = "LONG" if adoption.direction == 1 else "SHORT"
+            position.assert_valid_transition(status)
+            position.status = status
+            position.entry_price = adoption.price  # prix de marché du rapport : le prix d'entrée réel n'est pas rapporté (voir reconciliation.py)
+            position.units_held = adoption.direction * adoption.units
+            position.highest_seen_price = adoption.price if adoption.direction == 1 else None
+            position.lowest_seen_price = adoption.price if adoption.direction == -1 else None
+            position.trailing_activated = False
+            position.cooldown_until = None
+            position.opened_at = now
+            position.entered_as_simulated = True  # le courtier du moteur n'a jamais tenu cette position : la fermer ne doit pas lui envoyer d'ordre
+            position.entered_as_shadow_controlled = False
+            self._current_exposure += adoption.units * adoption.price
+        await self._publish_active_positions()
+        self._log.info(
+            "execution_reconciliation_done",
+            agent_id=self.agent_id,
+            venue=reference.venue,
+            adopted=[(a.instrument, a.direction, round(a.exposure_pct, 2)) for a in plan.adoptions],
+            ignored=list(plan.ignored),
+            divergences=list(plan.divergences),
+        )
+        for divergence in plan.divergences:
+            self._log.warning("execution_reconciliation_divergence", agent_id=self.agent_id, detail=divergence)
+        return True
+
     async def run(self) -> None:
         """Connect dependencies, then react to every incoming signal, price tick, or manual override.
 
@@ -1111,6 +1180,10 @@ class ExecutionAgent(BaseAgent):
         try:
             await self._connect_redis()
             await self.on_start()
+            if self._reconciler is not None:
+                # Le moteur ne décide de rien (ni entrée, ni sortie) tant qu'il ne tient pas les positions réelles ; le pont ne publie rien non plus.
+                self._engine_heartbeat.set_state(STATE_RECONCILING)
+                await self._reconcile_until_done(self._reconciler)
 
             self._running = True
             self._log.info("agent_started", agent_id=self.agent_id, instruments=sorted(self._instruments))
