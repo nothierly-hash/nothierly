@@ -449,10 +449,13 @@ def test_the_command_line_builds_the_documented_defaults(monkeypatch: pytest.Mon
     assert isinstance(custom["feed"], HyperliquidTradesFeed) and custom["calcs"]["BTCUSDT"].window_size == 20 and custom["calcs"]["BTCUSDT"].bucket_size == D(5000)
 
 
-def test_the_command_line_writes_to_redis_unless_dry_run(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_the_command_line_writes_to_redis_unless_dry_run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("REDIS_HOST", "redis-broker")
     monkeypatch.setenv("REDIS_PASSWORD", "pw")
-    assert isinstance(_run_cli(monkeypatch)["sink"], RedisVpinSink)
+    monkeypatch.setenv("NOTHIERLY_DATA_DIR", str(tmp_path))  # l'archive SQLite s'ouvre au démarrage : jamais dans le dossier du dépôt
+    seen = _run_cli(monkeypatch)
+    assert isinstance(seen["sink"], RedisVpinSink)
+    seen["kwargs"]["archive"].close()
 
 
 @pytest.mark.parametrize("args", [["--bucket-size", "0"], ["--window", "0"], ["--ttl-s", "10", "--refresh-s", "30"], ["--symbols", "btc/usdt"], ["--symbols", "bad symbol"]])

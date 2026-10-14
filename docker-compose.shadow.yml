@@ -24,8 +24,8 @@
 # create` ci-dessus, `up` échoue tout de suite avec un message clair, au lieu de démarrer sur un volume vide.
 #
 # **Ce qui n'est PAS persistant ici (à savoir).**
-#  - Le VPIN seul : `market:vpin:<SYMBOLE>` est une clé Redis avec expiration (dernière valeur, aucun historique). Il n'arrive dans
-#    l'archive que recopié dans META_LABEL_DECISION.features à chaque décision de consensus : sans décision, pas de trace.
+#  - La clé Redis `market:vpin:<SYMBOLE>` : dernière valeur avec expiration, aucun historique. L'historique du VPIN est écrit à part, seau par
+#    seau, par nothierly-vpin-tracker dans /data/vpin_history.sqlite3 (même volume que les fills).
 #  - Les journaux du moteur (nothierly-agents) : stdout, pilote json-file (20 Mo x 5). Seuls les workers écrivent des fichiers (/logs).
 #  - Les anciens volumes `platform_*_data` (un par worker) ne sont plus montés : les workers écrivent dans le volume commun. Les fichiers
 #    ont des noms distincts par plateforme (`bybit.sqlite3`, `bybit_fills.sqlite3`, ...), sans collision.
@@ -49,6 +49,11 @@ services:
     <<: *shadow-worker-storage
 
   nothierly-worker-binance:
+    <<: *shadow-worker-storage
+
+  # Archive continue du VPIN (workers/market_data/vpin_archive.py) : sans ce volume, l'historique de microstructure disparaîtrait avec le
+  # conteneur. C'est le seul producteur de données de marché continues du Shadow Run tant qu'aucun modèle ne décide.
+  nothierly-vpin-tracker:
     <<: *shadow-worker-storage
 
   # Outil d'extraction : hors `up` (profil `tools`), lancé à la demande avec `run --rm`. Même image que le moteur (scripts/ y est), mêmes

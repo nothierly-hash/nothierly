@@ -25,6 +25,11 @@ valeur du tout avant que la fenêtre soit pleine (voir ``vpin.py``).
 **Trou dans le flux.** Après une coupure de plus de ``--max-gap-s`` (30 s), les trades manqués fausseraient les seaux en cours :
 la fenêtre est vidée et la clé supprimée, la mesure repart de zéro. Les identifiants de trade déjà vus sont ignorés.
 
+**Archive continue (SQLite).** Redis ne garde que la dernière valeur, avec expiration. Chaque seau fermé est donc aussi écrit dans
+``<NOTHIERLY_DATA_DIR>/vpin_history.sqlite3`` (``--archive-db``, ``--no-archive`` pour couper), par un thread dédié : la boucle WebSocket ne
+touche jamais au disque (voir ``vpin_archive.py``). L'archive ne dépend pas de Redis (Redis en panne : rien n'est perdu) et ne l'arrête pas
+(archive en panne : Redis continue, et une alerte part). ``--dry-run`` n'écrit nulle part, archive comprise.
+
 **Ce que ce VPIN n'est pas.** Ce n'est PAS le VPIN que le moteur lit déjà (``research/alpha_features.compute_vpin`` et la lecture live de
 ``macro_order_execution`` : seaux en unités de base de 1,0, fenêtre de 10, trade non découpé). Autres unités, autre fenêtre : les deux
 valeurs ne se comparent pas et ne se mélangent pas. Celle-ci n'alimente qu'une variable du modèle de méta-labeling.
@@ -42,6 +47,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -52,6 +58,7 @@ from workers.common.alerts import AlertConfigError, Alerter, Severity, WebhookAl
 from workers.common.logging_setup import configure_logging
 from workers.common.ws_tracker import ConnectFn, WsConnection, websockets_connect
 from workers.market_data.vpin import VolumeBucketVpin
+from workers.market_data.vpin_archive import BucketRecord, VpinArchive, default_archive_path
 
 _log = logging.getLogger(__name__)
 
@@ -216,6 +223,7 @@ class VpinTracker:
         alerter: Alerter | None = None,
         alert_after_failures: int = 5,
         clock: Callable[[], float] = time.monotonic,
+        archive: VpinArchive | None = None,
     ) -> None:
         self._feed = feed
         self._calcs = dict(calculators)
@@ -230,6 +238,10 @@ class VpinTracker:
         self._alerter = alerter
         self._alert_after = alert_after_failures
         self._clock = clock
+        self._archive = archive
+        self._archive_errors_seen = 0
+        self._archive_dropped_seen = 0
+        self._archive_alerted = False
         self._last_ids: dict[str, int] = {}
         self._disconnected_at: float | None = None
         self._alerted = False
@@ -339,12 +351,36 @@ class VpinTracker:
             self.stats["trades"] += 1
             if closed:
                 self.stats["buckets"] += len(closed)
+                if self._archive is not None:  # d'abord : l'archive ne dépend ni de Redis ni de sa disponibilité ; ``submit`` ne bloque jamais
+                    for reading in closed:
+                        self._archive.submit(BucketRecord(
+                            trade.symbol, reading.closed_at_ms, reading.vpin, reading.buy_volume, reading.sell_volume, calc.bucket_size, calc.window_size,
+                        ))
                 latest = closed[-1].vpin
                 if latest is not None:
                     await self._safe_sink(self._sink.publish(trade.symbol, latest, self._ttl_s))
 
+    def _check_archive(self) -> None:
+        """Alerte (une fois) quand l'archive échoue ou abandonne des lignes ; annonce le retour à la normale."""
+        archive = self._archive
+        if archive is None:
+            return
+        failing = archive.errors > self._archive_errors_seen or archive.dropped > self._archive_dropped_seen  # nouveau depuis le dernier contrôle
+        self._archive_errors_seen, self._archive_dropped_seen = archive.errors, archive.dropped
+        if failing and not self._archive_alerted:
+            self._archive_alerted = True
+            self._alert(
+                "vpin_archive_failing",
+                f"l'archive VPIN n'écrit plus (erreurs={archive.errors}, lignes abandonnées={archive.dropped}, en attente={archive.backlog}, "
+                f"dernière erreur : {archive.last_error}) : l'historique de ce marché est en train de se perdre.",
+            )
+        elif self._archive_alerted and not failing and archive.backlog == 0:
+            self._archive_alerted = False
+            self._alert("end:vpin_archive_failing", "l'archive VPIN écrit de nouveau.", Severity.INFO)
+
     async def _refresh(self) -> None:
         """Ré-écrit la dernière valeur pour prolonger sa durée de vie : un marché calme ne ferme pas de seau."""
+        self._check_archive()
         for symbol, calc in self._calcs.items():
             value = calc.vpin
             if value is not None:
@@ -385,7 +421,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--ttl-s", type=float, default=120.0, help="durée de vie de la clé Redis")
     parser.add_argument("--refresh-s", type=float, default=30.0, help="ré-écriture de la dernière valeur tant que la connexion vit")
     parser.add_argument("--max-gap-s", type=float, default=30.0, help="coupure au-delà de laquelle la fenêtre est remise à zéro")
-    parser.add_argument("--dry-run", action="store_true", help="journalise les valeurs sans écrire dans Redis")
+    parser.add_argument("--archive-db", default=None, help="base SQLite de l'historique des seaux (défaut : <NOTHIERLY_DATA_DIR ou data/>/vpin_history.sqlite3)")
+    parser.add_argument("--no-archive", action="store_true", help="n'écrit pas l'historique SQLite (déconseillé : c'est la matière première de l'entraînement)")
+    parser.add_argument("--dry-run", action="store_true", help="journalise les valeurs sans écrire dans Redis ni dans l'archive")
     parser.add_argument("--log-dir", default=None, help="dossier d'un fichier de journal tournant (10 Mo x 5) en plus de stdout")
     args = parser.parse_args(argv)
     if args.bucket_size <= 0 or not args.bucket_size.is_finite():
@@ -413,14 +451,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         password=os.environ.get("REDIS_PASSWORD") or None, db=int(os.environ.get("REDIS_DB", "0")),
     )
     calculators = {s: VolumeBucketVpin(args.bucket_size, args.window) for s in symbols}
-    tracker = VpinTracker(feed, calculators, sink, ttl_s=args.ttl_s, refresh_s=args.refresh_s, max_gap_s=args.max_gap_s, alerter=alerter)
-    _log.info("vpin_tracker_start source=%s symbols=%s bucket=%s window=%d mode=%s", args.source, symbols, args.bucket_size, args.window, "DRY-RUN" if args.dry_run else "REDIS")
+    archive: VpinArchive | None = None
+    if not args.dry_run and not args.no_archive:
+        try:
+            archive = VpinArchive(args.archive_db or default_archive_path())  # échec rapide : pas de collecte sans archive, sauf --no-archive
+        except (OSError, sqlite3.Error) as exc:
+            parser.error(f"archive VPIN inutilisable ({type(exc).__name__}: {exc}) ; corriger NOTHIERLY_DATA_DIR / --archive-db, ou --no-archive")
+    tracker = VpinTracker(feed, calculators, sink, ttl_s=args.ttl_s, refresh_s=args.refresh_s, max_gap_s=args.max_gap_s, alerter=alerter, archive=archive)
+    _log.info(
+        "vpin_tracker_start source=%s symbols=%s bucket=%s window=%d mode=%s archive=%s", args.source, symbols, args.bucket_size, args.window,
+        "DRY-RUN" if args.dry_run else "REDIS", "off" if archive is None else archive.path,
+    )
 
     async def serve() -> None:
         stop = asyncio.Event()
+        if archive is not None:
+            archive.start()
         try:
             await tracker.run(stop)
         finally:
+            if archive is not None:
+                left = archive.close()
+                if left:
+                    _log.error("vpin_archive_lost_on_shutdown rows=%d", left)
             closer = getattr(sink, "close", None)
             if closer is not None:
                 await closer()

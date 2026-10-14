@@ -12,9 +12,11 @@
 - *Carnet, décisions du méta-label (dont le VPIN et les autres features), exécutions du moteur* : l'archive TimescaleDB
   (table ``bus_messages``, écrite par l'ArchivistAgent) : c'est ce que lit ``train_model.py``. Lue avec les réglages ``TIMESCALE_*``
   de l'environnement (``--source bus`` ou ``all``).
-- *VPIN seul* : la clé Redis ``market:vpin:<SYMBOLE>`` ne contient que la DERNIÈRE valeur (avec expiration) : elle n'est exportable
-  que dans la mesure où le moteur la recopie dans ``META_LABEL_DECISION.features`` à chaque décision de consensus. Aucun historique
-  VPIN continu n'est archivé aujourd'hui.
+- *VPIN* : la série continue, un seau par ligne, écrite 24 h/24 par ``workers/market_data/vpin_tracker.py`` dans
+  ``<NOTHIERLY_DATA_DIR>/vpin_history.sqlite3`` (table ``vpin_buckets``, voir ``vpin_archive.py``) ; ``--vpin-db`` pour un autre chemin.
+  La clé Redis ``market:vpin:<SYMBOLE>`` n'est que la dernière valeur, avec expiration : ce n'est PAS une source d'historique.
+  ``vpin_value`` est vide pour les seaux de chauffe (fenêtre pas encore pleine) ; ``bucket_buy_vol`` et ``bucket_sell_vol`` permettent de
+  recalculer le VPIN avec une autre fenêtre.
 
 Sortie : ``research/exports/<table>_<SYMBOLE>_<horodatage UTC>.csv`` (``--out-dir`` pour changer). Jamais d'écrasement : l'horodatage
 fait partie du nom. Un export vide n'est pas écrit, et le script sort en erreur : mieux vaut le savoir que lancer un entraînement
@@ -44,6 +46,7 @@ from typing import Any, Final
 ENV_DATA_DIR: Final[str] = "NOTHIERLY_DATA_DIR"
 DEFAULT_DATA_DIR: Final[str] = "data/"
 DEFAULT_OUT_DIR: Final[str] = "research/exports"
+VPIN_FILENAME: Final[str] = "vpin_history.sqlite3"  # même nom que workers/market_data/vpin_archive.DEFAULT_FILENAME (un test vérifie l'accord)
 FILLS_GLOB: Final[str] = "*_fills.sqlite3"
 _QUOTES: Final[tuple[str, ...]] = ("USDT", "USDC", "USD", "PERP")
 BUS_TOPICS: Final[tuple[str, ...]] = ("MARKET_DATA_L2", "META_LABEL_DECISION", "TRADE_EXECUTED")
@@ -103,6 +106,19 @@ def read_table(path: Path, table: str, *, since_ms: int, symbol: str) -> list[di
         if table not in present:
             raise RuntimeError(f"{path} : pas de table {table!r} (tables présentes : {sorted(present)}) ; ce n'est pas une base de fills.")
         cursor = conn.execute(f"SELECT * FROM {table} WHERE {time_column} >= ? ORDER BY {time_column}, rowid", (since_ms,))  # noqa: S608
+        return [dict(r) for r in cursor if symbol_matches(str(r["symbol"]), symbol)]
+    finally:
+        conn.close()
+
+
+def read_vpin(path: Path, *, since_ms: int, symbol: str) -> list[dict[str, Any]]:
+    """Seaux VPIN de ``symbol`` plus récents que ``since_ms``, par ordre chronologique (``id`` départage les seaux fermés par un même trade)."""
+    conn = _open_read_only(path)
+    try:
+        present = {str(r["name"]) for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if "vpin_buckets" not in present:
+            raise RuntimeError(f"{path} : pas de table 'vpin_buckets' (tables présentes : {sorted(present)}) ; ce n'est pas une archive VPIN.")
+        cursor = conn.execute("SELECT * FROM vpin_buckets WHERE timestamp_ms >= ? ORDER BY timestamp_ms, id", (since_ms,))
         return [dict(r) for r in cursor if symbol_matches(str(r["symbol"]), symbol)]
     finally:
         conn.close()
@@ -185,8 +201,9 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--symbol", required=True, help="symbole à exporter, ex. BTCUSDT ou BTC/USDT (obligatoire : un jeu de données = un symbole)")
     parser.add_argument("--since-days", type=float, default=30.0, help="profondeur de l'historique, en jours (défaut 30)")
-    parser.add_argument("--source", choices=("fills", "bus", "all"), default="all", help="fills = bases SQLite ; bus = archive TimescaleDB ; all = les deux")
+    parser.add_argument("--source", choices=("fills", "bus", "vpin", "all"), default="all", help="fills = bases SQLite ; bus = archive TimescaleDB ; vpin = série VPIN SQLite ; all = tout")
     parser.add_argument("--fills-db", nargs="*", default=None, help="bases de fills explicites (défaut : <NOTHIERLY_DATA_DIR>/*_fills.sqlite3)")
+    parser.add_argument("--vpin-db", default=None, help=f"archive VPIN explicite (défaut : <NOTHIERLY_DATA_DIR>/{VPIN_FILENAME})")
     parser.add_argument("--out-dir", default=DEFAULT_OUT_DIR, help=f"dossier de sortie (défaut {DEFAULT_OUT_DIR}/)")
     args = parser.parse_args(argv)
     if args.since_days <= 0:
@@ -215,6 +232,16 @@ def run(args: argparse.Namespace, *, now: datetime | None = None) -> dict[str, i
             target = out_dir / f"{table}_{tag}.csv"
             if write_csv(target, rows):
                 written[str(target)] = len(rows)
+
+    if args.source in ("vpin", "all"):
+        vpin_path = Path(args.vpin_db) if args.vpin_db else data_dir() / VPIN_FILENAME
+        if not vpin_path.is_file() and args.source == "all":
+            print(f"[export] pas d'archive VPIN ({vpin_path}) : VPIN ignoré", file=sys.stderr)
+        else:  # source explicite : une archive absente est une erreur (FileNotFoundError), pas un export vide
+            vpin_rows = read_vpin(vpin_path, since_ms=since_ms, symbol=args.symbol)
+            target = out_dir / f"vpin_{tag}.csv"
+            if write_csv(target, vpin_rows):
+                written[str(target)] = len(vpin_rows)
 
     if args.source in ("bus", "all"):
         try:
