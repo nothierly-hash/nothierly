@@ -22,6 +22,14 @@ __pycache__
 
 # Local-only artifacts not needed inside the image
 logs/
+# Runtime data lives in volumes (docker-compose.shadow.yml), never in an image layer: the SQLite files (fills, slippage), exports, and
+# the raw research data. Without these lines `COPY scripts/ ...` is unaffected, but `COPY . .`-style additions would bake them in.
+data/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+research/exports/
+# (research/sample_data/ is deliberately NOT ignored here: the `test` stage COPYs the two tracked .csv.gz samples.)
 models/*
 # models/ is shipped as a directory (`COPY models/ ./models/`, see the Dockerfile): `models/*` excludes the CONTENTS (not the
 # directory itself, which must stay in the context so that COPY cannot fail), then only the artifact names the loaders recognise are

@@ -27,6 +27,7 @@ from typing import ClassVar
 from contracts.curve_transport import CurveClientConfig, CurveConfigError, transport_refusal
 from contracts.platform_signal import PlatformSignal, TargetVenue
 from contracts.secure_signal_bus import load_secret_from_env
+from workers.common.paths import default_db_path, ensure_parent
 from workers.common.alerts import AlertConfigError, WebhookAlerter
 from workers.common.base import (
     DEFAULT_MAX_AGE_MS,
@@ -185,7 +186,7 @@ class HyperliquidWorker(ExposureWorkerBase):
 def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Worker Hyperliquid (dry-run testnet par défaut).")
     parser.add_argument("--address", default=os.environ.get("NOTHIERLY_ZMQ_ADDRESS"), help="endpoint ZMQ du publisher")
-    parser.add_argument("--db", default="hyperliquid_worker.sqlite3")
+    parser.add_argument("--db", default=str(default_db_path("hyperliquid_worker.sqlite3")), help="base SQLite d'état (défaut : $NOTHIERLY_DATA_DIR ou data/)")
     parser.add_argument("--network", choices=[n.value for n in Network], default=Network.TESTNET.value)
     parser.add_argument("--live", action="store_true", help="envoie réellement les ordres ; sinon dry-run (lecture seule)")
     parser.add_argument("--i-understand-real-funds", action="store_true", help="requis pour --live sur mainnet")
@@ -197,6 +198,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--dead-man-timeout", type=float, default=300.0, metavar="SECONDES",
                         help="ferme toutes les positions puis se verrouille après ce délai sans signal valide (0 = désactivé)")
     args = parser.parse_args(argv)
+    ensure_parent(args.db)
     if args.clear_halt:  # ne touche que la base locale : ni réseau, ni SDK, ni clé
         configure_logging("hyperliquid-worker", log_dir=args.log_dir)
         clear_execution_halt(HlState(args.db))

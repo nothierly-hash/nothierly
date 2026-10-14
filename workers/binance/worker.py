@@ -48,6 +48,7 @@ from workers.binance.client import (
     check_key_permissions,
 )
 from workers.binance.planner import ZERO, OrderPlan, binance_symbol, plan_order, round_price, size_for_pct_step
+from workers.common.paths import default_db_path, ensure_parent
 from workers.common.alerts import AlertConfigError, WebhookAlerter
 from workers.common.base import EmergencyOrder, ExposureWorkerBase, ExposureWorkerConfig, clear_execution_halt, dead_man_timeout_problem
 from workers.common.exposure import emergency_slippage_bps
@@ -214,7 +215,7 @@ class BinanceWorker(ExposureWorkerBase):
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Worker Binance USDⓈ-M Futures (dry-run sur le réseau de test par défaut).")
     parser.add_argument("--address", default=os.environ.get("NOTHIERLY_ZMQ_ADDRESS"), help="endpoint ZMQ du publisher")
-    parser.add_argument("--db", default="binance_worker.sqlite3")
+    parser.add_argument("--db", default=str(default_db_path("binance_worker.sqlite3")), help="base SQLite d'état (défaut : $NOTHIERLY_DATA_DIR ou data/)")
     parser.add_argument("--network", choices=[n.value for n in BinanceNetwork], default=BinanceNetwork.TESTNET.value)
     parser.add_argument("--base-url", default=None, help="surcharge l'adresse REST futures (le réseau de test a changé d'adresse dans la doc)")
     parser.add_argument("--ws-base-url", default=None, help="surcharge l'adresse WebSocket (ex. wss://fstream.binance.com)")
@@ -229,6 +230,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         help="ferme toutes les positions puis se verrouille après ce délai sans signal valide (0 = désactivé)")
     parser.add_argument("--max-equity-usd", type=Decimal, default=None, help="plafond d'equity utilisée pour dimensionner")
     args = parser.parse_args(argv)
+    ensure_parent(args.db)
     if args.clear_halt:  # ne touche que la base locale : ni réseau, ni clé, ni secret du bus
         configure_logging("binance-worker", log_dir=args.log_dir)
         clear_execution_halt(ExecutionState(args.db))

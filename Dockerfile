@@ -124,16 +124,10 @@ COPY network/ ./network/
 COPY pricing/ ./pricing/
 COPY execution/ ./execution/
 COPY research/alpha_features.py ./research/alpha_features.py
-# Same real gap, found the same way (a crash the first time a real deployment actually opened the
-# page): src/dashboard/ems_pages/agent_fleet.py's Tier 2 "Lancer une détection réelle" button calls
-# risk/regime_detector.py's load_real_bar_closes("BTCUSDT"), which requires this one real Tardis
-# trades sample file to exist on disk -- FileNotFoundError otherwise. research/sample_data/ itself is
-# ~973MB (this file, its ETH sibling, and two much larger book-snapshot CSVs no code in this image
-# actually reads) -- copying the whole directory the way every other package here is copied would
-# cost 973MB of image size for one 15.6MB file with no further dependencies. Only BTCUSDT is copied:
-# the button's own hardcoded symbol (see agent_fleet.py) -- ETHUSDT's sample file would close the
-# same gap for a symbol nothing currently calls this for, at another ~6MB, added if that ever changes.
-COPY research/sample_data/btcusdt_trades_2020-01-01.csv ./research/sample_data/btcusdt_trades_2020-01-01.csv
+# research/sample_data/ is NOT shipped (~973 MB of Tardis samples, and the single CSV once copied here was untracked, so a clean clone
+# could not even build). Consequence, deliberate: the dashboard's Tier 2 "Lancer une détection réelle" (risk/regime_detector.py's
+# load_real_bar_closes) raises a FileNotFoundError naming the missing path inside the image. Mount the file read-only at run time if
+# that page is needed.
 # Same real gap, third time -- src/dashboard/ems_pages/digital_twin_backtest.py's own top-level
 # `from simulation.digital_twin import (...)` crashed the page on load, before any button click. Only
 # 68KB, safe to copy wholesale (unlike research/, no size trade-off here).

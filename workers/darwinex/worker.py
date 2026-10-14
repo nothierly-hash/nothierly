@@ -38,6 +38,7 @@ from typing import ClassVar
 from contracts.curve_transport import CurveClientConfig, CurveConfigError, transport_refusal
 from contracts.platform_signal import PlatformSignal, TargetVenue
 from contracts.secure_signal_bus import load_secret_from_env
+from workers.common.paths import default_db_path, ensure_parent
 from workers.common.alerts import AlertConfigError, WebhookAlerter
 from workers.common.base import EmergencyOrder, ExposureWorkerBase, ExposureWorkerConfig, clear_execution_halt, dead_man_timeout_problem
 from workers.common.exposure import emergency_slippage_bps
@@ -222,7 +223,7 @@ class DarwinexWorker(ExposureWorkerBase):
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Worker Darwinex Zero (MetaTrader 5, Windows ; dry-run par défaut).")
     parser.add_argument("--address", default=os.environ.get("NOTHIERLY_ZMQ_ADDRESS"), help="endpoint ZMQ du publisher")
-    parser.add_argument("--db", default="darwinex_worker.sqlite3")
+    parser.add_argument("--db", default=str(default_db_path("darwinex_worker.sqlite3")), help="base SQLite d'état (défaut : $NOTHIERLY_DATA_DIR ou data/)")
     parser.add_argument("--account-login", type=int, default=int(os.environ.get("DWZ_ACCOUNT_LOGIN", "0")),
                         help="numéro du SEUL compte que ce worker a le droit de piloter (ou DWZ_ACCOUNT_LOGIN)")
     parser.add_argument("--live", action="store_true", help="envoie réellement les ordres ; sinon dry-run")
@@ -238,6 +239,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--allow-plaintext-remote", action="store_true", help="autorise un endpoint non local SANS chiffrement CURVE")
     parser.add_argument("--log-dir", default=None, help="dossier d'un fichier de journal tournant (10 Mo x 5) en plus de stdout ; défaut : NOTHIERLY_LOG_DIR")
     args = parser.parse_args(argv)
+    ensure_parent(args.db)
     if args.clear_halt:  # ne touche que la base locale : ni terminal MT5, ni compte, ni secret du bus
         configure_logging("darwinex-worker", log_dir=args.log_dir)
         clear_execution_halt(ExecutionState(args.db))

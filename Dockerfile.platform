@@ -46,15 +46,17 @@ COPY src/bridge/ ./src/bridge/
 COPY scripts/run_platform_bridge.py scripts/generate_curve_keys.py scripts/inject_test_signal.py ./scripts/
 COPY pyproject.toml .
 
-# Workers keep their SQLite state (idempotence, dead man's switch, drawdown) in /data: mount a volume there.
+# Workers keep their SQLite state (idempotence, dead man's switch, drawdown, fills/slippage) in /data and, if NOTHIERLY_LOG_DIR=/logs, rotating
+# log files in /logs: mount a volume on each. Both directories are created here and owned by the runtime user, so that a fresh named volume
+# inherits that ownership (Docker copies it on first mount).
 # Same non-root user pattern as the engine's Dockerfile (chmod o+x /root: the user must traverse /root to reach .local).
 RUN groupadd --system nothierly \
     && useradd --system --gid nothierly --home-dir /app --no-create-home --shell /usr/sbin/nologin nothierly \
-    && mkdir /data \
-    && chown -R nothierly:nothierly /app /data /root/.local \
+    && mkdir /data /logs \
+    && chown -R nothierly:nothierly /app /data /logs /root/.local \
     && chmod o+x /root
 USER nothierly
-VOLUME ["/data"]
+VOLUME ["/data", "/logs"]
 
 # Default: the bridge in --dry-run (logs signals, publishes nothing). Real components are selected by compose.
 CMD ["python", "scripts/run_platform_bridge.py", "--dry-run"]
