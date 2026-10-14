@@ -224,7 +224,11 @@ confidences and their gap, the latest spread, the realized volatility of recent 
 signed by trade direction), asks it for P(success) and turns that into a size multiplier with
 :func:`risk.meta_labeling.kelly_size_multiplier` (a fractional-Kelly slope around the neutral 0.5, so the untrained
 skeleton still maps to exactly 1.0). A missing or unusable artifact, or a feature the model needs that has no reading yet,
-falls back to the neutral 0.5 / multiplier 1.0, never to a made-up input. Every consensus-driven Gate 3 evaluation is
+falls back to the neutral 0.5 / multiplier 1.0, never to a made-up input. For crypto instruments the model may also
+take ``vpin``: the order-flow toxicity written by ``workers/market_data/vpin_tracker.py`` under ``market:vpin:<SYMBOL>`` (read at
+Gate 3; a missing or expired key falls back to the last value read within five minutes, else to "no reading", which a model that
+declares ``vpin`` answers neutrally; no invented 0.5, which is not a neutral VPIN). The primary PPO and XGBoost models do not
+receive it: their input layouts are fixed by their trained weights. Every consensus-driven Gate 3 evaluation is
 published on the bus as ``META_LABEL_DECISION`` (features, probability, multiplier), archived by the Archivist: that log is
 what the training script joins to the realized outcomes. Position sizes still reach external venues only through the
 bridge, which quantizes them to price-bucket steps (``src/bridge/platform_bridge.py``): the dynamic multiplier is never
@@ -313,6 +317,9 @@ _AGENT_ID: Final[str] = "execution-agent"
 _TRADE_EXECUTED_TOPIC: Final[str] = "TRADE_EXECUTED"
 _META_LABEL_DECISION_TOPIC: Final[str] = "META_LABEL_DECISION"
 _RECENT_MIDS_MAXLEN: Final[int] = 120  # ticks of mid-price history behind the volatility feature
+_VPIN_KEY_PREFIX: Final[str] = "market:vpin:"  # written by workers/market_data/vpin_tracker.py
+_VPIN_CACHE_MAX_AGE_S: Final[float] = 300.0  # how long the last value read stays usable when the key is missing or expired
+_VPIN_READ_TIMEOUT_S: Final[float] = 1.0
 _MIN_MIDS_FOR_VOLATILITY: Final[int] = 10
 _MARKET_DATA_TOPIC: Final[str] = "MARKET_DATA_L2"
 _DEFAULT_REQUIRED_AGENT_IDS: Final[frozenset[str]] = frozenset({"supervisor-agent", "rl-signal-agent"})
@@ -993,6 +1000,7 @@ class ExecutionAgent(BaseAgent):
         self._last_spreads: dict[str, float] = {}
         # Meta-label inputs (see _meta_label_assess): latest signed order-book imbalance and a short mid-price history.
         self._last_imbalances: dict[str, float] = {}
+        self._vpin_cache: dict[str, tuple[float, float]] = {}  # instrument -> (value, time.monotonic() when read)
         self._recent_mids: dict[str, deque[float]] = {}
         # "Protocole AEGIS" real gap detection over _tick_events -- see _record_tick_event.
         self._last_tick_event_time: dict[str, float] = {}
@@ -1674,7 +1682,8 @@ class ExecutionAgent(BaseAgent):
                 0.0,
             )
 
-        assessment = self._meta_label_assess(instrument, signals)
+        vpin = await self._read_vpin(instrument) if signals is not None else None
+        assessment = self._meta_label_assess(instrument, signals, vpin=vpin)
         multiplier, meta_confidence = assessment.multiplier, assessment.confidence
         if signals is not None:
             await self._record_meta_label_decision(instrument, current_price, assessment)
@@ -1693,7 +1702,36 @@ class ExecutionAgent(BaseAgent):
         )
         return GateResult(3, _GATE_NAMES[2], "PASSED", detail), sized_units
 
-    def _meta_label_assess(self, instrument: str, signals: dict[str, TradingSignal] | None) -> _MetaLabelAssessment:
+    async def _read_vpin(self, instrument: str) -> float | None:
+        """The order-flow toxicity (VPIN, in ``[0, 1]``) for a crypto instrument, or ``None`` if there is no usable reading.
+
+        ``BTC/USDT`` reads ``market:vpin:BTCUSDT``. A missing, expired, unreadable or out-of-range value falls back to the last
+        valid value read within ``_VPIN_CACHE_MAX_AGE_S``, otherwise ``None``: never an invented number.
+        """
+        if "/" not in instrument or self._redis_client is None:
+            return None
+        key = f"{_VPIN_KEY_PREFIX}{instrument.replace('/', '')}"
+        value: float | None = None
+        try:
+            raw = await asyncio.wait_for(self._redis_client.execute("get", key), timeout=_VPIN_READ_TIMEOUT_S)
+            if raw is not None:
+                candidate = float(raw)
+                if math.isfinite(candidate) and 0.0 <= candidate <= 1.0:
+                    value = candidate
+        except (RedisUnavailableError, asyncio.TimeoutError, ValueError, TypeError):
+            value = None
+        now = time.monotonic()
+        if value is not None:
+            self._vpin_cache[instrument] = (value, now)
+            return value
+        cached = self._vpin_cache.get(instrument)
+        if cached is not None and now - cached[1] <= _VPIN_CACHE_MAX_AGE_S:
+            return cached[0]
+        return None
+
+    def _meta_label_assess(
+        self, instrument: str, signals: dict[str, TradingSignal] | None, *, vpin: float | None = None,
+    ) -> _MetaLabelAssessment:
         """The meta-label's probability and size multiplier for this consensus event, plus the inputs it was given.
 
         ``signals is None`` (a manual operator override, see Gate 1) has no per-agent confidence to build a
@@ -1725,6 +1763,8 @@ class ExecutionAgent(BaseAgent):
                 values["volatility"] = float(np.std(returns, ddof=1))
         if instrument in self._last_imbalances:
             values["imbalance_aligned"] = self._last_imbalances[instrument] * float(direction)
+        if vpin is not None:
+            values["vpin"] = vpin
         features = self._meta_label_model.vectorize(values)
         if features is None:
             missing = [n for n in self._meta_label_model.feature_names if n not in values]

@@ -99,6 +99,9 @@ FEATURES_V2: Final[tuple[str, ...]] = (
     "volatility",
     "imbalance_aligned",
 )
+# v3 adds the order-flow toxicity written by ``workers/market_data/vpin_tracker.py`` (``market:vpin:<SYMBOL>``, in [0, 1]).
+# Only crypto instruments have it; a model that declares ``vpin`` answers neutrally (0.5) when there is no reading.
+FEATURES_V3: Final[tuple[str, ...]] = (*FEATURES_V2, "vpin")
 METADATA_SUFFIX: Final[str] = ".meta.json"
 _DEFAULT_PAYOFF_RATIO: Final[float] = 1.0
 

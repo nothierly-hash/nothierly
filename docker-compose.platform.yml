@@ -146,6 +146,35 @@ services:
     depends_on:
       - nothierly-platform-bridge
 
+  # VPIN en temps réel à partir des trades PUBLICS : aucune clé d'exchange, donc pas de platform.env. Écrit market:vpin:<SYMBOLE> dans
+  # le Redis du moteur ; le moteur n'a ainsi aucun accès sortant. Un seul démon par symbole (Binance OU Hyperliquid, jamais les deux).
+  nothierly-vpin-tracker:
+    <<: *platform-hardening
+    build: *platform-build
+    image: nothierly-platform:local
+    container_name: nothierly-${CLIENT_ID:?Set CLIENT_ID}-vpin-tracker
+    command:
+      - python
+      - -m
+      - workers.market_data.vpin_tracker
+      - --source
+      - binance
+      - --symbols
+      - BTCUSDT
+      - ETHUSDT
+      - --bucket-size
+      - "100000"
+      - --window
+      - "50"
+    environment:
+      REDIS_HOST: redis-broker
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD}
+      WEBHOOK_URL: ${WEBHOOK_URL:-}
+    depends_on:
+      redis-broker:
+        condition: service_healthy
+
 volumes:
   platform_hyperliquid_data:
   platform_bybit_data:

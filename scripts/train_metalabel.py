@@ -57,7 +57,7 @@ import numpy.typing as npt
 import xgboost as xgb
 from sklearn.metrics import accuracy_score, brier_score_loss, log_loss, roc_auc_score
 
-from risk.meta_labeling import FEATURES_V2, kelly_size_multiplier, metadata_path_for
+from risk.meta_labeling import FEATURES_V2, FEATURES_V3, kelly_size_multiplier, metadata_path_for
 from workers.common.fills_db import BUY, Execution, FillsDatabase
 
 MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
@@ -447,6 +447,8 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--lookback-days", type=int, default=60, help="with --timescale")
     parser.add_argument("--fills-db", type=Path, nargs="+", required=True, help="workers' fills SQLite files")
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
+    parser.add_argument("--features", choices=["v2", "v3"], default="v2",
+                        help="v3 ajoute le VPIN (market:vpin:<SYMBOLE>) ; les décisions sans VPIN sont alors écartées et comptées")
     parser.add_argument("--max-lag-s", type=float, default=120.0)
     parser.add_argument("--test-fraction", type=float, default=0.3)
     parser.add_argument("--min-trades", type=int, default=300)
@@ -471,7 +473,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         fills.extend(db.executions(limit=10_000_000))
         db.close()
     code, report, details = run(
-        rows, fills, out=args.out, max_lag_s=args.max_lag_s, test_fraction=args.test_fraction, min_trades=args.min_trades,
+        rows, fills, out=args.out, feature_names=FEATURES_V3 if args.features == "v3" else FEATURES_V2, max_lag_s=args.max_lag_s, test_fraction=args.test_fraction, min_trades=args.min_trades,
         min_test=args.min_test, min_auc=args.min_auc,
     )
     print(json.dumps({"exit": code, "report": report.__dict__, "details": details}, indent=2, default=str))
