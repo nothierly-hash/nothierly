@@ -1,0 +1,436 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nothierly : guide de déploiement</title>
+<style>
+  :root {
+    --bg: #0b1020; --panel: #121a33; --panel2: #18224a; --text: #e8ecff; --muted: #9aa6d6; --line: #26335f;
+    --cyan: #22d3ee; --green: #34d399; --amber: #fbbf24; --red: #f87171; --violet: #a78bfa; --pink: #f472b6; --blue: #60a5fa; --orange: #fb923c;
+    --code: #070b18;
+  }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      --bg: #f4f6ff; --panel: #ffffff; --panel2: #eef1ff; --text: #17203d; --muted: #5a6591; --line: #d5dcf5; --code: #101733;
+      --cyan: #0891b2; --green: #059669; --amber: #b45309; --red: #dc2626; --violet: #6d28d9; --pink: #be185d; --blue: #2563eb; --orange: #c2410c;
+    }
+  }
+  :root[data-theme="light"] {
+    --bg: #f4f6ff; --panel: #ffffff; --panel2: #eef1ff; --text: #17203d; --muted: #5a6591; --line: #d5dcf5; --code: #101733;
+    --cyan: #0891b2; --green: #059669; --amber: #b45309; --red: #dc2626; --violet: #6d28d9; --pink: #be185d; --blue: #2563eb; --orange: #c2410c;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  a { color: var(--cyan); }
+  .wrap { max-width: 1060px; margin: 0 auto; padding: 0 16px 80px; }
+  header.hero { background: linear-gradient(135deg, #1e3a8a 0%, #6d28d9 45%, #be185d 100%); color: #fff; padding: 42px 16px 34px; }
+  header.hero .in { max-width: 1060px; margin: 0 auto; }
+  header.hero h1 { margin: 0 0 6px; font-size: clamp(1.7rem, 4vw, 2.5rem); letter-spacing: -.5px; }
+  header.hero p { margin: 4px 0; opacity: .92; max-width: 760px; }
+  .meta { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+  .chip { background: rgba(255,255,255,.16); border: 1px solid rgba(255,255,255,.28); border-radius: 999px; padding: 3px 12px; font-size: .82rem; }
+  nav.toc { position: sticky; top: 0; z-index: 5; background: color-mix(in srgb, var(--bg) 88%, transparent); backdrop-filter: blur(8px); border-bottom: 1px solid var(--line); }
+  nav.toc .in { max-width: 1060px; margin: 0 auto; padding: 8px 16px; display: flex; gap: 6px; overflow-x: auto; align-items: center; }
+  nav.toc a { white-space: nowrap; text-decoration: none; color: var(--muted); font-size: .86rem; padding: 4px 10px; border-radius: 8px; }
+  nav.toc a:hover { background: var(--panel2); color: var(--text); }
+  nav.toc button { margin-left: auto; }
+  h2 { margin: 46px 0 6px; font-size: 1.6rem; display: flex; align-items: center; gap: 10px; }
+  h2 .num { background: linear-gradient(135deg, var(--cyan), var(--violet)); color: #fff; border-radius: 10px; padding: 0 11px; font-size: 1.1rem; }
+  h3 { margin: 22px 0 6px; font-size: 1.15rem; }
+  p.lead { color: var(--muted); margin: 0 0 14px; max-width: 780px; }
+  .grid { display: grid; gap: 14px; }
+  .g2 { grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); }
+  .g3 { grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 16px 18px; }
+  .card h3 { margin-top: 0; }
+  .accent { border-top: 4px solid var(--c, var(--cyan)); }
+  .badge { display: inline-block; font-size: .74rem; font-weight: 700; padding: 2px 9px; border-radius: 999px; letter-spacing: .3px; vertical-align: middle; }
+  .ok { background: color-mix(in srgb, var(--green) 20%, transparent); color: var(--green); border: 1px solid var(--green); }
+  .warn { background: color-mix(in srgb, var(--amber) 20%, transparent); color: var(--amber); border: 1px solid var(--amber); }
+  .no { background: color-mix(in srgb, var(--red) 20%, transparent); color: var(--red); border: 1px solid var(--red); }
+  .info { background: color-mix(in srgb, var(--blue) 20%, transparent); color: var(--blue); border: 1px solid var(--blue); }
+  .callout { border-left: 5px solid var(--c, var(--amber)); background: var(--panel2); border-radius: 0 12px 12px 0; padding: 12px 16px; margin: 14px 0; }
+  .callout b.t { display: block; margin-bottom: 2px; color: var(--c, var(--amber)); }
+  .why { --c: var(--violet); } .danger { --c: var(--red); } .good { --c: var(--green); } .tip { --c: var(--cyan); }
+  pre { position: relative; background: var(--code); color: #d6defa; border: 1px solid #263561; border-radius: 10px; padding: 12px 14px; overflow-x: auto; font: .86rem/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; margin: 8px 0 12px; }
+  pre .copy { position: absolute; top: 6px; right: 6px; }
+  code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: .88em; background: var(--panel2); padding: 1px 6px; border-radius: 5px; }
+  code { overflow-wrap: anywhere; }
+  pre code { background: none; padding: 0; font-size: inherit; overflow-wrap: normal; }
+  dl.kv dd, dl.kv dt { min-width: 0; }
+  button { cursor: pointer; border: 1px solid var(--line); background: var(--panel2); color: var(--text); border-radius: 8px; padding: 4px 10px; font-size: .78rem; }
+  button:hover { border-color: var(--cyan); }
+  .step { display: grid; grid-template-columns: 44px minmax(0, 1fr); gap: 14px; margin: 16px 0; }
+  .card, .step .body { min-width: 0; }
+  .step .n { width: 44px; height: 44px; border-radius: 50%; display: grid; place-items: center; font-weight: 800; color: #fff; background: linear-gradient(135deg, var(--c, var(--cyan)), var(--violet)); }
+  .step .body { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 14px 18px; }
+  .step .body h3 { margin: 0 0 4px; }
+  .where { font-size: .78rem; font-weight: 700; text-transform: uppercase; letter-spacing: .6px; color: var(--c, var(--cyan)); }
+  .check { display: flex; gap: 8px; align-items: flex-start; margin: 6px 0; }
+  .check input { margin-top: 5px; width: 17px; height: 17px; accent-color: var(--green); }
+  table { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; font-size: .92rem; }
+  th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { background: var(--panel2); color: var(--muted); font-size: .78rem; text-transform: uppercase; letter-spacing: .5px; }
+  tr:last-child td { border-bottom: 0; }
+  .scroll { overflow-x: auto; }
+  svg text { fill: var(--text); font: 600 13px system-ui, sans-serif; }
+  svg .sub { fill: var(--muted); font-weight: 400; font-size: 11px; }
+  .progress { height: 10px; border-radius: 999px; background: var(--panel2); border: 1px solid var(--line); overflow: hidden; }
+  .progress > i { display: block; height: 100%; width: 0; background: linear-gradient(90deg, var(--green), var(--cyan)); transition: width .3s; }
+  ul { padding-left: 20px; } li { margin: 3px 0; }
+  .plat-head { display: flex; justify-content: space-between; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .plat-head h3 { margin: 0; font-size: 1.3rem; }
+  dl.kv { display: grid; grid-template-columns: 150px 1fr; gap: 6px 14px; margin: 10px 0 0; }
+  dl.kv dt { color: var(--muted); font-size: .86rem; font-weight: 700; }
+  dl.kv dd { margin: 0; }
+  @media (max-width: 640px) { dl.kv { grid-template-columns: 1fr; } .step { grid-template-columns: 34px minmax(0, 1fr); } .step .n { width: 34px; height: 34px; } }
+</style>
+</head>
+<body>
+
+<header class="hero"><div class="in">
+  <h1>Nothierly : guide de déploiement</h1>
+  <p>Ce qui reste à faire, dans l'ordre, avec pour chaque étape le <b>pourquoi</b>, la vérification attendue et les erreurs fréquentes. Puis, plateforme par plateforme, ce qui est prêt, ce qui ne l'est pas et pourquoi.</p>
+  <div class="meta">
+    <span class="chip">Branche <b>red-team-audit</b></span>
+    <span class="chip">Dernier commit de déploiement <b>c4a0652</b></span>
+    <span class="chip">Serveur : AWS Tokyo, Ubuntu 24.04, m6i.xlarge</span>
+    <span class="chip">Mode : Shadow Run (collecte, dry-run, testnet)</span>
+  </div>
+</div></header>
+
+<nav class="toc"><div class="in">
+  <a href="#etat">1 · État</a><a href="#archi">2 · Architecture</a><a href="#etapes">3 · Étapes restantes</a><a href="#plateformes">4 · Les 5 plateformes</a>
+  <a href="#secrets">5 · Secrets</a><a href="#choix">6 · Pourquoi ces choix</a><a href="#depannage">7 · Dépannage</a><a href="#apres">8 · Après le lancement</a><a href="#limites">9 · Limites</a>
+  <button id="theme" type="button" aria-label="Changer de thème">Thème</button>
+</div></nav>
+
+<div class="wrap">
+
+<!-- 1 ---------------------------------------------------------------------------------------------------------- -->
+<h2 id="etat"><span class="num">1</span> Où on en est</h2>
+<p class="lead">Le code est terminé et testé sur ce PC. Le serveur AWS existe. Il manque l'envoi du code vers GitHub, la liaison du serveur et le démarrage. Aucune de ces étapes n'a pu être faite par l'assistant : il n'a ni accès à AWS ni à GitHub.</p>
+<div class="grid g3">
+  <div class="card accent" style="--c:var(--green)"><span class="badge ok">FAIT</span><h3>Code</h3>
+    <ul><li>Moteur, pont, workers, tracker VPIN, archive SQLite, extracteur, maintenance</li><li>Réconciliation d'état, limites de débit 429/418, watchdog WebSocket</li><li>Environ 600 tests passent sur les suites concernées</li></ul></div>
+  <div class="card accent" style="--c:var(--green)"><span class="badge ok">FAIT</span><h3>Serveur</h3>
+    <ul><li>Instance Ubuntu 24.04 lancée, rôle SSM attaché</li><li>Docker, git et python3-zmq installés par le script de démarrage</li><li>Clé de déploiement générée (la clé publique vous a été affichée)</li></ul></div>
+  <div class="card accent" style="--c:var(--amber)"><span class="badge warn">RESTE</span><h3>À faire par vous</h3>
+    <ul><li>Pousser le code sur GitHub</li><li>Ajouter la clé de déploiement au dépôt</li><li>Cloner, créer les secrets, démarrer</li></ul></div>
+</div>
+<div class="callout danger" style="--c:var(--red)"><b class="t">Rien n'a tourné sous Docker</b>
+  Ni les fichiers Compose, ni les scripts de déploiement n'ont été exécutés. Ils ont été relus, validés en syntaxe et recoupés entre eux. Le premier lancement est le vrai test : suivez les vérifications de chaque étape.</div>
+
+<!-- 2 ---------------------------------------------------------------------------------------------------------- -->
+<h2 id="archi"><span class="num">2</span> L'architecture en une image</h2>
+<p class="lead">Le <b>Cerveau</b> décide, le <b>pont</b> traduit et signe, chaque <b>worker</b> n'exécute que sur sa plateforme. Les clés de trading ne sont que dans les workers ; le Cerveau n'a ni clé ni accès sortant.</p>
+<div class="card scroll">
+<svg viewBox="0 0 980 360" width="100%" role="img" aria-label="Schéma de l'architecture Nothierly">
+  <defs><marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#9aa6d6"/></marker></defs>
+  <rect x="20" y="30" width="190" height="86" rx="12" fill="#6d28d9"/><text x="115" y="66" text-anchor="middle" fill="#fff" style="fill:#fff">Cerveau (moteur)</text><text x="115" y="86" text-anchor="middle" class="sub" style="fill:#e9ddff">PPO + XGBoost, Kelly, 8 portes</text>
+  <rect x="270" y="30" width="170" height="86" rx="12" fill="#0e7490"/><text x="355" y="66" text-anchor="middle" style="fill:#fff">Pont</text><text x="355" y="86" text-anchor="middle" class="sub" style="fill:#d4f7ff">signe (HMAC) + chiffre (CURVE)</text>
+  <line x1="210" y1="73" x2="268" y2="73" stroke="#9aa6d6" stroke-width="2" marker-end="url(#ar)"/>
+  <rect x="520" y="10" width="190" height="44" rx="10" fill="#047857"/><text x="615" y="37" text-anchor="middle" style="fill:#fff">Worker Hyperliquid</text>
+  <rect x="520" y="62" width="190" height="44" rx="10" fill="#b45309"/><text x="615" y="89" text-anchor="middle" style="fill:#fff">Worker Bybit</text>
+  <rect x="520" y="114" width="190" height="44" rx="10" fill="#a16207"/><text x="615" y="141" text-anchor="middle" style="fill:#fff">Worker Binance</text>
+  <rect x="770" y="10" width="190" height="44" rx="10" fill="#9f1239"/><text x="865" y="37" text-anchor="middle" style="fill:#fff">Darwinex (Windows)</text>
+  <rect x="770" y="62" width="190" height="44" rx="10" fill="#475569"/><text x="865" y="89" text-anchor="middle" style="fill:#fff">Numerai (sans signaux)</text>
+  <line x1="440" y1="60" x2="518" y2="32" stroke="#9aa6d6" stroke-width="2" marker-end="url(#ar)"/>
+  <line x1="440" y1="76" x2="518" y2="84" stroke="#9aa6d6" stroke-width="2" marker-end="url(#ar)"/>
+  <line x1="440" y1="92" x2="518" y2="136" stroke="#9aa6d6" stroke-width="2" marker-end="url(#ar)"/>
+  <line x1="712" y1="32" x2="768" y2="32" stroke="#6b7280" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <rect x="20" y="190" width="190" height="70" rx="12" fill="#1d4ed8"/><text x="115" y="222" text-anchor="middle" style="fill:#fff">Redis</text><text x="115" y="240" text-anchor="middle" class="sub" style="fill:#dbe7ff">état, VPIN, rapports</text>
+  <rect x="270" y="190" width="170" height="70" rx="12" fill="#1d4ed8"/><text x="355" y="222" text-anchor="middle" style="fill:#fff">TimescaleDB</text><text x="355" y="240" text-anchor="middle" class="sub" style="fill:#dbe7ff">archive du bus (carnet, décisions)</text>
+  <rect x="520" y="190" width="190" height="70" rx="12" fill="#be185d"/><text x="615" y="217" text-anchor="middle" style="fill:#fff">Tracker VPIN</text><text x="615" y="236" text-anchor="middle" class="sub" style="fill:#ffe0ee">flux publics Binance, SQLite 24 h/24</text>
+  <rect x="770" y="190" width="190" height="70" rx="12" fill="#0f766e"/><text x="865" y="217" text-anchor="middle" style="fill:#fff">Reporter de positions</text><text x="865" y="236" text-anchor="middle" class="sub" style="fill:#d5fbf4">lecture seule, vers Redis</text>
+  <rect x="20" y="290" width="940" height="46" rx="10" fill="#334155"/><text x="490" y="318" text-anchor="middle" style="fill:#fff">Maintenance : purge SQLite, VACUUM, rétention et compression TimescaleDB (toutes les 24 h)</text>
+  <line x1="115" y1="118" x2="115" y2="188" stroke="#9aa6d6" stroke-width="2" marker-end="url(#ar)"/>
+  <line x1="355" y1="118" x2="355" y2="188" stroke="#9aa6d6" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <line x1="613" y1="262" x2="613" y2="288" stroke="#9aa6d6" stroke-width="1.5" stroke-dasharray="5 4"/>
+</svg>
+</div>
+<div class="callout why"><b class="t">Pourquoi cette séparation</b>
+  Si un worker est compromis, l'attaquant touche une seule plateforme et une seule clé, sans droit de retrait. Si le Cerveau est compromis, il n'a aucune clé d'exchange à voler. Le reporter de positions est un service à part, en lecture seule, justement pour ne pas donner Redis aux workers qui portent des clés de trading.</div>
+
+<!-- 3 ---------------------------------------------------------------------------------------------------------- -->
+<h2 id="etapes"><span class="num">3</span> Les étapes restantes, dans l'ordre</h2>
+<p class="lead">Cochez au fur et à mesure : la progression est mémorisée dans votre navigateur. Chaque étape dit où la faire, pourquoi, et comment savoir qu'elle a réussi.</p>
+<div class="card"><div class="progress"><i id="bar"></i></div><div style="margin-top:6px;color:var(--muted);font-size:.9rem" id="barlabel">0 / 0 étapes</div></div>
+
+<div class="step" style="--c:var(--blue)"><div class="n">1</div><div class="body">
+  <span class="where">Sur votre PC · Git Bash</span>
+  <h3>Envoyer le code sur GitHub</h3>
+  <p><b>Pourquoi :</b> le serveur clone le code depuis GitHub. Aujourd'hui le dépôt n'a aucun remote : tout le travail n'existe que sur votre PC, donc le <code>git clone</code> du serveur échouerait.</p>
+<pre><button class="copy" type="button">Copier</button><code>cd "/c/Users/DELL/projet API trading"
+git remote add origin git@github.com:&lt;VOTRE_COMPTE&gt;/&lt;VOTRE_DEPOT&gt;.git
+git push -u origin red-team-audit</code></pre>
+  <div class="callout danger" style="--c:var(--red)"><b class="t">Ne faites pas <code>git branch -M main</code></b>Votre <code>main</code> local existe déjà : cette commande l'écraserait. Poussez la branche telle quelle.</div>
+  <p><b>Vérification :</b> la dernière ligne affichée est <code>red-team-audit -&gt; red-team-audit</code>. Un <code>Permission denied (publickey)</code> signifie que la clé SSH de <i>votre PC</i> n'est pas enregistrée sur GitHub (Settings, SSH and GPG keys). Créez le dépôt vide <b>privé</b> sur GitHub avant.</p>
+  <label class="check"><input type="checkbox" data-k="s1"> Fait : le push affiche <code>red-team-audit -&gt; red-team-audit</code></label>
+</div></div>
+
+<div class="step" style="--c:var(--pink)"><div class="n">2</div><div class="body">
+  <span class="where">Sur GitHub · navigateur</span>
+  <h3>Autoriser le serveur à lire le dépôt</h3>
+  <p><b>Pourquoi :</b> le dépôt est privé. La clé de déploiement est une clé <i>propre au serveur</i>, en lecture seule : si le serveur est compromis, l'attaquant peut lire le code mais pas le modifier, et vous la révoquez sans toucher à votre compte.</p>
+  <ol>
+    <li>Dépôt, <b>Settings</b>, <b>Deploy keys</b>, <b>Add deploy key</b>.</li>
+    <li>Titre : <code>AWS Tokyo</code>. Collez la ligne que le script CloudShell a affichée (elle commence par <code>ssh-ed25519</code> et finit par <code>nothierly-deploy</code>).</li>
+    <li><b>Laissez « Allow write access » décoché.</b></li>
+  </ol>
+  <p><b>Vérification :</b> la clé apparaît dans la liste. Vous testerez la connexion à l'étape 4. Vous pouvez la relire sur le serveur avec <code>cat ~/.ssh/nothierly_deploy.pub</code> : la clé <i>publique</i> seulement, jamais le fichier sans <code>.pub</code>.</p>
+  <label class="check"><input type="checkbox" data-k="s2"> Fait : la clé de déploiement est dans la liste, en lecture seule</label>
+</div></div>
+
+<div class="step" style="--c:var(--violet)"><div class="n">3</div><div class="body">
+  <span class="where">Console AWS · navigateur</span>
+  <h3>Ouvrir le terminal du serveur (sans SSH)</h3>
+  <p><b>Pourquoi :</b> votre PC n'arrivait pas à joindre le port 22 d'AWS, alors que <code>github.com:22</code> répondait : le blocage venait d'AWS, pas de votre opérateur. Le Gestionnaire de session (SSM) passe par le port 443 sortant de l'instance : aucun port à ouvrir, aucune clé SSH à gérer.</p>
+  <ol>
+    <li>Région <b>Tokyo</b>, <b>EC2</b>, <b>Instances</b>, cochez votre instance <code>i-0f3749477797afa0d</code>.</li>
+    <li>Attendez « Running » et les contrôles d'état <b>2/2</b>.</li>
+    <li><b>Se connecter</b>, onglet <b>Gestionnaire de session</b>, <b>Se connecter</b>. Un terminal noir s'ouvre.</li>
+  </ol>
+<pre><button class="copy" type="button">Copier</button><code>sudo su - ubuntu</code></pre>
+  <p><b>Vérification :</b> l'invite affiche <code>ubuntu@ip-…:~$</code>. Collez cette commande <b>seule</b>, attendez l'invite, puis continuez.</p>
+  <div class="callout tip" style="--c:var(--cyan)"><b class="t">Si « Se connecter » est grisé</b>Le rôle <code>nothierly-ssm</code> n'est pas attaché (Actions, Sécurité, Modifier le rôle IAM), ou l'instance n'a pas de route vers Internet (VPC, Tables de routage : une route <code>0.0.0.0/0</code> vers <code>igw-…</code>). Attendez 5 minutes après toute correction.</div>
+  <label class="check"><input type="checkbox" data-k="s3"> Fait : l'invite <code>ubuntu@ip-…</code> s'affiche</label>
+</div></div>
+
+<div class="step" style="--c:var(--green)"><div class="n">4</div><div class="body">
+  <span class="where">Terminal SSM · serveur</span>
+  <h3>Cloner le code</h3>
+  <p><b>Pourquoi :</b> le code vient de GitHub, jamais copié à la main : ce qui tourne sur le serveur est exactement un commit connu.</p>
+<pre><button class="copy" type="button">Copier</button><code>ssh -T git@github.com</code></pre>
+  <p>Réponse attendue : « Hi … You've successfully authenticated ». Avant de continuer, comparez l'empreinte de <code>github.com</code> enregistrée par le serveur avec celle publiée par GitHub (documentation GitHub, « SSH key fingerprints ») :</p>
+<pre><button class="copy" type="button">Copier</button><code>ssh-keygen -lf ~/.ssh/known_hosts</code></pre>
+<pre><button class="copy" type="button">Copier</button><code>git clone -b red-team-audit git@github.com:&lt;VOTRE_COMPTE&gt;/&lt;VOTRE_DEPOT&gt;.git ~/nothierly &amp;&amp; cd ~/nothierly</code></pre>
+  <p><b>Vérification :</b> <code>git log --oneline -1</code> affiche <code>c4a0652</code> ou un commit plus récent. <code>Permission denied (publickey)</code> : la clé de déploiement n'est pas (bien) ajoutée sur ce dépôt, ou l'URL est en HTTPS au lieu de <code>git@github.com:</code>.</p>
+  <label class="check"><input type="checkbox" data-k="s4"> Fait : le dépôt est cloné dans <code>~/nothierly</code></label>
+</div></div>
+
+<div class="step" style="--c:var(--orange)"><div class="n">5</div><div class="body">
+  <span class="where">Terminal SSM · serveur</span>
+  <h3>Créer les secrets (sur le serveur seulement)</h3>
+  <p><b>Pourquoi :</b> les secrets n'ont jamais été dans Git. Les générer <i>sur le serveur</i>, directement dans les fichiers, évite qu'ils passent par votre PC, votre presse-papiers ou un chat. <code>umask 077</code> crée les fichiers lisibles par le seul propriétaire ; le script de déploiement refuse des fichiers lisibles par tous.</p>
+<pre><button class="copy" type="button">Copier</button><code>umask 077 &amp;&amp; printf 'CLIENT_ID=nothierly-prod\nDB_USER=nothierly\nDB_PASSWORD=%s\nREDIS_PASSWORD=%s\n' "$(python3 -c 'import secrets;print(secrets.token_hex(32))')" "$(python3 -c 'import secrets;print(secrets.token_hex(32))')" &gt; .env</code></pre>
+<pre><button class="copy" type="button">Copier</button><code>umask 077 &amp;&amp; printf 'NOTHIERLY_ZMQ_SECRET=%s\n' "$(python3 -c 'import secrets;print(secrets.token_hex(32))')" &gt; platform.env &amp;&amp; : &gt; reporter.env</code></pre>
+<pre><button class="copy" type="button">Copier</button><code>python3 scripts/generate_curve_keys.py --clients hyperliquid bybit binance --out-dir secrets/curve</code></pre>
+<pre><button class="copy" type="button">Copier</button><code>ls -la .env platform.env reporter.env secrets/curve</code></pre>
+  <p><b>Vérification :</b> les trois fichiers affichent <code>-rw-------</code> ; <code>secrets/curve</code> contient un fichier par client plus <code>curve_server.env</code>.</p>
+  <div class="callout why"><b class="t">Pourquoi <code>DB_USER=nothierly</code> et pas un long mot de passe</b>PostgreSQL limite les noms d'utilisateur à 63 caractères. Un identifiant de 64 caractères hexadécimaux est tronqué en silence et peut causer des erreurs d'authentification difficiles à comprendre.</div>
+  <div class="callout why"><b class="t">Pourquoi <code>reporter.env</code> est vide</b>Le script exige que le fichier existe. Vous le remplirez (clés de lecture seule Bybit et Binance, adresse Hyperliquid) quand vous activerez le reporter de positions.</div>
+  <label class="check"><input type="checkbox" data-k="s5"> Fait : <code>ls -la</code> montre <code>-rw-------</code> sur les trois fichiers</label>
+</div></div>
+
+<div class="step" style="--c:var(--cyan)"><div class="n">6</div><div class="body">
+  <span class="where">Terminal SSM · serveur</span>
+  <h3>Démarrer la collecte de données</h3>
+  <p><b>Pourquoi seulement ces services :</b> le Shadow Run sert à accumuler des données réelles (VPIN, carnet) pour entraîner les modèles. Les workers d'exécution n'y servent à rien, et sans clés de testnet ils quittent au démarrage et sont relancés en boucle par Docker, ce qui sature le CPU et noie les journaux.</p>
+<pre><button class="copy" type="button">Copier</button><code>SERVICES="redis-broker timescaledb nothierly-agents nothierly-vpin-tracker nothierly-maintenance" bash scripts/deploy_shadow.sh --up</code></pre>
+  <p><b>Ce que fait le script, dans l'ordre :</b> vérifie Ubuntu, l'espace disque (50 Go libres minimum) et la RAM, installe Docker si besoin, vérifie que <code>.env</code>, <code>platform.env</code>, <code>reporter.env</code> et <code>secrets/curve</code> existent et que les variables obligatoires y sont, crée les 4 volumes permanents, valide la configuration Compose, joue la maintenance à blanc, <b>puis seulement</b> démarre. Au moindre problème il s'arrête <i>avant</i> de démarrer et dit quoi corriger.</p>
+  <p><b>Sans <code>--up</code></b> il fait toutes les vérifications sans rien démarrer : utile pour un premier essai.</p>
+  <label class="check"><input type="checkbox" data-k="s6"> Fait : le script se termine sans erreur et <code>docker compose ps</code> montre les services « running »</label>
+</div></div>
+
+<div class="step" style="--c:var(--green)"><div class="n">7</div><div class="body">
+  <span class="where">Terminal SSM · serveur</span>
+  <h3>Vérifier que les données arrivent</h3>
+<pre><button class="copy" type="button">Copier</button><code>docker compose -f docker-compose.yml -f docker-compose.platform.yml -f docker-compose.shadow.yml logs -f nothierly-vpin-tracker</code></pre>
+  <p>Utilisez <b>exactement</b> la même liste de fichiers que pour le démarrage : sinon Compose ne voit pas les services du Shadow Run.</p>
+  <dl class="kv">
+    <dt>Succès</dt><dd><code>vpin_feed_connected symbols=['BTCUSDT', 'ETHUSDT']</code></dd>
+    <dt>Blocage géographique</dt><dd>Erreurs répétées de connexion vers <code>fstream.binance.com</code> (HTTP 403 ou 451). Voir « Dépannage ».</dd>
+    <dt>Flux muet</dt><dd><code>vpin_feed_stale</code> : le garde-fou a coupé la clé Redis et reconnecte. Si ça se répète, voir « Dépannage ».</dd>
+    <dt>Premières valeurs</dt><dd>Le VPIN n'apparaît qu'une fois la fenêtre pleine (50 seaux de 100 000 $) : patience, de quelques minutes à plusieurs dizaines selon l'activité du marché.</dd>
+  </dl>
+  <label class="check"><input type="checkbox" data-k="s7"> Fait : <code>vpin_feed_connected</code> est affiché</label>
+</div></div>
+
+<div class="step" style="--c:var(--amber)"><div class="n">8</div><div class="body">
+  <span class="where">Plus tard · serveur</span>
+  <h3>Ajouter les workers et le reporter (quand vous aurez les clés)</h3>
+  <p>Voir la section « Les 5 plateformes » : chaque plateforme a ses propres prérequis. Principe : <b>testnet et dry-run d'abord</b>, une plateforme à la fois, en lisant les journaux.</p>
+  <label class="check"><input type="checkbox" data-k="s8"> Fait (plus tard) : au moins une plateforme tourne en dry-run sur testnet sans erreur</label>
+</div></div>
+
+<!-- 4 ---------------------------------------------------------------------------------------------------------- -->
+<h2 id="plateformes"><span class="num">4</span> Les 5 plateformes : où en est chacune et pourquoi</h2>
+<p class="lead">Trois sont câblées et prêtes à tourner en dry-run. Deux ne peuvent pas l'être aujourd'hui, pour des raisons techniques précises.</p>
+
+<div class="grid g2">
+
+<div class="card accent" style="--c:var(--green)">
+  <div class="plat-head"><h3>Hyperliquid</h3><span class="badge ok">PRÊT · dry-run testnet</span></div>
+  <dl class="kv">
+    <dt>Pourquoi ce worker</dt><dd>Bourse décentralisée. Les positions d'une adresse sont <b>publiques</b> : le reporter de positions n'a besoin d'aucune clé. Un « agent wallet » signe les ordres et ne peut pas retirer de fonds.</dd>
+    <dt>Variables</dt><dd><code>HL_ACCOUNT_ADDRESS</code> (adresse du compte), <code>HL_AGENT_SECRET</code> (lu <i>seulement</i> avec <code>--live</code>), <code>HL_VAULT_ADDRESS</code> si vous tradez via un vault.</dd>
+    <dt>Fichier</dt><dd><code>platform.env</code> pour le worker ; <code>reporter.env</code> pour le reporter (adresse seulement).</dd>
+    <dt>Particularité</dt><dd>Les fills sont suivis par WebSocket (avec ping applicatif et garde-fou de fraîcheur). Le VPIN peut aussi venir d'Hyperliquid (<code>--source hyperliquid</code>) : <b>jamais les deux sources pour le même symbole</b>, elles écriraient la même clé avec des flux différents.</dd>
+    <dt>Activer</dt><dd>Ajouter les variables, puis démarrer <code>nothierly-platform-bridge</code> et <code>nothierly-worker-hyperliquid</code> (testnet, dry-run par défaut).</dd>
+    <dt>Passer en réel</dt><dd>Éditer la commande du worker dans <code>docker-compose.platform.yml</code> : ajouter <code>--live</code> ; sur mainnet aussi <code>--network mainnet --i-understand-real-funds</code>. C'est une modification volontaire du fichier, pas une variable d'environnement : une faute de frappe dans un <code>.env</code> ne peut pas envoyer un ordre réel.</dd>
+  </dl>
+</div>
+
+<div class="card accent" style="--c:var(--amber)">
+  <div class="plat-head"><h3>Bybit</h3><span class="badge ok">PRÊT · dry-run testnet</span> </div>
+  <dl class="kv">
+    <dt>Pourquoi ce worker</dt><dd>Futures USDT linéaires, API REST signée. Le worker vérifie au démarrage les droits de la clé (<code>/v5/user/query-api</code>) et <b>refuse</b> une clé qui a le droit de retrait.</dd>
+    <dt>Variables</dt><dd>Worker : <code>BYBIT_API_KEY</code>, <code>BYBIT_API_SECRET</code> (sans droit de retrait). Reporter : <code>BYBIT_READONLY_API_KEY</code> et <code>_SECRET</code>, une <b>autre</b> clé en lecture seule.</dd>
+    <dt>Particularité</dt><dd>Par défaut seuls les symboles ouverts au copy-trading sont acceptés ; <code>--allow-non-copy-symbols</code> lève cette limite. Mode de position « one-way » seulement (le mode hedge est refusé). Bybit n'accuse que la réception d'un ordre : la confirmation vient du WebSocket des fills.</dd>
+    <dt>Risque à vérifier</dt><dd>Restrictions par pays de l'adresse IP du serveur (Japon). Je ne l'ai pas vérifié : testez avec le dry-run avant de décider de la région.</dd>
+    <dt>Limites de débit</dt><dd>HTTP 429 : le worker dort exactement la durée de <code>Retry-After</code>. Les autres signaux de limite de Bybit (code dans le corps JSON, HTTP 403) ne sont pas traités.</dd>
+  </dl>
+</div>
+
+<div class="card accent" style="--c:var(--orange)">
+  <div class="plat-head"><h3>Binance</h3><span class="badge ok">PRÊT · dry-run testnet</span></div>
+  <dl class="kv">
+    <dt>Pourquoi ce worker</dt><dd>Futures USDⓈ-M. Le worker lit les précisions de chaque contrat (<code>exchangeInfo</code>), refuse une clé avec droit de retrait et un compte en mode hedge (il ne gère que le mode one-way).</dd>
+    <dt>Variables</dt><dd>Worker : <code>BINANCE_API_KEY</code>, <code>BINANCE_API_SECRET</code> (« Enable Reading » pour la vérification, « Enable Futures » pour ordonner, jamais le retrait). Reporter : <code>BINANCE_READONLY_API_KEY</code> et <code>_SECRET</code>.</dd>
+    <dt>Particularité</dt><dd>Les fills arrivent par le flux utilisateur (<code>ORDER_TRADE_UPDATE</code>), dont la clé d'écoute est renouvelée. HTTP 429 : pause exacte ; <b>HTTP 418 (adresse IP bannie)</b> : pause plus l'alerte immédiate.</dd>
+    <dt>À savoir</dt><dd>L'adresse du réseau de test de Binance est <b>à confirmer</b> dans la documentation (voir l'architecture, §4.5) : le testnet peut demander un ajustement.</dd>
+    <dt>Lien avec le VPIN</dt><dd>Le tracker VPIN lit les flux <b>publics</b> de Binance, sans clé. C'est lui qui révélera un blocage géographique depuis Tokyo (403 ou 451).</dd>
+  </dl>
+</div>
+
+<div class="card accent" style="--c:var(--red)">
+  <div class="plat-head"><h3>Darwinex</h3><span class="badge no">NON CÂBLÉ · Windows requis</span></div>
+  <dl class="kv">
+    <dt>Pourquoi pas sur Ubuntu</dt><dd>Le worker pilote MetaTrader 5 par le paquet Python <code>MetaTrader5</code>, qui n'existe que sous Windows et doit tourner sur la même machine que le terminal MT5. Aucun conteneur Linux ne peut le faire.</dd>
+    <dt>Ce qui existe</dt><dd>Le code du worker et ses tests (même socle que les autres : homme mort, alertes, état local). Il n'est pas dans les fichiers Compose.</dd>
+    <dt>Comment l'ajouter</dt><dd>Une machine Windows (instance EC2 Windows, ou votre PC) avec MT5 installé et connecté à Darwinex, qui lance le worker. Elle doit joindre le pont par le réseau : cela demande de publier le port du pont, d'autoriser cette machine dans le groupe de sécurité et de lui donner une clé CURVE. Rien de cela n'est préparé.</dd>
+    <dt>Pourquoi attendre</dt><dd>Chaque port ouvert est une surface d'attaque ; mieux vaut valider d'abord les trois plateformes Linux.</dd>
+  </dl>
+</div>
+
+<div class="card accent" style="--c:var(--blue)">
+  <div class="plat-head"><h3>Numerai Signals</h3><span class="badge no">NON CÂBLÉ · aucun signal à envoyer</span></div>
+  <dl class="kv">
+    <dt>Pourquoi rien ne se passe</dt><dd>Le worker existe, mais le pont ne lui envoie rien : ses signaux sont destinés aux exchanges, et le worker Numerai les rejette (<code>wrong_venue</code>). Numerai attend un fichier de prédictions hebdomadaire, un tout autre produit.</dd>
+    <dt>Ce qui manque</dt><dd>Un producteur de prédictions Numerai (un modèle et un pipeline de soumission) : il n'existe pas dans ce projet. Je ne l'ai pas ajouté au Compose : il resterait inactif.</dd>
+    <dt>Variables (plus tard)</dt><dd><code>NUMERAI_*</code> pour la soumission réelle ; en dry-run il écrit simplement les fichiers dans <code>numerai_submissions</code>.</dd>
+  </dl>
+</div>
+
+<div class="card accent" style="--c:var(--violet)">
+  <div class="plat-head"><h3>Reporter de positions</h3><span class="badge warn">À ACTIVER PLUS TARD</span></div>
+  <dl class="kv">
+    <dt>À quoi il sert</dt><dd>Au redémarrage, le moteur lit les positions <i>réelles</i> des plateformes et les adopte au lieu de repartir à plat. Sans lui, le pont enverrait « FLAT » et les workers fermeraient vos positions au marché, avec spread et frais.</dd>
+    <dt>Pourquoi un service à part</dt><dd>Le moteur n'a ni clé ni accès sortant ; les workers ont les clés de trading et n'ont volontairement pas Redis. Le reporter lit avec des clés en <b>lecture seule</b> et écrit une clé Redis : s'il est compromis, il ne peut pas trader.</dd>
+    <dt>Activer</dt><dd>Remplir <code>reporter.env</code> (modèle <code>reporter.env.example</code>), démarrer <code>nothierly-position-reporter</code>, puis ajouter <code>NOTHIERLY_RECONCILE_VENUES=HYPERLIQUID,BYBIT</code> dans <code>.env</code> (l'ordre est la priorité d'adoption).</dd>
+    <dt>Limite</dt><dd>Le prix d'entrée, l'ancre du stop suiveur et la date d'ouverture réels ne sont pas rapportés : après adoption, le stop repart du prix de marché. Cela efface le niveau de protection d'une position en gain et redonne une distance de stop neuve à une position en perte.</dd>
+  </dl>
+</div>
+
+</div>
+
+<!-- 5 ---------------------------------------------------------------------------------------------------------- -->
+<h2 id="secrets"><span class="num">5</span> Les fichiers de secrets</h2>
+<p class="lead">Aucun n'est dans Git (règle <code>*.env</code>). Ne copiez jamais <code>real_keys.env</code> ni une clé de trading dans <code>reporter.env</code>.</p>
+<div class="scroll"><table>
+<tr><th>Fichier</th><th>Contenu obligatoire</th><th>Pourquoi</th></tr>
+<tr><td><code>.env</code></td><td><code>CLIENT_ID</code>, <code>DB_USER</code>, <code>DB_PASSWORD</code>, <code>REDIS_PASSWORD</code>. Optionnel : <code>NOTHIERLY_RECONCILE_VENUES</code>.</td><td>Les fichiers Compose refusent de démarrer sans ces quatre variables : Redis sans mot de passe ou une base sans identifiants seraient dangereux.</td></tr>
+<tr><td><code>platform.env</code></td><td><code>NOTHIERLY_ZMQ_SECRET</code> (32 caractères minimum). Plus, pour les workers, leurs clés de trading de testnet.</td><td>Clé de signature (HMAC) des signaux : sans elle, un tiers pourrait forger un ordre.</td></tr>
+<tr><td><code>reporter.env</code></td><td>Vide au début. Plus tard : <code>HL_ACCOUNT_ADDRESS</code>, <code>BYBIT_READONLY_*</code>, <code>BINANCE_READONLY_*</code>.</td><td>Fichier séparé exprès : ce service ne doit <b>jamais</b> recevoir une clé de trading.</td></tr>
+<tr><td><code>secrets/curve/</code></td><td>Généré par <code>generate_curve_keys.py</code> : une clé par client et une clé serveur.</td><td>Chiffre le canal pont vers workers (CURVE) et n'autorise que les clients connus. Un fichier par worker : révoquer l'un ne casse pas les autres.</td></tr>
+</table></div>
+<div class="callout good" style="--c:var(--green)"><b class="t">Vérification automatique</b>Le script de déploiement refuse de démarrer si <code>.env</code>, <code>platform.env</code> ou <code>reporter.env</code> sont lisibles par d'autres utilisateurs, ou si une variable obligatoire est vide.</div>
+
+<!-- 6 ---------------------------------------------------------------------------------------------------------- -->
+<h2 id="choix"><span class="num">6</span> Pourquoi ces choix d'infrastructure</h2>
+<div class="grid g2">
+  <div class="card accent" style="--c:var(--violet)"><h3>SSM plutôt que SSH</h3><p>Aucun port entrant, aucune clé SSH à protéger, journal des actions. Vous n'êtes plus dépendant du port 22 de votre réseau.</p></div>
+  <div class="card accent" style="--c:var(--cyan)"><h3>m6i.xlarge plutôt que t3</h3><p>Les instances « t3 » sont bridées quand leurs crédits de calcul s'épuisent, ce qui arrive vite avec 16 agents et de l'inférence. Les « m6i » ont une puissance constante. 16 Go de RAM : le moteur charge torch et FinBERT, et l'export de séries longues en demande aussi.</p></div>
+  <div class="card accent" style="--c:var(--green)"><h3>Volumes « external »</h3><p>Un volume ordinaire disparaît avec <code>docker compose down -v</code>. Un volume <code>external</code> n'est jamais supprimé par Compose : perdre des semaines de VPIN exigerait une commande <code>docker volume rm</code> explicite.</p></div>
+  <div class="card accent" style="--c:var(--amber)"><h3>Collecte sans workers au départ</h3><p>Le but du Shadow Run est la donnée. Les workers sans clés de testnet redémarrent en boucle et saturent l'instance : on les ajoute plus tard, un par un.</p></div>
+  <div class="card accent" style="--c:var(--red)"><h3>Sans l'overlay <code>docker-compose.prod.yml</code></h3><p>Il met Redis, TimescaleDB et le moteur sur le seul réseau <code>internal_core</code>, que le tracker VPIN, le pont, le reporter et la maintenance ne rejoignent pas : ils perdraient l'accès à Redis et à la base. Les empiler suppose d'ajouter ce réseau à tous ces services (non fait, non testé).</p></div>
+  <div class="card accent" style="--c:var(--pink)"><h3>Réconciliation désactivée par défaut</h3><p>Activée sans reporter, le moteur attendrait des rapports qui n'arrivent pas. L'opt-in via <code>NOTHIERLY_RECONCILE_VENUES</code> garde le comportement historique tant que vous ne l'avez pas voulu.</p></div>
+  <div class="card accent" style="--c:var(--blue)"><h3>Dry-run et testnet par défaut</h3><p>Rien ne devient réel par accident : le passage en réel est une édition volontaire de la commande du worker, pas une variable d'environnement.</p></div>
+  <div class="card accent" style="--c:var(--orange)"><h3>Maintenance planifiée</h3><p>Rien d'autre ne purge : sans elle, TimescaleDB et les SQLite grossissent sans limite. Rétentions par défaut : VPIN 180 jours, bus 120 jours (compressé après 7). L'entraînement lit 30 jours : exportez avant de raccourcir une rétention.</p></div>
+</div>
+
+<!-- 7 ---------------------------------------------------------------------------------------------------------- -->
+<h2 id="depannage"><span class="num">7</span> Dépannage</h2>
+<div class="scroll"><table>
+<tr><th>Symptôme</th><th>Cause probable</th><th>Action</th></tr>
+<tr><td><code>git push</code> : Permission denied (publickey)</td><td>Clé SSH de votre PC absente de GitHub.</td><td>GitHub, Settings, SSH and GPG keys. Ou poussez en HTTPS avec un jeton.</td></tr>
+<tr><td>SSM : « Se connecter » grisé</td><td>Rôle IAM absent, ou pas de route Internet.</td><td>Vérifiez le rôle <code>nothierly-ssm</code> et la route <code>0.0.0.0/0</code> vers <code>igw-…</code>. Attendez 5 minutes.</td></tr>
+<tr><td><code>git clone</code> : Permission denied (publickey)</td><td>Clé de déploiement non ajoutée à <i>ce</i> dépôt, ou URL en HTTPS.</td><td>Ajoutez la clé (étape 2) et utilisez <code>git@github.com:…</code>.</td></tr>
+<tr><td>Script : « fichiers manquants »</td><td><code>reporter.env</code> absent, ou <code>secrets/curve</code> pas généré.</td><td>Créez <code>reporter.env</code> (même vide), relancez <code>generate_curve_keys.py</code>.</td></tr>
+<tr><td>Script : « est lisible par tous »</td><td>Droits trop ouverts.</td><td><code>chmod 600 .env platform.env reporter.env</code></td></tr>
+<tr><td>Script : volume introuvable</td><td>Un des 4 volumes <code>external</code> manque.</td><td>Le script les crée ; sinon <code>docker volume create nothierly_shadow_data</code> (idem logs, timescaledb, redis).</td></tr>
+<tr><td>Le tracker ne se connecte pas, 403 ou 451</td><td>Blocage géographique depuis le Japon.</td><td>Relancer l'instance dans <b>Singapour</b> (<code>ap-southeast-1</code>) avec le même script. Je n'ai pas vérifié la restriction : ce log la confirme ou non.</td></tr>
+<tr><td><code>vpin_feed_stale</code> répété</td><td>Flux silencieux plus de 60 s (marché calme, ou connexion semi-ouverte).</td><td>Normal de temps en temps. Si permanent : relever <code>--stale-after-s</code> ou vérifier la sortie réseau.</td></tr>
+<tr><td>Un worker redémarre en boucle</td><td>Clés de testnet absentes ou refusées (droit de retrait, mode hedge).</td><td><code>docker compose … logs nothierly-worker-…</code> : le message dit quelle vérification échoue.</td></tr>
+<tr><td>Le moteur reste « RECONCILING »</td><td>Pas de rapport de positions frais.</td><td>Vérifiez <code>nothierly-position-reporter</code> ; sinon retirez <code>NOTHIERLY_RECONCILE_VENUES</code>. Au bout de 300 s le pont traite ce silence comme une panne et ferme.</td></tr>
+</table></div>
+
+<!-- 8 ---------------------------------------------------------------------------------------------------------- -->
+<h2 id="apres"><span class="num">8</span> Après le lancement</h2>
+<div class="grid g2">
+  <div class="card accent" style="--c:var(--green)"><h3>Chaque jour pendant la première semaine</h3>
+    <ul><li>Le tracker est « connected » et sans <code>vpin_feed_stale</code> répétés</li><li>L'espace disque : <code>df -h /</code> et <code>docker system df</code></li><li>Le journal du service <code>nothierly-maintenance</code> (premier cycle 2 minutes après le démarrage)</li><li>Un dry-run de maintenance : <code>… run --rm nothierly-maintenance python scripts/maintenance_cron.py --once --dry-run</code></li></ul></div>
+  <div class="card accent" style="--c:var(--cyan)"><h3>Récupérer les données (dans quelques semaines)</h3>
+<pre><button class="copy" type="button">Copier</button><code>docker compose -f docker-compose.yml -f docker-compose.platform.yml -f docker-compose.shadow.yml run --rm nothierly-exporter --symbol BTCUSDT --since-days 30</code></pre>
+    <p>Les CSV arrivent dans <code>research/exports/</code> : VPIN, fills, carnet, décisions. Il faut d'abord que ce dossier soit accessible en écriture (<code>chmod a+w research/exports</code>).</p></div>
+</div>
+<div class="callout why"><b class="t">Aucun fill sans modèle</b>Sans modèle entraîné, le moteur ne prend aucune décision : les bases de fills resteront vides. La seule donnée continue du Shadow Run est le VPIN (SQLite) et ce que le bus archive dans TimescaleDB.</div>
+<h3>Avant tout passage en réel (liste de contrôle)</h3>
+<label class="check"><input type="checkbox" data-k="r1"> Modèles entraînés sur les données réelles, validés par les scripts (test de significativité), jamais copiés d'un autre serveur</label>
+<label class="check"><input type="checkbox" data-k="r2"> Au moins une plateforme a tourné en dry-run sur testnet plusieurs jours sans erreur ni redémarrage en boucle</label>
+<label class="check"><input type="checkbox" data-k="r3"> Les alertes (<code>WEBHOOK_URL</code>) sont configurées et testées : <code>scripts/run_platform_bridge.py --test-alert</code></label>
+<label class="check"><input type="checkbox" data-k="r4"> Clés d'exchange sans droit de retrait ; clés du reporter distinctes et en lecture seule</label>
+<label class="check"><input type="checkbox" data-k="r5"> Accès réseau de l'API testé depuis l'IP du serveur (pas de 403 ni 451)</label>
+<label class="check"><input type="checkbox" data-k="r6"> Le passage <code>--live</code> est fait plateforme par plateforme, avec un plafond d'exposition bas, en relisant les journaux</label>
+
+<!-- 9 ---------------------------------------------------------------------------------------------------------- -->
+<h2 id="limites"><span class="num">9</span> Ce qui n'est pas vérifié</h2>
+<div class="callout danger" style="--c:var(--red)"><b class="t">Soyez lucide sur ces points</b>
+  <ul>
+    <li><b>Docker :</b> aucun fichier Compose ni script de déploiement n'a tourné sous Docker. Le premier démarrage est le premier test.</li>
+    <li><b>Exchanges :</b> les clients sont testés sur de fausses réponses, pas contre de vrais comptes. Les formes de messages viennent de la documentation.</li>
+    <li><b>TimescaleDB :</b> les instructions de rétention et de compression sont construites et testées, jamais exécutées contre une vraie base.</li>
+    <li><b>SQLite partagé entre conteneurs :</b> un fichier en mode WAL écrit par un conteneur et lu par un autre devrait fonctionner sur un volume local ; non vérifié.</li>
+    <li><b>Géographie :</b> les restrictions de Binance et de Bybit selon le pays de l'IP ne sont pas vérifiées.</li>
+    <li><b>Pas de remote Git au moment de l'écriture :</b> tant que vous n'avez pas poussé, le serveur ne peut rien cloner.</li>
+  </ul></div>
+<p style="color:var(--muted);margin-top:30px;font-size:.9rem">Ce document décrit l'état du dépôt au commit c4a0652. En cas de doute entre ce guide et les commentaires d'en-tête des fichiers <code>docker-compose.*.yml</code> et <code>scripts/deploy_shadow.sh</code>, ces derniers font foi.</p>
+
+</div>
+
+<script>
+(function () {
+  var root = document.documentElement;
+  function store(k, v) { try { if (v === undefined) return localStorage.getItem(k); localStorage.setItem(k, v); } catch (e) { return null; } return null; }
+  var saved = store("nothierly-theme");
+  if (saved === "dark" || saved === "light") root.setAttribute("data-theme", saved);
+  document.getElementById("theme").addEventListener("click", function () {
+    var dark = root.getAttribute("data-theme") === "dark" || (root.getAttribute("data-theme") === null && !window.matchMedia("(prefers-color-scheme: light)").matches);
+    var next = dark ? "light" : "dark"; root.setAttribute("data-theme", next); store("nothierly-theme", next);
+  });
+  document.querySelectorAll("pre .copy").forEach(function (b) {
+    b.addEventListener("click", function () {
+      var text = b.parentElement.querySelector("code").innerText;
+      var done = function () { var t = b.textContent; b.textContent = "Copié"; setTimeout(function () { b.textContent = t; }, 1200); };
+      if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(done, function () {});
+    });
+  });
+  var boxes = Array.prototype.slice.call(document.querySelectorAll('input[type="checkbox"][data-k]'));
+  var steps = boxes.filter(function (b) { return b.dataset.k.charAt(0) === "s"; });
+  function refresh() {
+    var n = steps.filter(function (b) { return b.checked; }).length;
+    document.getElementById("bar").style.width = (steps.length ? 100 * n / steps.length : 0) + "%";
+    document.getElementById("barlabel").textContent = n + " / " + steps.length + " étapes";
+  }
+  boxes.forEach(function (b) {
+    b.checked = store("nothierly-" + b.dataset.k) === "1";
+    b.addEventListener("change", function () { store("nothierly-" + b.dataset.k, b.checked ? "1" : "0"); refresh(); });
+  });
+  refresh();
+})();
+</script>
+</body>
+</html>
