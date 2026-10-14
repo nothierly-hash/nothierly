@@ -8,6 +8,7 @@ import csv
 import sqlite3
 import threading
 import time
+from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -294,10 +295,11 @@ def test_a_missing_or_foreign_vpin_archive_is_an_error_for_the_vpin_source(tmp_p
 def test_source_all_skips_a_missing_vpin_archive_but_a_symbol_without_data_still_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(ENV_DATA_DIR, str(tmp_path / "vide"))
 
-    async def no_bus(*_: Any) -> Any:
-        return []
+    async def no_bus(*_: Any) -> AsyncIterator[Any]:
+        return
+        yield  # pragma: no cover -- fait de ``no_bus`` un générateur asynchrone vide
 
-    monkeypatch.setattr(ex, "fetch_bus_rows", no_bus)
+    monkeypatch.setattr(ex, "iter_bus_rows", no_bus)
     with pytest.raises(RuntimeError, match="rien à exporter"):
         ex.run(_args(tmp_path, source="all"))
 

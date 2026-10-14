@@ -7,6 +7,7 @@ import csv
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
+from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
 import pytest
@@ -39,6 +40,15 @@ def _args(tmp_path: Path, **over: Any) -> argparse.Namespace:
     base: dict[str, Any] = dict(symbol="BTCUSDT", since_days=30.0, source="fills", fills_db=None, out_dir=str(tmp_path / "out"))
     base.update(over)
     return argparse.Namespace(**base)
+
+
+def _fake_bus(rows: list[tuple[datetime, str, str, dict[str, Any]]]) -> Any:
+    async def source(start: datetime, end: datetime, topics: Sequence[str]) -> AsyncIterator[tuple[datetime, str, str, dict[str, Any]]]:
+        for row in rows:
+            if row[2] in topics:
+                yield row
+
+    return source
 
 
 def _ids(path: str) -> list[str]:
@@ -145,10 +155,11 @@ def test_the_symbol_is_mandatory_and_the_window_positive() -> None:
 
 
 def test_an_unreachable_archive_is_reported_not_swallowed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    async def boom(*_: Any) -> Any:
+    async def boom(*_: Any) -> AsyncIterator[Any]:
         raise ConnectionRefusedError("timescale down")
+        yield  # pragma: no cover -- fait de ``boom`` un générateur asynchrone
 
-    monkeypatch.setattr(ex, "fetch_bus_rows", boom)
+    monkeypatch.setattr(ex, "iter_bus_rows", boom)
     with pytest.raises(RuntimeError, match="TimescaleDB illisible"):
         ex.run(_args(tmp_path, source="bus"), now=NOW)
 
@@ -171,10 +182,9 @@ def test_bus_rows_are_filtered_by_symbol_and_flattened() -> None:
 
 
 def test_bus_export_writes_one_file_per_topic(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    async def fake(*_: Any) -> Any:
-        return [(NOW, "m", "MARKET_DATA_L2", {"symbol": "BTCUSDT", "spread": 1.0}), (NOW, "e", "META_LABEL_DECISION", {"instrument": "BTCUSDT", "vetoed": True})]
-
-    monkeypatch.setattr(ex, "fetch_bus_rows", fake)
+    monkeypatch.setattr(ex, "iter_bus_rows", _fake_bus([
+        (NOW, "m", "MARKET_DATA_L2", {"symbol": "BTCUSDT", "spread": 1.0}), (NOW, "e", "META_LABEL_DECISION", {"instrument": "BTCUSDT", "vetoed": True}),
+    ]))
     written = ex.run(_args(tmp_path, source="bus"), now=NOW)
     assert sorted(Path(p).name for p in written) == ["market_data_l2_BTCUSDT_20261014T120000Z.csv", "meta_label_decision_BTCUSDT_20261014T120000Z.csv"]
 
@@ -213,3 +223,80 @@ def test_the_exporter_and_the_workers_agree_on_the_data_dir(monkeypatch: pytest.
         else:
             monkeypatch.setenv(ENV_DATA_DIR, value)
         assert ex.data_dir() == paths.data_dir()
+
+
+# --- Flux : mémoire constante, fichiers jamais tronqués ----------------------------------------
+
+
+def _bulk_fills(path: Path, n: int) -> None:
+    FillsDatabase(path).close()
+    conn = sqlite3.connect(path)
+    conn.executemany(
+        "INSERT INTO executions (timestamp, venue, symbol, direction, intended_price, fill_price, fill_qty, slippage_bps, order_id, fill_id, kind, fee, fee_currency, recorded_ms)"
+        " VALUES (?, 'BYBIT', 'BTCUSDT', 'BUY', 100.0, 100.1, 1.0, 10.0, 'o1', ?, 'signal', 0.01, 'USDT', ?)",
+        ((NOW_MS - n + i, f"f{i}", NOW_MS) for i in range(n)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_memory_stays_flat_whatever_the_number_of_rows(tmp_path: Path) -> None:
+    import tracemalloc
+
+    peaks = {}
+    for n in (20_000, 200_000):
+        db = tmp_path / f"b{n}_fills.sqlite3"
+        _bulk_fills(db, n)
+        tracemalloc.start()
+        ex.run(_args(tmp_path, fills_db=[str(db)], out_dir=str(tmp_path / f"out{n}")), now=NOW)
+        peaks[n] = tracemalloc.get_traced_memory()[1]
+        tracemalloc.stop()
+    assert peaks[200_000] < 3 * peaks[20_000] + 2_000_000  # 10 fois plus de lignes, pas 10 fois plus de mémoire
+    assert peaks[200_000] < 20_000_000  # une liste de 200 000 dictionnaires dépasserait largement 100 Mo
+    out = next((tmp_path / "out200000").glob("executions_*.csv"))
+    with open(out, newline="", encoding="utf-8") as handle:
+        assert sum(1 for _ in handle) == 200_001  # en-tête + toutes les lignes
+
+
+def test_several_databases_are_merged_in_time_order_without_loading_them(tmp_path: Path) -> None:
+    a = _fills_db(tmp_path / "a_fills.sqlite3", [(NOW_MS - 5000, "BTCUSDT", "a1"), (NOW_MS - 3000, "BTCUSDT", "a2"), (NOW_MS - 1000, "BTCUSDT", "a3")])
+    b = _fills_db(tmp_path / "b_fills.sqlite3", [(NOW_MS - 4000, "BTCUSDT", "b1"), (NOW_MS - 2000, "BTCUSDT", "b2")])
+    ((path, count),) = ex.run(_args(tmp_path, fills_db=[str(a), str(b)]), now=NOW).items()
+    assert count == 5 and _ids(path) == ["a1", "b1", "a2", "b2", "a3"]
+
+
+def test_a_failure_midway_leaves_no_file_and_no_part_file(tmp_path: Path) -> None:
+    def rows() -> Any:
+        yield {"a": 1}
+        raise RuntimeError("disque plein")
+
+    target = tmp_path / "x.csv"
+    with pytest.raises(RuntimeError, match="disque plein"):
+        ex.write_csv_stream(target, ["a"], rows())
+    assert not target.exists() and not (tmp_path / "x.csv.part").exists()  # jamais un CSV tronqué sous un nom plausible
+
+
+def test_a_completed_export_leaves_only_the_final_file(tmp_path: Path) -> None:
+    target = tmp_path / "x.csv"
+    assert ex.write_csv_stream(target, ["a", "b"], [{"a": 1, "b": 2}, {"a": 3}]) == 2
+    assert target.read_text(encoding="utf-8").splitlines() == ["a,b", "1,2", "3,"]  # colonne manquante : vide
+    assert not (tmp_path / "x.csv.part").exists()
+    assert ex.write_csv_stream(tmp_path / "vide.csv", ["a"], []) == 0 and not (tmp_path / "vide.csv").exists()
+
+
+def test_the_bus_export_uses_every_column_seen_even_when_messages_differ(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ex, "iter_bus_rows", _fake_bus([
+        (NOW, "e", "META_LABEL_DECISION", {"instrument": "BTCUSDT", "features": {"vpin": 0.6}}),
+        (NOW, "e", "META_LABEL_DECISION", {"instrument": "BTCUSDT", "features": {"vpin": 0.7, "rsi": 55}, "vetoed": True}),  # colonnes apparues plus tard
+    ]))
+    ((path, count),) = ex.run(_args(tmp_path, source="bus"), now=NOW).items()
+    with open(path, newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert count == 2 and rows[0]["features.rsi"] == "" and rows[1]["features.rsi"] == "55" and rows[1]["vetoed"] == "True"
+
+
+def test_a_bus_export_never_overwrites(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ex, "iter_bus_rows", _fake_bus([(NOW, "m", "MARKET_DATA_L2", {"symbol": "BTCUSDT", "spread": 1.0})]))
+    ex.run(_args(tmp_path, source="bus"), now=NOW)
+    with pytest.raises(FileExistsError):
+        ex.run(_args(tmp_path, source="bus"), now=NOW)

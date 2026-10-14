@@ -18,9 +18,15 @@
   ``vpin_value`` est vide pour les seaux de chauffe (fenêtre pas encore pleine) ; ``bucket_buy_vol`` et ``bucket_sell_vol`` permettent de
   recalculer le VPIN avec une autre fenêtre.
 
-Sortie : ``research/exports/<table>_<SYMBOLE>_<horodatage UTC>.csv`` (``--out-dir`` pour changer). Jamais d'écrasement : l'horodatage
-fait partie du nom. Un export vide n'est pas écrit, et le script sort en erreur : mieux vaut le savoir que lancer un entraînement
-sur un fichier vide.
+**Mémoire constante.** Rien n'est matérialisé : chaque source est lue par lots (``fetchmany`` / curseur asyncpg avec prélecture bornée) et
+écrite ligne à ligne par ``csv.writer``. Plusieurs bases de fills sont fusionnées dans l'ordre chronologique par ``heapq.merge`` (une ligne
+par base en mémoire). L'archive du bus a des colonnes variables : deux passes (la première ne retient que l'ensemble des noms de colonnes).
+L'empreinte ne dépend donc pas du nombre de lignes (50 millions de lignes = la même RAM que 50).
+
+Sortie : ``research/exports/<table>_<SYMBOLE>_<horodatage UTC>.csv`` (``--out-dir`` pour changer). Chaque fichier est écrit sous
+``<nom>.csv.part`` puis renommé une fois complet : un export interrompu ne laisse jamais un CSV tronqué qui ressemble à un bon. Jamais
+d'écrasement : l'horodatage fait partie du nom. Un export vide n'est pas écrit, et le script sort en erreur : mieux vaut le savoir que
+lancer un entraînement sur un fichier vide.
 
 Symboles : comparés sans casse ni séparateurs (``BTC/USDT`` = ``BTCUSDT``), et un symbole nu d'une plateforme (``BTC`` sur
 Hyperliquid) correspond à ``BTCUSDT`` / ``BTCUSD`` / ``BTCUSDC``.
@@ -31,12 +37,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import csv
+import heapq
 import json
+import operator
 import os
 import sqlite3
 import sys
 import time
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Iterable, Iterator, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Final
@@ -48,10 +56,13 @@ DEFAULT_DATA_DIR: Final[str] = "data/"
 DEFAULT_OUT_DIR: Final[str] = "research/exports"
 VPIN_FILENAME: Final[str] = "vpin_history.sqlite3"  # même nom que workers/market_data/vpin_archive.DEFAULT_FILENAME (un test vérifie l'accord)
 FILLS_GLOB: Final[str] = "*_fills.sqlite3"
+BATCH_SIZE: Final[int] = 10_000
 _QUOTES: Final[tuple[str, ...]] = ("USDT", "USDC", "USD", "PERP")
 BUS_TOPICS: Final[tuple[str, ...]] = ("MARKET_DATA_L2", "META_LABEL_DECISION", "TRADE_EXECUTED")
 _BUS_SYMBOL_KEYS: Final[tuple[str, ...]] = ("symbol", "instrument")
 _TABLES: Final[dict[str, str]] = {"executions": "timestamp", "order_intents": "sent_at_ms"}  # table -> colonne d'horodatage (ms)
+_VPIN_TABLE: Final[str] = "vpin_buckets"
+_PART_SUFFIX: Final[str] = ".part"
 
 
 def data_dir() -> Path:
@@ -73,7 +84,7 @@ def symbol_matches(row_symbol: str, wanted: str) -> bool:
     return any(want == row + quote or row == want + quote for quote in _QUOTES)
 
 
-# --- Fills (SQLite) --------------------------------------------------------------------------
+# --- SQLite (flux) ---------------------------------------------------------------------------
 
 
 def find_fills_databases(directory: Path) -> list[Path]:
@@ -95,49 +106,77 @@ def _open_read_only(path: Path) -> sqlite3.Connection:
     return conn
 
 
-def read_table(path: Path, table: str, *, since_ms: int, symbol: str) -> list[dict[str, Any]]:
-    """Lignes de ``table`` plus récentes que ``since_ms`` pour ``symbol``, par ordre chronologique."""
-    time_column = _TABLES.get(table)
-    if time_column is None:
-        raise ValueError(f"table inconnue : {table!r}")  # ``table`` et ``time_column`` viennent d'une liste blanche interne
+def _require_table(conn: sqlite3.Connection, path: Path, table: str) -> None:
+    present = {str(r["name"]) for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if table not in present:
+        raise RuntimeError(f"{path} : pas de table {table!r} (tables présentes : {sorted(present)}) ; ce n'est pas la base attendue.")
+
+
+def table_columns(path: Path, table: str) -> list[str]:
     conn = _open_read_only(path)
     try:
-        present = {str(r["name"]) for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        if table not in present:
-            raise RuntimeError(f"{path} : pas de table {table!r} (tables présentes : {sorted(present)}) ; ce n'est pas une base de fills.")
-        cursor = conn.execute(f"SELECT * FROM {table} WHERE {time_column} >= ? ORDER BY {time_column}, rowid", (since_ms,))  # noqa: S608
-        return [dict(r) for r in cursor if symbol_matches(str(r["symbol"]), symbol)]
+        _require_table(conn, path, table)
+        return [str(r["name"]) for r in conn.execute(f"PRAGMA table_info({table})")]  # noqa: S608 -- ``table`` vient d'une liste blanche interne
     finally:
         conn.close()
 
 
-def read_vpin(path: Path, *, since_ms: int, symbol: str) -> list[dict[str, Any]]:
-    """Seaux VPIN de ``symbol`` plus récents que ``since_ms``, par ordre chronologique (``id`` départage les seaux fermés par un même trade)."""
+def iter_sqlite_rows(path: Path, table: str, *, time_column: str, order: str, since_ms: int, symbol: str, batch_size: int = BATCH_SIZE) -> Iterator[dict[str, Any]]:
+    """Lignes de ``table`` plus récentes que ``since_ms`` pour ``symbol``, dans l'ordre ``order``, lues par lots de ``batch_size``.
+
+    Générateur : la connexion se ferme quand il est épuisé ou fermé. ``table``, ``time_column`` et ``order`` viennent d'une liste blanche interne.
+    """
     conn = _open_read_only(path)
     try:
-        present = {str(r["name"]) for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        if "vpin_buckets" not in present:
-            raise RuntimeError(f"{path} : pas de table 'vpin_buckets' (tables présentes : {sorted(present)}) ; ce n'est pas une archive VPIN.")
-        cursor = conn.execute("SELECT * FROM vpin_buckets WHERE timestamp_ms >= ? ORDER BY timestamp_ms, id", (since_ms,))
-        return [dict(r) for r in cursor if symbol_matches(str(r["symbol"]), symbol)]
+        _require_table(conn, path, table)
+        cursor = conn.execute(f"SELECT * FROM {table} WHERE {time_column} >= ? ORDER BY {order}", (since_ms,))  # noqa: S608
+        while batch := cursor.fetchmany(batch_size):
+            for row in batch:
+                if symbol_matches(str(row["symbol"]), symbol):
+                    yield dict(row)
     finally:
         conn.close()
 
 
-def write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> int:
-    """Écrit ``rows`` ; refuse d'écraser. Renvoie le nombre de lignes (0 : rien n'est écrit). Colonnes : union ordonnée des clés."""
-    if not rows:
+# --- CSV (flux, sans écrasement, sans fichier tronqué) ---------------------------------------
+
+
+def write_csv_stream(path: Path, columns: Sequence[str], rows: Iterable[Mapping[str, Any]]) -> int:
+    """Écrit ``rows`` ligne à ligne dans ``path``. Renvoie le nombre de lignes ; 0 : aucun fichier n'est laissé.
+
+    Écrit sous ``path.part`` puis renomme : un crash ne laisse jamais un CSV tronqué sous le nom final. Refuse d'écraser un fichier existant.
+    """
+    if path.exists():
+        raise FileExistsError(f"{path} existe déjà ; l'export n'écrase jamais")
+    part = path.with_name(path.name + _PART_SUFFIX)
+    count = 0
+    handle = None
+    writer: csv.DictWriter[str] | None = None
+    try:
+        for row in rows:
+            if handle is None or writer is None:  # le fichier n'est créé qu'à la première ligne : pas d'export vide
+                path.parent.mkdir(parents=True, exist_ok=True)
+                handle = part.open("w", newline="", encoding="utf-8")
+                writer = csv.DictWriter(handle, fieldnames=list(columns), extrasaction="ignore", restval="")
+                writer.writeheader()
+            writer.writerow(row)
+            count += 1
+    except BaseException:
+        if handle is not None:
+            handle.close()
+        part.unlink(missing_ok=True)
+        raise
+    if handle is None:
         return 0
-    header = list(dict.fromkeys(k for row in rows for k in row))
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("x", newline="", encoding="utf-8") as handle:  # "x" : jamais d'écrasement
-        writer = csv.DictWriter(handle, fieldnames=header)
-        writer.writeheader()
-        writer.writerows(rows)
-    return len(rows)
+    handle.close()
+    os.replace(part, path)
+    return count
 
 
-# --- Archive du bus (TimescaleDB) ------------------------------------------------------------
+# --- Archive du bus (TimescaleDB, flux) ------------------------------------------------------
+
+
+BusRow = tuple[datetime, str, str, Mapping[str, Any]]
 
 
 def flatten(value: Any, prefix: str = "") -> Iterator[tuple[str, Any]]:
@@ -163,8 +202,8 @@ def bus_symbol(data: Mapping[str, Any]) -> str | None:
     return None
 
 
-def select_bus_rows(rows: Iterable[tuple[datetime, str, str, Mapping[str, Any]]], symbol: str) -> list[dict[str, Any]]:
-    """Garde les messages du symbole demandé. Un message sans symbole identifiable est écarté (jamais deviné)."""
+def select_bus_rows(rows: Iterable[BusRow], symbol: str) -> list[dict[str, Any]]:
+    """Messages du symbole demandé, aplatis (matérialisé : petits jeux de données et tests). Sans symbole identifiable : écarté, jamais deviné."""
     out: list[dict[str, Any]] = []
     for time_, sender_id, topic, data in rows:
         found = bus_symbol(data)
@@ -173,25 +212,72 @@ def select_bus_rows(rows: Iterable[tuple[datetime, str, str, Mapping[str, Any]]]
     return out
 
 
-async def fetch_bus_rows(start: datetime, end: datetime, topics: Sequence[str]) -> list[tuple[datetime, str, str, dict[str, Any]]]:
-    """Lit ``bus_messages`` avec les réglages ``TIMESCALE_*`` du moteur (imports tardifs : ``--source fills`` n'exige ni asyncpg ni .env)."""
+async def iter_bus_rows(start: datetime, end: datetime, topics: Sequence[str]) -> AsyncIterator[BusRow]:
+    """Lit ``bus_messages`` avec un curseur serveur (prélecture bornée) : la mémoire ne dépend pas du nombre de lignes.
+
+    Réglages ``TIMESCALE_*`` du moteur ; imports tardifs : ``--source fills`` n'exige ni asyncpg ni .env.
+    """
     import asyncpg
 
     from core.config import get_settings
 
     ts = get_settings().timescale
-    pool = await asyncpg.create_pool(
+    conn = await asyncpg.connect(
         host=ts.host, port=ts.port, database=ts.database, user=ts.user,
-        password=ts.password.get_secret_value() if ts.password is not None else None, min_size=1, max_size=2, timeout=10,
+        password=ts.password.get_secret_value() if ts.password is not None else None, timeout=10,
     )
     try:
-        records = await pool.fetch(
-            "SELECT time, sender_id, topic, data FROM bus_messages WHERE topic = ANY($1::text[]) AND time >= $2 AND time < $3 ORDER BY time",
-            list(topics), start, end,
-        )
+        async with conn.transaction():  # un curseur asyncpg exige une transaction
+            async for record in conn.cursor(
+                "SELECT time, sender_id, topic, data FROM bus_messages WHERE topic = ANY($1::text[]) AND time >= $2 AND time < $3 ORDER BY time",
+                list(topics), start, end, prefetch=BATCH_SIZE,
+            ):
+                data = record["data"]
+                yield record["time"], record["sender_id"], record["topic"], json.loads(data) if isinstance(data, str) else dict(data)
     finally:
-        await pool.close()
-    return [(r["time"], r["sender_id"], r["topic"], json.loads(r["data"]) if isinstance(r["data"], str) else dict(r["data"])) for r in records]
+        await conn.close()
+
+
+BusSource = Callable[[datetime, datetime, Sequence[str]], AsyncIterator[BusRow]]
+
+
+async def _records(source: BusSource, start: datetime, end: datetime, symbol: str, topics: Sequence[str]) -> AsyncIterator[dict[str, Any]]:
+    async for time_, sender_id, topic, data in source(start, end, topics):
+        found = bus_symbol(data)
+        if found is not None and symbol_matches(found, symbol):
+            yield bus_row_to_record(time_, sender_id, topic, data)
+
+
+async def export_bus(source: BusSource, start: datetime, end: datetime, symbol: str, out_dir: Path, tag: str) -> dict[str, int]:
+    """Deux passes sur l'archive (la 2e réinterroge la base, bornée par le même ``end``) : la 1re ne garde que les noms de colonnes de
+    chaque sujet, la 2e écrit. Les colonnes d'un message varient, donc l'en-tête ne se connaît qu'à la fin de la 1re passe."""
+    columns: dict[str, dict[str, None]] = {}  # sujet -> noms de colonnes dans l'ordre d'apparition (dict = ensemble ordonné)
+    async for record in _records(source, start, end, symbol, BUS_TOPICS):
+        columns.setdefault(str(record["topic"]), dict.fromkeys(("time", "topic", "sender_id"))).update(dict.fromkeys(record))
+    written: dict[str, int] = {}
+    for topic, names in sorted(columns.items()):
+        target = out_dir / f"{topic.lower()}_{tag}.csv"
+        if target.exists():
+            raise FileExistsError(f"{target} existe déjà ; l'export n'écrase jamais")
+        part = target.with_name(target.name + _PART_SUFFIX)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        count = 0
+        try:
+            with part.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=list(names), extrasaction="ignore", restval="")
+                writer.writeheader()
+                async for record in _records(source, start, end, symbol, (topic,)):
+                    writer.writerow(record)
+                    count += 1
+        except BaseException:
+            part.unlink(missing_ok=True)
+            raise
+        if count:
+            os.replace(part, target)
+            written[str(target)] = count
+        else:  # les données ont disparu entre les deux passes : pas de fichier
+            part.unlink(missing_ok=True)
+    return written
 
 
 # --- CLI -------------------------------------------------------------------------------------
@@ -211,7 +297,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     return args
 
 
-def run(args: argparse.Namespace, *, now: datetime | None = None) -> dict[str, int]:
+def run(args: argparse.Namespace, *, now: datetime | None = None, bus_source: BusSource | None = None) -> dict[str, int]:
     """Exporte et renvoie ``{fichier: nombre de lignes}``. Lève ``RuntimeError`` si rien n'a pu être exporté."""
     now = now or datetime.now(timezone.utc)
     start = now - timedelta(days=args.since_days)
@@ -226,35 +312,33 @@ def run(args: argparse.Namespace, *, now: datetime | None = None) -> dict[str, i
             if args.source == "fills":
                 raise RuntimeError(f"aucune base de fills dans {data_dir()} (motif {FILLS_GLOB}) ; donner --fills-db ou NOTHIERLY_DATA_DIR")
             print(f"[export] aucune base de fills dans {data_dir()} : fills ignorés", file=sys.stderr)
-        for table, time_column in _TABLES.items():
-            rows = [row for path in paths for row in read_table(path, table, since_ms=since_ms, symbol=args.symbol)]
-            rows.sort(key=lambda r: r[time_column])
+        for table, time_column in _TABLES.items() if paths else ():
+            columns = list(dict.fromkeys(name for path in paths for name in table_columns(path, table)))
+            streams = [iter_sqlite_rows(path, table, time_column=time_column, order=f"{time_column}, rowid", since_ms=since_ms, symbol=args.symbol) for path in paths]
+            merged = heapq.merge(*streams, key=operator.itemgetter(time_column))  # chaque flux est déjà trié : fusion à une ligne par base
             target = out_dir / f"{table}_{tag}.csv"
-            if write_csv(target, rows):
-                written[str(target)] = len(rows)
+            count = write_csv_stream(target, columns, merged)
+            if count:
+                written[str(target)] = count
 
     if args.source in ("vpin", "all"):
         vpin_path = Path(args.vpin_db) if args.vpin_db else data_dir() / VPIN_FILENAME
         if not vpin_path.is_file() and args.source == "all":
             print(f"[export] pas d'archive VPIN ({vpin_path}) : VPIN ignoré", file=sys.stderr)
         else:  # source explicite : une archive absente est une erreur (FileNotFoundError), pas un export vide
-            vpin_rows = read_vpin(vpin_path, since_ms=since_ms, symbol=args.symbol)
-            target = out_dir / f"vpin_{tag}.csv"
-            if write_csv(target, vpin_rows):
-                written[str(target)] = len(vpin_rows)
+            vpin_target = out_dir / f"vpin_{tag}.csv"
+            vpin_rows = iter_sqlite_rows(vpin_path, _VPIN_TABLE, time_column="timestamp_ms", order="timestamp_ms, id", since_ms=since_ms, symbol=args.symbol)
+            count = write_csv_stream(vpin_target, table_columns(vpin_path, _VPIN_TABLE), vpin_rows)
+            if count:
+                written[str(vpin_target)] = count
 
     if args.source in ("bus", "all"):
         try:
-            records = asyncio.run(fetch_bus_rows(start, now, BUS_TOPICS))
+            written.update(asyncio.run(export_bus(bus_source or iter_bus_rows, start, now, args.symbol, out_dir, tag)))
+        except FileExistsError:
+            raise
         except Exception as exc:  # noqa: BLE001 -- asyncpg, pydantic (réglages) et réseau lèvent des familles sans parent commun
             raise RuntimeError(f"archive TimescaleDB illisible ({type(exc).__name__}: {exc}) ; --source fills pour n'exporter que les fills") from exc
-        by_topic: dict[str, list[dict[str, Any]]] = {}
-        for record in select_bus_rows(records, args.symbol):
-            by_topic.setdefault(str(record["topic"]), []).append(record)
-        for topic, rows in sorted(by_topic.items()):
-            target = out_dir / f"{topic.lower()}_{tag}.csv"
-            if write_csv(target, rows):
-                written[str(target)] = len(rows)
 
     if not written:
         raise RuntimeError(f"rien à exporter pour {args.symbol!r} sur {args.since_days:g} jours (source : {args.source}) ; aucun fichier écrit")
