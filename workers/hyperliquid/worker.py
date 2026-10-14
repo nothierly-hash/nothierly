@@ -27,6 +27,7 @@ from typing import ClassVar
 from contracts.curve_transport import CurveClientConfig, CurveConfigError, transport_refusal
 from contracts.platform_signal import PlatformSignal, TargetVenue
 from contracts.secure_signal_bus import load_secret_from_env
+from workers.common.alerts import AlertConfigError, WebhookAlerter
 from workers.common.base import (
     DEFAULT_MAX_AGE_MS,
     EmergencyOrder,
@@ -35,6 +36,7 @@ from workers.common.base import (
     clear_execution_halt,
 )
 from workers.common.exposure import emergency_slippage_bps
+from workers.common.logging_setup import configure_logging
 from workers.hyperliquid.client import AccountSnapshot, HyperliquidClient, Network, OrderRequest, SdkHyperliquidClient
 from workers.hyperliquid.planner import ZERO, OrderPlan, hl_asset, plan_order, round_price, size_for_pct
 from workers.hyperliquid.state import HlState
@@ -182,11 +184,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--i-understand-real-funds", action="store_true", help="requis pour --live sur mainnet")
     parser.add_argument("--clear-halt", action="store_true", help="lève les verrous (drawdown et homme mort) puis quitte")
     parser.add_argument("--allow-plaintext-remote", action="store_true", help="autorise un endpoint non local SANS chiffrement CURVE")
+    parser.add_argument("--log-dir", default=None, help="dossier d'un fichier de journal tournant (10 Mo x 5) en plus de stdout ; défaut : NOTHIERLY_LOG_DIR")
     parser.add_argument("--dead-man-timeout", type=float, default=300.0, metavar="SECONDES",
                         help="ferme toutes les positions puis se verrouille après ce délai sans signal valide (0 = désactivé)")
     args = parser.parse_args(argv)
     if args.clear_halt:  # ne touche que la base locale : ni réseau, ni SDK, ni clé
-        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+        configure_logging("hyperliquid-worker", log_dir=args.log_dir)
         clear_execution_halt(HlState(args.db))
         _log.info("hl_halt_cleared")
         return
@@ -212,13 +215,17 @@ def main(argv: Sequence[str] | None = None) -> None:
     secret = os.environ.get("HL_AGENT_SECRET") if args.live else None
     if args.live and not secret:
         parser.error("--live exige HL_AGENT_SECRET (clé d'un API wallet sans droit de retrait)")
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    try:
+        alerter = WebhookAlerter.from_env(source="hyperliquid-worker")
+    except AlertConfigError as exc:
+        parser.error(str(exc))
+    configure_logging("hyperliquid-worker", log_dir=args.log_dir)
     client = SdkHyperliquidClient(
         network=network, account_address=account, agent_secret=secret, vault_address=os.environ.get("HL_VAULT_ADDRESS")
     )
     config = HyperliquidWorkerConfig(
         address=args.address, secret_key=load_secret_from_env(), db_path=args.db, dry_run=not args.live,
-        dead_man_timeout_s=args.dead_man_timeout or None, curve=curve,
+        dead_man_timeout_s=args.dead_man_timeout or None, curve=curve, alerter=alerter,
     )
     worker = HyperliquidWorker(config, client)
     _log.info("hl_worker_start network=%s mode=%s", network.value, "LIVE" if args.live else "DRY-RUN")
@@ -227,6 +234,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         asyncio.run(worker.run(), loop_factory=asyncio.SelectorEventLoop)
     except KeyboardInterrupt:
         _log.info("hl_worker_stopped")
+    finally:
+        if alerter is not None:
+            alerter.close(2.0)
 
 
 if __name__ == "__main__":

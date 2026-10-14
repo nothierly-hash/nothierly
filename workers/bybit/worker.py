@@ -45,8 +45,10 @@ from workers.bybit.client import (
     check_key_info,
 )
 from workers.bybit.planner import ZERO, OrderPlan, bybit_symbol, plan_order, round_price, size_for_pct_step
+from workers.common.alerts import AlertConfigError, WebhookAlerter
 from workers.common.base import EmergencyOrder, ExposureWorkerBase, ExposureWorkerConfig, clear_execution_halt
 from workers.common.exposure import emergency_slippage_bps
+from workers.common.logging_setup import configure_logging
 from workers.common.state import ExecutionState
 
 _log = logging.getLogger(__name__)
@@ -214,13 +216,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--i-understand-real-funds", action="store_true", help="requis pour --live sur mainnet")
     parser.add_argument("--clear-halt", action="store_true", help="lève les verrous (drawdown et homme mort) puis quitte")
     parser.add_argument("--allow-plaintext-remote", action="store_true", help="autorise un endpoint non local SANS chiffrement CURVE")
+    parser.add_argument("--log-dir", default=None, help="dossier d'un fichier de journal tournant (10 Mo x 5) en plus de stdout ; défaut : NOTHIERLY_LOG_DIR")
     parser.add_argument("--dead-man-timeout", type=float, default=300.0, metavar="SECONDES",
                         help="ferme toutes les positions puis se verrouille après ce délai sans signal valide (0 = désactivé)")
     parser.add_argument("--allow-non-copy-symbols", action="store_true", help="n'exige pas copyTrading != none")
     parser.add_argument("--max-equity-usd", type=Decimal, default=None, help="plafond d'equity utilisée pour dimensionner")
     args = parser.parse_args(argv)
     if args.clear_halt:  # ne touche que la base locale : ni réseau, ni clé, ni secret du bus
-        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+        configure_logging("bybit-worker", log_dir=args.log_dir)
         clear_execution_halt(ExecutionState(args.db))
         _log.info("bybit_halt_cleared")
         return 0
@@ -243,7 +246,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     key, secret = os.environ.get("BYBIT_API_KEY"), os.environ.get("BYBIT_API_SECRET")
     if not key or not secret:
         parser.error("BYBIT_API_KEY et BYBIT_API_SECRET requis (même en dry-run : solde et positions sont privés ; clé en lecture seule conseillée)")
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    try:
+        alerter = WebhookAlerter.from_env(source="bybit-worker")
+    except AlertConfigError as exc:
+        parser.error(str(exc))
+    configure_logging("bybit-worker", log_dir=args.log_dir)
     client = BybitRestClient(api_key=key, api_secret=secret, network=network)
     problems = check_key_info(client.key_info(), live=args.live)
     if problems:
@@ -259,6 +266,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_equity_usd=args.max_equity_usd,
         dead_man_timeout_s=args.dead_man_timeout or None,
         curve=curve,
+        alerter=alerter,
     )
     worker = BybitWorker(config, client)
     _log.info("bybit_worker_start network=%s mode=%s", network.value, "LIVE" if args.live else "DRY-RUN")
@@ -267,6 +275,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         asyncio.run(worker.run(), loop_factory=asyncio.SelectorEventLoop)
     except KeyboardInterrupt:
         _log.info("bybit_worker_stopped")
+    finally:
+        if alerter is not None:
+            alerter.close(2.0)
     return 0
 
 

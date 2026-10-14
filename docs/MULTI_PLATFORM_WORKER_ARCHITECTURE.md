@@ -542,6 +542,34 @@ Le worker tombe seul, le Cerveau n'en sait rien.
 
 ---
 
+### 6.8 Observabilité : rotation des journaux et alertes push
+
+*Implémenté et testé : `workers/common/alerts.py`, `workers/common/logging_setup.py`, intégration dans `workers/common/base.py`. Jamais éprouvé contre un vrai Discord ou Telegram : les formes de requête viennent de leur documentation.*
+
+**Rotation des journaux.** `--log-dir` (ou `NOTHIERLY_LOG_DIR`) ajoute un fichier `<composant>.log` en `RotatingFileHandler` : 10 Mo par fichier, 5 sauvegardes, donc au plus ~60 Mo par processus, en plus de stdout. Sans dossier : stdout seul. Un dossier inutilisable n'empêche pas le démarrage (erreur journalisée, stdout continue). S'applique aux quatre workers et au pont. Le moteur garde son propre module (`core/logger.py`, déjà tournant : 50 Mo x 10). Dans Docker, ne pas écrire de fichier : le pilote `json-file` du compose plafonne déjà stdout (20 Mo x 5).
+
+**Alertes webhook.** `WEBHOOK_URL` dans l'environnement ; absente = aucune alerte ; invalide (pas en `https`, hors boucle locale) = refus de démarrer, sans jamais répéter l'URL (elle porte le jeton). `alert()` ne bloque ni ne lève jamais : file bornée de 32 messages, un thread démon fait le `POST` avec un délai de 3 s, un échec est journalisé sans l'URL. Anti-spam : une même clé au plus une fois par 5 minutes. **Aucune garantie de livraison** : aucune décision du worker n'en dépend, un webhook muet laisse la protection inchangée.
+
+**Ce qui alerte, et seulement cela** (workers sur le socle commun : Hyperliquid, Bybit, Darwinex) :
+
+| Événement | Clé | Gravité |
+|---|---|---|
+| Homme mort déclenché (passage en `HALTED`) | `dead_man_tripped` | critique |
+| Fermeture d'urgence toujours pas confirmée à la 3e tentative | `flatten_incomplete:<actif>` | critique |
+| Coupe-circuit de drawdown (réduction seule) | `drawdown_halt` | critique |
+| 5 échecs consécutifs d'exécution (`read_error`, `error`, ou exception : API de l'exchange injoignable) | `streak:execute` | critique |
+| 5 échecs consécutifs de la surveillance de l'homme mort, ou du traitement des messages du bus | `streak:dead_man_loop`, `streak:frames` | critique |
+| Première réussite après une alerte de série | `recovered:<série>` | info |
+
+Rien d'autre : ni ordres exécutés, ni signaux périmés ou rejoués, ni tailles sous le minimum, ni mode simulé. Une série n'alerte qu'une fois, quelle que soit sa longueur.
+
+**Limites.**
+
+- **Le worker Numerai et le pont n'alertent pas.** Numerai n'est pas sur le socle (pas de positions, pas d'homme mort) ; le pont publie `FLAT` sur kill switch ou moteur muet sans prévenir personne. C'est le trou le plus utile à combler ensuite (un `FLAT` forcé est exactement ce qu'un opérateur veut savoir).
+- **« Connexion API coupée » n'est détectée que par ses effets** : cinq lectures ou ordres consécutifs en échec. Un exchange injoignable alors qu'aucun signal n'arrive n'est pas vu ; c'est l'homme mort qui parle alors, si le moteur se tait aussi.
+- **Un worker qui meurt ne s'alerte pas lui-même.** Un processus tué (mémoire, `kill -9`) n'envoie rien : seule une surveillance extérieure (un `healthcheck` Docker, un moniteur de disponibilité) le voit.
+- Le délai de 3 s ne borne pas la résolution DNS, ce qui n'a pas de conséquence ici : l'envoi se fait dans un thread à part.
+
 ## 7. Plan de mise en œuvre (ordre recommandé)
 
 | Phase | Contenu | État / coût |

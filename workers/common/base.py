@@ -41,6 +41,19 @@ position sans plus rien entendre reste exposé à l'aveugle.
   moteur ait pu lui parler, même si son dernier signal persisté est ancien.
 - Les horloges sont murales : un saut d'horloge vers l'avant supérieur à N déclenche (sens sûr : on réduit).
 - Capacité par worker : ``supports_dead_man``. Un worker sans positions (Numerai) n'hérite pas de ce socle.
+
+**Alertes (``config.alerter``, voir ``workers.common.alerts``).** Un webhook optionnel prévient l'opérateur, sans jamais
+bloquer ni faire échouer le worker, et seulement pour les urgences opérationnelles :
+
+- l'homme mort se déclenche (``HALTED``) ; la fermeture d'urgence d'un actif n'est toujours pas confirmée à la 3e tentative ;
+- le coupe-circuit de drawdown verrouille le worker ;
+- ``api_failure_threshold`` échecs consécutifs (5 par défaut) de l'exécution (``read_error`` / ``error`` : l'API de
+  l'exchange ne répond pas ou l'ordre est ambigu, ou une exception), de la surveillance de l'homme mort, ou du
+  traitement des messages du bus. Une seule alerte par série ; un message de rétablissement suit la première
+  réussite, uniquement si l'alerte a été envoyée.
+
+Ni les ordres exécutés, ni les rejets ordinaires (signal périmé, rejeu, taille sous le minimum, mode simulé) n'alertent.
+Les alertes ne changent aucune décision : un webhook muet laisse le worker se protéger exactement comme avant.
 """
 
 from __future__ import annotations
@@ -64,6 +77,7 @@ import zmq.asyncio
 from contracts.curve_transport import CurveClientConfig, apply_client, is_local_endpoint
 from contracts.platform_signal import PlatformSignal, TargetVenue
 from contracts.secure_signal_bus import DEFAULT_TOPIC, ReplayGuard, open_envelope, verify_signature
+from workers.common.alerts import Alerter, Severity
 from workers.common.exposure import RiskLimits
 from workers.common.state import ExecutionRecord, ExecutionState
 
@@ -77,6 +91,37 @@ _DM_PENDING = "dead_man_pending"
 _FLAT_RECHECK_MIN_S = 60.0
 # Résultats d'``emergency_flatten`` qui terminent le travail sur un actif (les autres sont réessayés).
 _FLATTEN_DONE = frozenset({"no_position", "dry_run"})
+# Codes d'``execute_signal`` qui signalent une panne côté exchange (lecture ou envoi), par opposition à un rejet ordinaire.
+_API_FAILURE_STATUSES = frozenset({"read_error", "error"})
+# Une fermeture d'urgence envoyée attend sa vérification au cycle suivant (normal) : on n'alerte qu'à la tentative N.
+_FLATTEN_ALERT_ATTEMPTS = 3
+_STREAK_MESSAGES = {
+    "execute": "{n} échecs d'exécution consécutifs (dernier : {detail}) : l'API de l'exchange est peut-être injoignable ; "
+               "les positions ne suivent plus les signaux.",
+    "dead_man_loop": "la surveillance de l'homme mort échoue {n} fois de suite ({detail}) : elle ne protège plus.",
+    "frames": "le traitement des messages du bus échoue {n} fois de suite ({detail}).",
+}
+
+
+class _FailureStreak:
+    """Compte les échecs consécutifs ; ne parle qu'au franchissement du seuil et au rétablissement qui suit."""
+
+    def __init__(self, threshold: int) -> None:
+        self._threshold = max(1, threshold)
+        self.count = 0
+        self._alerted = False
+
+    def record(self, ok: bool) -> str | None:
+        """``"alert"`` quand le seuil est atteint, ``"recovered"`` à la première réussite qui suit une alerte, sinon ``None``."""
+        if ok:
+            recovered = self._alerted
+            self.count, self._alerted = 0, False
+            return "recovered" if recovered else None
+        self.count += 1
+        if self.count == self._threshold:
+            self._alerted = True
+            return "alert"
+        return None
 
 
 class PlannedOrder(Protocol):
@@ -117,6 +162,9 @@ class ExposureWorkerConfig:
     emergency_slippage_bps: Decimal = Decimal("300")
     # Chiffrement et authentification du canal (CURVE). ``None`` = en clair (acceptable seulement en local).
     curve: CurveClientConfig | None = None
+    # Alertes webhook sur les urgences opérationnelles (homme mort, drawdown, pannes répétées). ``None`` = aucune.
+    alerter: Alerter | None = None
+    api_failure_threshold: int = 5
 
 
 class ExposureWorkerBase(ABC):
@@ -135,6 +183,7 @@ class ExposureWorkerBase(ABC):
         self._started_ms = int(time.time() * 1000)
         self._flat_until_ms: dict[str, int] = {}
         self._flatten_attempts: dict[str, int] = {}
+        self._streaks = {name: _FailureStreak(config.api_failure_threshold) for name in _STREAK_MESSAGES}
         for signal_id in self._state.recent_signal_ids(self._started_ms - _REPLAY_WINDOW_MS):
             self._replay_guard.check_and_add(uuid.UUID(signal_id))  # un redémarrage n'ouvre pas de fenêtre de rejeu
         self._state.prune_seen_before(self._started_ms - 2 * _REPLAY_WINDOW_MS)
@@ -220,6 +269,26 @@ class ExposureWorkerBase(ABC):
             self._pending[asset] = signal  # le plus récent remplace : avec une cible, l'ancien est caduc
         return "queued"
 
+    # --- alertes ----------------------------------------------------------------------------
+
+    def _alert(self, key: str, text: str, severity: Severity = Severity.CRITICAL) -> None:
+        """Alerte non bloquante ; toute erreur de l'alerteur est journalisée et ignorée."""
+        alerter = self._cfg.alerter
+        if alerter is None:
+            return
+        try:
+            alerter.alert(text, key=key, severity=severity)
+        except Exception:  # noqa: BLE001 -- une alerte ne doit jamais toucher la boucle d'exécution
+            _log.exception("%s_alert_failed key=%s", self._tag, key)
+
+    def _track(self, name: str, ok: bool, detail: str = "") -> None:
+        streak = self._streaks[name]
+        verdict = streak.record(ok)
+        if verdict == "alert":
+            self._alert(f"streak:{name}", _STREAK_MESSAGES[name].format(n=streak.count, detail=detail or "?"))
+        elif verdict == "recovered":
+            self._alert(f"recovered:{name}", f"rétabli : {name} refonctionne.", Severity.INFO)
+
     # --- risque et audit --------------------------------------------------------------------
 
     def _update_halt(self, equity: Decimal, now_ms: int) -> bool:
@@ -233,6 +302,11 @@ class ExposureWorkerBase(ABC):
         if start > 0 and (start - equity) / start * 100 >= self._cfg.limits.max_daily_drawdown_pct:
             self._state.set("halted", "1")
             _log.critical("%s_drawdown_halt start=%s equity=%s : réduction seule jusqu'à intervention", self._tag, start, equity)
+            self._alert(
+                "drawdown_halt",
+                f"coupe-circuit de drawdown : perte journalière >= {self._cfg.limits.max_daily_drawdown_pct}% "
+                f"(equity {start} -> {equity}). Worker verrouillé en réduction seule jusqu'à --clear-halt.",
+            )
             return True
         return False
 
@@ -320,6 +394,12 @@ class ExposureWorkerBase(ABC):
             "%s_dead_man_tripped asset=%s silent_for_s=%.1f timeout_s=%s : fermeture de toutes les positions puis HALTED",
             self._tag, asset, silent_for_ms / 1000, self._cfg.dead_man_timeout_s,
         )
+        self._alert(
+            "dead_man_tripped",
+            f"HOMME MORT déclenché : aucun signal valide du moteur depuis {silent_for_ms / 1000:.0f}s "
+            f"(seuil {self._cfg.dead_man_timeout_s}s, actif déclencheur {asset}). Fermeture de toutes les positions puis HALTED ; "
+            "réarmer avec --clear-halt une fois le moteur rétabli.",
+        )
 
     async def _dead_man_flatten_pending(self, now_ms: int, *, skip: frozenset[str]) -> str:
         pending = [str(a) for a in json.loads(self._state.get(_DM_PENDING) or "[]")]
@@ -336,6 +416,12 @@ class ExposureWorkerBase(ABC):
                 remaining.append(asset)
                 _log.error("%s_dead_man_flatten_incomplete asset=%s result=%s attempt=%d : nouvel essai au prochain cycle",
                            self._tag, asset, result, self._flatten_attempts[asset])
+                if self._flatten_attempts[asset] >= _FLATTEN_ALERT_ATTEMPTS:  # un ordre « sent » attend sa vérification : pas d'alerte avant
+                    self._alert(
+                        f"flatten_incomplete:{asset}",
+                        f"fermeture d'urgence INCOMPLÈTE sur {asset} (résultat {result}, tentative {self._flatten_attempts[asset]}) : "
+                        "une position reste peut-être ouverte, nouvel essai au prochain cycle.",
+                    )
         self._state.set(_DM_PENDING, json.dumps(remaining))
         return "halted_flattening" if remaining else "halted_flat"
 
@@ -352,16 +438,20 @@ class ExposureWorkerBase(ABC):
                     async with self._order_lock:
                         if self.dead_man_tripped:  # déclenché pendant l'attente du verrou
                             break
-                        await self.execute_signal(signal, asset)
-                except Exception:  # noqa: BLE001 -- un signal ne doit jamais arrêter l'exécuteur
+                        status = await self.execute_signal(signal, asset)
+                    self._track("execute", status not in _API_FAILURE_STATUSES, status)
+                except Exception as exc:  # noqa: BLE001 -- un signal ne doit jamais arrêter l'exécuteur
                     _log.exception("%s_execute_failed asset=%s", self._tag, asset)
+                    self._track("execute", False, type(exc).__name__)
 
     async def _dead_man_loop(self, stop: asyncio.Event) -> None:
         while not stop.is_set():
             try:
                 await self.check_dead_man()
-            except Exception:  # noqa: BLE001 -- une surveillance qui plante ne doit pas disparaître en silence
+                self._track("dead_man_loop", True)
+            except Exception as exc:  # noqa: BLE001 -- une surveillance qui plante ne doit pas disparaître en silence
                 _log.exception("%s_dead_man_check_failed", self._tag)
+                self._track("dead_man_loop", False, type(exc).__name__)
             try:
                 await asyncio.wait_for(stop.wait(), timeout=self._cfg.dead_man_check_interval_s)
             except asyncio.TimeoutError:
@@ -397,8 +487,10 @@ class ExposureWorkerBase(ABC):
                     try:
                         if self.handle_frames(frames) == "queued":
                             wake.set()
-                    except Exception:  # noqa: BLE001 -- un message ne doit jamais arrêter le worker
+                        self._track("frames", True)
+                    except Exception as exc:  # noqa: BLE001 -- un message ne doit jamais arrêter le worker
                         _log.exception("%s_handle_frames_failed", self._tag)
+                        self._track("frames", False, type(exc).__name__)
         finally:
             stop.set()
             wake.set()

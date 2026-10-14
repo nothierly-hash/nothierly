@@ -38,8 +38,10 @@ from typing import ClassVar
 from contracts.curve_transport import CurveClientConfig, CurveConfigError, transport_refusal
 from contracts.platform_signal import PlatformSignal, TargetVenue
 from contracts.secure_signal_bus import load_secret_from_env
+from workers.common.alerts import AlertConfigError, WebhookAlerter
 from workers.common.base import EmergencyOrder, ExposureWorkerBase, ExposureWorkerConfig, clear_execution_halt
 from workers.common.exposure import emergency_slippage_bps
+from workers.common.logging_setup import configure_logging
 from workers.common.state import ExecutionState
 from workers.darwinex.client import (
     MetaTrader5Client,
@@ -234,9 +236,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--dead-man-timeout", type=float, default=300.0, metavar="SECONDES",
                         help="ferme toutes les positions puis se verrouille après ce délai sans signal valide (0 = désactivé)")
     parser.add_argument("--allow-plaintext-remote", action="store_true", help="autorise un endpoint non local SANS chiffrement CURVE")
+    parser.add_argument("--log-dir", default=None, help="dossier d'un fichier de journal tournant (10 Mo x 5) en plus de stdout ; défaut : NOTHIERLY_LOG_DIR")
     args = parser.parse_args(argv)
     if args.clear_halt:  # ne touche que la base locale : ni terminal MT5, ni compte, ni secret du bus
-        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+        configure_logging("darwinex-worker", log_dir=args.log_dir)
         clear_execution_halt(ExecutionState(args.db))
         _log.info("dwx_halt_cleared")
         return 0
@@ -257,7 +260,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error(refusal)
     if args.live and args.allow_real_account and args.dead_man_timeout == 0:
         parser.error("--live sur un compte réel exige l'homme mort : --dead-man-timeout doit être > 0")
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    try:
+        alerter = WebhookAlerter.from_env(source="darwinex-worker")
+    except AlertConfigError as exc:
+        parser.error(str(exc))
+    configure_logging("darwinex-worker", log_dir=args.log_dir)
     login_env = os.environ.get("MT5_LOGIN")
     try:
         client = MetaTrader5Client(
@@ -275,7 +282,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         address=args.address, secret_key=load_secret_from_env(), db_path=args.db, dry_run=not args.live,
         symbol_suffix=args.symbol_suffix, max_spread_bps=args.max_spread_bps,
         default_stop_loss_bps=args.default_stop_loss_bps or None,
-        dead_man_timeout_s=args.dead_man_timeout or None, curve=curve,
+        dead_man_timeout_s=args.dead_man_timeout or None, curve=curve, alerter=alerter,
     )
     worker = DarwinexWorker(config, client)
     _log.info("dwx_worker_start mode=%s", "LIVE" if args.live else "DRY-RUN")
@@ -286,6 +293,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         _log.info("dwx_worker_stopped")
     finally:
         client.close()
+        if alerter is not None:
+            alerter.close(2.0)
     return 0
 
 
