@@ -3,6 +3,8 @@
 #
 #   scripts/deploy_shadow.sh            # vérifie tout, ne démarre RIEN
 #   scripts/deploy_shadow.sh --up       # idem, puis `docker compose up -d --build` si tout est vert
+#   SERVICES="redis-broker timescaledb nothierly-agents nothierly-vpin-tracker nothierly-maintenance" scripts/deploy_shadow.sh --up
+#                                       # ne démarre QUE ces services (ex. collecte de données sans workers : sans clés de testnet, un worker redémarre en boucle)
 #
 # Ce que ce script fait : installe Docker (dépôt officiel) s'il manque, vérifie les prérequis, crée les 4 volumes `external`,
 # valide la configuration Compose, joue la maintenance à blanc, puis (avec --up) démarre la pile.
@@ -91,7 +93,8 @@ fi
 
 # --- 6. Démarrage ------------------------------------------------------------------------------
 log "démarrage (build puis up -d)"
-"${DOCKER[@]}" compose "${COMPOSE_FILES[@]}" up -d --build
+# shellcheck disable=SC2086 -- SERVICES est une liste de noms séparés par des espaces, volontairement non citée
+"${DOCKER[@]}" compose "${COMPOSE_FILES[@]}" up -d --build ${SERVICES:-}
 sleep 20
 "${DOCKER[@]}" compose "${COMPOSE_FILES[@]}" ps
 log "à surveiller : docker compose ... logs -f nothierly-vpin-tracker nothierly-position-reporter nothierly-maintenance"
