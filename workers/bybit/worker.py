@@ -48,7 +48,9 @@ from workers.bybit.planner import ZERO, OrderPlan, bybit_symbol, plan_order, rou
 from workers.common.alerts import AlertConfigError, WebhookAlerter
 from workers.common.base import EmergencyOrder, ExposureWorkerBase, ExposureWorkerConfig, clear_execution_halt
 from workers.common.exposure import emergency_slippage_bps
+from workers.common.fills_db import FillsDatabase
 from workers.common.logging_setup import configure_logging
+from workers.common.ws_tracker import BybitFillFeed, FillTracker
 from workers.common.state import ExecutionState
 
 _log = logging.getLogger(__name__)
@@ -152,12 +154,14 @@ class BybitWorker(ExposureWorkerBase):
             _log.info("bybit_dry_run %s %s qty=%s px=%s %s reduce_only=%s", asset, "BUY" if plan.is_buy else "SELL", plan.size, plan.limit_px, plan.tif, plan.reduce_only)
             return "dry_run"
         request = BybitOrderRequest(plan.symbol, plan.is_buy, plan.size, plan.limit_px, plan.tif, plan.reduce_only, plan.order_link_id)
+        self._intent_before_send(plan.order_link_id, plan.symbol, plan.is_buy, mid, plan.size)
         try:
             outcome = await asyncio.to_thread(self._client.place_order, request)
         except Exception as exc:  # noqa: BLE001 -- ambigu : pas de nouvel essai, le prochain signal relit la position
             _log.exception("bybit_place_order_failed")
             self._record(signal, asset, "error", now, plan, repr(exc)[:200])
             return "error"
+        self._intent_order_id(plan.order_link_id, outcome.order_id)
         self._record(signal, asset, outcome.status, now, plan, outcome.detail or f"orderId={outcome.order_id}")
         return outcome.status
 
@@ -197,12 +201,14 @@ class BybitWorker(ExposureWorkerBase):
             return "dry_run"
         link_id = "n" + hashlib.sha256(f"deadman:{asset}:{now_ms}:{attempt}".encode()).hexdigest()[:32]
         request = BybitOrderRequest(asset, is_buy, order.size, order.limit_px, "IOC", True, link_id)
+        self._intent_before_send(link_id, asset, is_buy, mid, order.size, "emergency")
         try:
             outcome = await asyncio.to_thread(self._client.place_order, request)
         except Exception as exc:  # noqa: BLE001 -- ambigu : la position est relue au prochain cycle, qui décide
             _log.exception("bybit_dead_man_place_order_failed")
             self._record_emergency(asset, "error", now_ms, order, repr(exc)[:200])
             return "error"
+        self._intent_order_id(link_id, outcome.order_id)
         self._record_emergency(asset, outcome.status, now_ms, order, outcome.detail or f"orderId={outcome.order_id}")
         return outcome.status
 
@@ -216,6 +222,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--i-understand-real-funds", action="store_true", help="requis pour --live sur mainnet")
     parser.add_argument("--clear-halt", action="store_true", help="lève les verrous (drawdown et homme mort) puis quitte")
     parser.add_argument("--allow-plaintext-remote", action="store_true", help="autorise un endpoint non local SANS chiffrement CURVE")
+    parser.add_argument("--fills-db", default=None, help="base SQLite des fills et du slippage (défaut : bybit_fills.sqlite3 à côté de --db)")
+    parser.add_argument("--no-fill-tracking", action="store_true", help="désactive l'écoute des fills (activée avec --live)")
     parser.add_argument("--log-dir", default=None, help="dossier d'un fichier de journal tournant (10 Mo x 5) en plus de stdout ; défaut : NOTHIERLY_LOG_DIR")
     parser.add_argument("--dead-man-timeout", type=float, default=300.0, metavar="SECONDES",
                         help="ferme toutes les positions puis se verrouille après ce délai sans signal valide (0 = désactivé)")
@@ -257,6 +265,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         for problem in problems:
             _log.error("bybit_key_refused %s", problem)
         return 2
+    fills_db: FillsDatabase | None = None
+    tracker: FillTracker | None = None
+    if args.live and not args.no_fill_tracking:  # en dry-run aucun ordre ne part : rien à mesurer
+        fills_db = FillsDatabase(args.fills_db or Path(args.db).with_name("bybit_fills.sqlite3"))
+        tracker = FillTracker(BybitFillFeed(api_key=key, api_secret=secret, network=network.value), fills_db, alerter=alerter)
     config = BybitWorkerConfig(
         address=args.address,
         secret_key=load_secret_from_env(),
@@ -267,6 +280,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         dead_man_timeout_s=args.dead_man_timeout or None,
         curve=curve,
         alerter=alerter,
+        fills_db=fills_db,
+        fill_tracker=tracker,
     )
     worker = BybitWorker(config, client)
     _log.info("bybit_worker_start network=%s mode=%s", network.value, "LIVE" if args.live else "DRY-RUN")
@@ -278,6 +293,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     finally:
         if alerter is not None:
             alerter.close(2.0)
+        if fills_db is not None:
+            fills_db.close()
     return 0
 
 

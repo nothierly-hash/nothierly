@@ -36,7 +36,9 @@ from workers.common.base import (
     clear_execution_halt,
 )
 from workers.common.exposure import emergency_slippage_bps
+from workers.common.fills_db import FillsDatabase
 from workers.common.logging_setup import configure_logging
+from workers.common.ws_tracker import FillTracker, HyperliquidFillFeed
 from workers.hyperliquid.client import AccountSnapshot, HyperliquidClient, Network, OrderRequest, SdkHyperliquidClient
 from workers.hyperliquid.planner import ZERO, OrderPlan, hl_asset, plan_order, round_price, size_for_pct
 from workers.hyperliquid.state import HlState
@@ -125,12 +127,14 @@ class HyperliquidWorker(ExposureWorkerBase):
             _log.info("hl_dry_run %s %s sz=%s px=%s reduce_only=%s", asset, "BUY" if plan.is_buy else "SELL", plan.size, plan.limit_px, plan.reduce_only)
             return "dry_run"
         request = OrderRequest(plan.asset, plan.is_buy, plan.size, plan.limit_px, plan.tif, plan.reduce_only, plan.cloid)
+        self._intent_before_send(plan.cloid, asset, plan.is_buy, mid, plan.size)
         try:
             outcome = await asyncio.to_thread(self._client.place_order, request)
         except Exception as exc:  # noqa: BLE001 -- ambigu : pas de nouvel essai, le prochain signal relit la position
             _log.exception("hl_place_order_failed")
             self._record(signal, asset, "error", now, plan, repr(exc)[:200])
             return "error"
+        self._intent_order_id(plan.cloid, outcome.oid)
         self._record(signal, asset, outcome.status, now, plan, outcome.detail or f"oid={outcome.oid} filled={outcome.filled_size}")
         return outcome.status
 
@@ -165,12 +169,14 @@ class HyperliquidWorker(ExposureWorkerBase):
             return "dry_run"
         cloid = "0x" + hashlib.sha256(f"deadman:{asset}:{now_ms}:{attempt}".encode()).hexdigest()[:32]
         request = OrderRequest(asset, is_buy, order.size, order.limit_px, "Ioc", True, cloid)
+        self._intent_before_send(cloid, asset, is_buy, mid, order.size, "emergency")
         try:
             outcome = await asyncio.to_thread(self._client.place_order, request)
         except Exception as exc:  # noqa: BLE001 -- ambigu : la position est relue au prochain cycle, qui décide
             _log.exception("hl_dead_man_place_order_failed")
             self._record_emergency(asset, "error", now_ms, order, repr(exc)[:200])
             return "error"
+        self._intent_order_id(cloid, outcome.oid)
         self._record_emergency(asset, outcome.status, now_ms, order, outcome.detail or f"oid={outcome.oid} filled={outcome.filled_size}")
         return outcome.status
 
@@ -184,6 +190,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--i-understand-real-funds", action="store_true", help="requis pour --live sur mainnet")
     parser.add_argument("--clear-halt", action="store_true", help="lève les verrous (drawdown et homme mort) puis quitte")
     parser.add_argument("--allow-plaintext-remote", action="store_true", help="autorise un endpoint non local SANS chiffrement CURVE")
+    parser.add_argument("--fills-db", default=None, help="base SQLite des fills et du slippage (défaut : hyperliquid_fills.sqlite3 à côté de --db)")
+    parser.add_argument("--no-fill-tracking", action="store_true", help="désactive l'écoute des fills (activée avec --live)")
     parser.add_argument("--log-dir", default=None, help="dossier d'un fichier de journal tournant (10 Mo x 5) en plus de stdout ; défaut : NOTHIERLY_LOG_DIR")
     parser.add_argument("--dead-man-timeout", type=float, default=300.0, metavar="SECONDES",
                         help="ferme toutes les positions puis se verrouille après ce délai sans signal valide (0 = désactivé)")
@@ -223,9 +231,15 @@ def main(argv: Sequence[str] | None = None) -> None:
     client = SdkHyperliquidClient(
         network=network, account_address=account, agent_secret=secret, vault_address=os.environ.get("HL_VAULT_ADDRESS")
     )
+    fills_db: FillsDatabase | None = None
+    tracker: FillTracker | None = None
+    if args.live and not args.no_fill_tracking:  # en dry-run aucun ordre ne part : rien à mesurer
+        fills_db = FillsDatabase(args.fills_db or Path(args.db).with_name("hyperliquid_fills.sqlite3"))
+        feed = HyperliquidFillFeed(user=os.environ.get("HL_VAULT_ADDRESS") or account, network=network.value)
+        tracker = FillTracker(feed, fills_db, alerter=alerter)
     config = HyperliquidWorkerConfig(
         address=args.address, secret_key=load_secret_from_env(), db_path=args.db, dry_run=not args.live,
-        dead_man_timeout_s=args.dead_man_timeout or None, curve=curve, alerter=alerter,
+        dead_man_timeout_s=args.dead_man_timeout or None, curve=curve, alerter=alerter, fills_db=fills_db, fill_tracker=tracker,
     )
     worker = HyperliquidWorker(config, client)
     _log.info("hl_worker_start network=%s mode=%s", network.value, "LIVE" if args.live else "DRY-RUN")
@@ -237,6 +251,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     finally:
         if alerter is not None:
             alerter.close(2.0)
+        if fills_db is not None:
+            fills_db.close()
 
 
 if __name__ == "__main__":

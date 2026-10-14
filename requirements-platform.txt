@@ -7,6 +7,8 @@
 # switch), hence pydantic-settings, structlog and redis.
 redis>=5.0.0,<6.0.0
 pyzmq>=25.1.0,<28.0.0
+# Flux WebSocket privés des fills (workers/common/ws_tracker.py). Même borne que requirements.txt.
+websockets>=13.0,<16.0.0
 pydantic>=2.7.0,<3.0.0
 pydantic-settings>=2.3.0,<3.0.0
 python-dotenv>=1.0.0,<2.0.0

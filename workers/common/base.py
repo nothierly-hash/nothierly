@@ -54,6 +54,12 @@ bloquer ni faire échouer le worker, et seulement pour les urgences opérationne
 
 Ni les ordres exécutés, ni les rejets ordinaires (signal périmé, rejeu, taille sous le minimum, mode simulé) n'alertent.
 Les alertes ne changent aucune décision : un webhook muet laisse le worker se protéger exactement comme avant.
+
+**Mesure du slippage (``config.fills_db`` et ``config.fill_tracker``, voir ``workers.common.fills_db`` et ``ws_tracker``).**
+Avant d'envoyer un ordre, le worker enregistre son *intention* (identifiant client, prix de référence = le ``mid`` qui a servi
+à le dimensionner, quantité) ; à la réponse de l'API il y ajoute l'identifiant d'ordre de la plateforme. Un tracker
+WebSocket, tâche à part lancée par ``run()``, rapproche chaque fill de cette intention et écrit le slippage dans SQLite.
+L'enregistrement ne conditionne jamais l'envoi : s'il échoue, l'ordre part quand même (erreur journalisée).
 """
 
 from __future__ import annotations
@@ -79,6 +85,7 @@ from contracts.platform_signal import PlatformSignal, TargetVenue
 from contracts.secure_signal_bus import DEFAULT_TOPIC, ReplayGuard, open_envelope, verify_signature
 from workers.common.alerts import Alerter, Severity
 from workers.common.exposure import RiskLimits
+from workers.common.fills_db import FillsDatabase, OrderIntent
 from workers.common.state import ExecutionRecord, ExecutionState
 
 _log = logging.getLogger(__name__)
@@ -101,6 +108,12 @@ _STREAK_MESSAGES = {
     "dead_man_loop": "la surveillance de l'homme mort échoue {n} fois de suite ({detail}) : elle ne protège plus.",
     "frames": "le traitement des messages du bus échoue {n} fois de suite ({detail}).",
 }
+
+
+class FillTrackerLike(Protocol):
+    """Ce que le socle attend d'un tracker de fills : une tâche qui tourne jusqu'à ``stop`` (voir ``ws_tracker.FillTracker``)."""
+
+    async def run(self, stop: asyncio.Event) -> None: ...
 
 
 class _FailureStreak:
@@ -165,6 +178,9 @@ class ExposureWorkerConfig:
     # Alertes webhook sur les urgences opérationnelles (homme mort, drawdown, pannes répétées). ``None`` = aucune.
     alerter: Alerter | None = None
     api_failure_threshold: int = 5
+    # Mesure du slippage : base des intentions/fills et tracker du flux privé (``None`` = pas de mesure).
+    fills_db: FillsDatabase | None = None
+    fill_tracker: FillTrackerLike | None = None
 
 
 class ExposureWorkerBase(ABC):
@@ -288,6 +304,40 @@ class ExposureWorkerBase(ABC):
             self._alert(f"streak:{name}", _STREAK_MESSAGES[name].format(n=streak.count, detail=detail or "?"))
         elif verdict == "recovered":
             self._alert(f"recovered:{name}", f"rétabli : {name} refonctionne.", Severity.INFO)
+
+    # --- mesure du slippage -----------------------------------------------------------------
+
+    def _intent_before_send(self, client_id: str, symbol: str, is_buy: bool, intended_price: Decimal, qty: Decimal, kind: str = "signal") -> None:
+        """À appeler juste avant d'envoyer un ordre : un fill peut arriver sur le flux avant la réponse de l'API.
+        ``intended_price`` = prix de référence du worker à cet instant. Ne lève jamais et ne retarde pas l'ordre."""
+        db = self._cfg.fills_db
+        if db is None:
+            return
+        try:
+            db.register_intent(OrderIntent(self.venue.value, client_id, None, symbol, is_buy, intended_price, qty, kind, int(time.time() * 1000)))
+        except Exception:  # noqa: BLE001 -- la mesure ne doit jamais empêcher un ordre
+            _log.exception("%s_intent_not_recorded client_id=%s", self._tag, client_id)
+
+    def _intent_order_id(self, client_id: str, order_id: object) -> None:
+        """À appeler avec l'identifiant d'ordre de la plateforme dès que la réponse de l'API le donne."""
+        db = self._cfg.fills_db
+        if db is None or order_id is None:
+            return
+        try:
+            db.attach_order_id(self.venue.value, client_id, str(order_id))
+        except Exception:  # noqa: BLE001
+            _log.exception("%s_order_id_not_recorded client_id=%s", self._tag, client_id)
+
+    async def _run_fill_tracker(self, stop: asyncio.Event) -> None:
+        tracker = self._cfg.fill_tracker
+        assert tracker is not None
+        try:
+            await tracker.run(stop)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 -- le tracker est une aide : sa panne ne touche pas l'exécution
+            _log.exception("%s_fill_tracker_crashed", self._tag)
+            self._alert("fill_tracker_crashed", "le tracker de fills s'est arrêté sur une erreur : le slippage n'est plus mesuré.")
 
     # --- risque et audit --------------------------------------------------------------------
 
@@ -475,6 +525,8 @@ class ExposureWorkerBase(ABC):
             _log.warning("%s_plaintext_remote address=%s : canal NON chiffré, un observateur lit les signaux", self._tag, self._cfg.address)
         socket.connect(self._cfg.address)
         tasks = [asyncio.create_task(self._executor(stop, wake))]
+        if self._cfg.fill_tracker is not None:
+            tasks.append(asyncio.create_task(self._run_fill_tracker(stop)))
         if self._cfg.dead_man_timeout_s is not None:
             tasks.append(asyncio.create_task(self._dead_man_loop(stop)))
             _log.info("%s_dead_man_armed timeout_s=%s grace_s=%s", self._tag, self._cfg.dead_man_timeout_s, self._cfg.dead_man_startup_grace_s)

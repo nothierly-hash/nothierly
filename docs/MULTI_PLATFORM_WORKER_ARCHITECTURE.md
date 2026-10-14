@@ -581,6 +581,34 @@ Ni ouvertures, ni fermetures, ni inversions, ni republications n'alertent. L'ale
 - **Un worker qui meurt ne s'alerte pas lui-même.** Un processus tué (mémoire, `kill -9`) n'envoie rien : seule une surveillance extérieure (un `healthcheck` Docker, un moniteur de disponibilité) le voit.
 - Le délai de 3 s ne borne pas la résolution DNS, ce qui n'a pas de conséquence ici : l'envoi se fait dans un thread à part.
 
+### 6.9 Mesure du slippage (boucle de feedback d'exécution)
+
+*Implémenté et testé : `workers/common/fills_db.py`, `workers/common/ws_tracker.py`, intégration dans `workers/common/base.py`, `workers/hyperliquid/worker.py` et `workers/bybit/worker.py`, rapport `scripts/fills_report.py`. Jamais connecté à un vrai flux : les formats viennent de la documentation officielle, la logique est testée sur de faux flux et sur un serveur WebSocket local.*
+
+**Ce que ça mesure.** Pour chaque fill : l'écart entre le **prix de référence du worker au moment où l'ordre part** (le `mid` qui a servi à le dimensionner) et le prix d'exécution réel, en points de base, **positif = coût**. C'est le coût de l'exécution (traverser le carnet, mouvement pendant l'aller-retour réseau). **Ce n'est pas** la dérive entre la décision du moteur et l'arrivée du signal au worker : le contrat `PlatformSignal` ne porte pas de prix de décision. Cette partie-là reste à mesurer (il faudrait un prix de référence dans le signal).
+
+**Flux.** Avant d'envoyer un ordre le worker écrit une *intention* (identifiant client, `mid`, quantité, nature `signal` ou `emergency`) ; à la réponse de l'API il y rattache l'identifiant d'ordre de la plateforme. Le tracker (tâche `asyncio` à part, lancée par `run()` à côté de la boucle ZMQ) se connecte au flux privé, rapproche chaque fill de son intention, calcule le slippage et insère une ligne par fill (`executions`, idempotente sur `(venue, fill_id)`). Les lectures du socket sont des `await` ; l'accès SQLite se fait dans un thread (un test prouve qu'une écriture de 0,4 s ne gèle pas la boucle). Une panne du flux, de la base ou du tracker ne touche pas l'exécution des ordres (alerte `fill_tracker_down` / `fill_tracker_crashed` si un webhook est configuré).
+
+| Plateforme | Flux | Rapprochement |
+|---|---|---|
+| Bybit | `wss://stream.bybit.com/v5/private` (testnet : `stream-testnet`), authentification HMAC `GET/realtime{expires}`, sujet `execution.linear`, ping toutes les 20 s | `orderLinkId` (identifiant client), sinon `orderId` ; seuls les `execType == "Trade"` comptent (le même flux porte le financement et les liquidations) |
+| Hyperliquid | `wss://api.hyperliquid.xyz/ws` (testnet : `api.hyperliquid-testnet.xyz`), abonnement `userFills` | `oid` **seulement** : le fill ne porte pas de `cloid` (vérifié dans la doc) ; le fill peut arriver avant la réponse de l'API, il attend alors `match_grace_s` (10 s) puis le rapprochement est retenté |
+
+Un fill sans intention connue (ordre passé à la main, intention perdue) est enregistré `kind='unmatched'` avec prix voulu et slippage **vides**, jamais un faux zéro, et compté à part dans les rapports. Les ordres d'urgence de l'homme mort sont mesurés aussi (`kind='emergency'`).
+
+**Activation.** Seulement avec `--live` (en dry-run aucun ordre ne part) : `--fills-db` (défaut : `hyperliquid_fills.sqlite3` / `bybit_fills.sqlite3` à côté de `--db`), `--no-fill-tracking` pour couper. Rapport : `python scripts/fills_report.py <base> [--venue V] [--symbol S] [--since-hours 24]` (moyenne, moyenne pondérée par le notionnel, médiane, p95, pire).
+
+**Pourquoi pas `core/analytics/db.py`.** Les workers n'importent jamais `core` (frontière d'IP, test AST) et c'est eux qui écrivent : le module est en stdlib dans `workers/common/`. Le moteur peut lire le fichier SQLite directement.
+
+**Limites.**
+
+- **Bybit ne rejoue rien** : les fills survenus pendant une coupure du flux sont perdus pour cette base (Hyperliquid renvoie un instantané à la reconnexion, ce qui les récupère s'ils correspondent à une intention). Une réconciliation par l'API REST reste à écrire.
+- **Fills partiels** : une ligne par fill ; le slippage d'un ordre est la moyenne pondérée de ses lignes (non agrégée en base).
+- Le slippage est mesuré par rapport au `mid` du worker : sur un ordre limite IOC loin du marché il mesure surtout la profondeur du carnet.
+- **Darwinex (MT5) n'est pas couvert** : pas de flux WebSocket, il faudrait lire l'historique des transactions du terminal.
+- Prix et quantités sont stockés en `REAL` (agrégats SQL) ; le calcul se fait en `Decimal` avant conversion.
+- Aucun seuil d'alerte sur un slippage anormal : la mesure précède la décision de ce qui est « anormal ».
+
 ## 7. Plan de mise en œuvre (ordre recommandé)
 
 | Phase | Contenu | État / coût |
