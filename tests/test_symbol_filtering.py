@@ -87,9 +87,10 @@ def _patch_archive(monkeypatch: pytest.MonkeyPatch, rows: list[dict[str, Any]]) 
 
 def test_train_ppo_only_sees_the_rows_of_the_chosen_symbol(monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_archive(monkeypatch, MIXED)
-    features, prices = asyncio.run(train_ppo._fetch_aligned_dataset(5, "BTCUSDT"))
+    features, prices, vpin = asyncio.run(train_ppo._fetch_aligned_dataset(5, "BTCUSDT"))
     assert features.shape == (120, 5) and prices.shape == (120,) and float(prices.min()) >= 50_000.0
-    eth_features, eth_prices = asyncio.run(train_ppo._fetch_aligned_dataset(5, "ETH/USDT"))
+    assert vpin is None  # sans archive VPIN, l'observation reste celle d'avant
+    eth_features, eth_prices, _ = asyncio.run(train_ppo._fetch_aligned_dataset(5, "ETH/USDT"))
     assert float(eth_prices.max()) < 4_000.0 and len(eth_prices) == 120
 
 
@@ -105,12 +106,13 @@ def test_the_ppo_pipeline_passes_the_symbol_down_to_the_dataset_and_exports_only
     _patch_archive(monkeypatch, MIXED)
     seen: dict[str, Any] = {}
 
-    def fake_training(features: Any, prices: Any, config: Any) -> str:
+    def fake_training(features: Any, prices: Any, config: Any, **kwargs: Any) -> str:
         seen["prices"] = prices
+        seen["kwargs"] = kwargs
         return "modèle"
 
     monkeypatch.setattr(train_ppo, "run_ppo_training", fake_training)
-    monkeypatch.setattr(train_ppo, "export_model", lambda model, models_dir: tmp_path / "ppo.pt")
+    monkeypatch.setattr(train_ppo, "export_model", lambda model, models_dir, metadata=None: tmp_path / "ppo.pt")
     path = asyncio.run(train_ppo.run_training_pipeline(symbol="BTCUSDT", lookback_days=5, total_timesteps=10, rollout_length=5, models_dir=tmp_path))
     assert path == tmp_path / "ppo.pt" and float(seen["prices"].min()) >= 50_000.0 and len(seen["prices"]) == 120
 

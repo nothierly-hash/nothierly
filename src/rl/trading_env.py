@@ -18,6 +18,16 @@ import gymnasium as gym
 import numpy as np
 import numpy.typing as npt
 
+from src.rl.risk_shaping import (
+    BPS,
+    RiskShapingConfig,
+    compute_action_mask,
+    safe_action,
+    safe_harbor_reward,
+    stop_penalty,
+    toxicity_tax,
+)
+
 # Action space (matches core.schemas.SupervisorAction's BUY/SELL/HOLD
 # vocabulary, minus the position-agnostic framing: here SELL means "exit
 # to flat", not "go short" -- this environment is long-only/flat, the
@@ -29,6 +39,9 @@ ACTION_SELL: Final[int] = 2
 
 _N_MARKET_FEATURES: Final[int] = 5  # spread, obi, macro x2, sentiment -- see build_observation
 _OBSERVATION_DIM: Final[int] = _N_MARKET_FEATURES + 1  # + current position
+OBSERVATION_DIM: Final[int] = _OBSERVATION_DIM  # taille de l'observation sans VPIN (publique : lue par l'entraînement et l'inférence)
+N_VPIN_FEATURES: Final[int] = 3  # niveau, vitesse (delta 1 min), accélération (delta^2 1 min) du VPIN : voir src/rl/risk_shaping.py
+OBSERVATION_DIM_WITH_VPIN: Final[int] = _OBSERVATION_DIM + N_VPIN_FEATURES
 
 # Calibrated against real daily log-returns (EUR/USD, gold, BTC/USD all
 # checked -- typical magnitude ~1e-3 to ~1e-2), not chosen arbitrarily.
@@ -110,6 +123,8 @@ class MarketEnv(gym.Env[npt.NDArray[np.float64], int]):
         volatility_window: int = 20,
         risk_aversion: float = _DEFAULT_RISK_AVERSION,
         episode_length: int | None = None,
+        vpin_features: npt.NDArray[np.float64] | None = None,
+        risk_shaping: RiskShapingConfig | None = None,
     ) -> None:
         """Configure the environment over a fixed, pre-aligned dataset.
 
@@ -138,6 +153,14 @@ class MarketEnv(gym.Env[npt.NDArray[np.float64], int]):
                 the market is actually doing.
             episode_length: Steps per episode before truncation. Defaults
                 to using the entire dataset as one episode.
+            vpin_features: Optional, shape ``(T, 3)``: VPIN level, velocity
+                and acceleration at each step (see :func:`src.rl.risk_shaping.
+                vpin_derivatives`; must be CAUSAL and free of NaN: trim the dataset
+                to the rows where the VPIN is known). When given, the observation
+                grows from 6 to 9 values (``[..., position, vpin, dvpin, d2vpin]``).
+            risk_shaping: Optional :class:`~src.rl.risk_shaping.RiskShapingConfig`
+                (toxicity tax, non-linear stop penalty, safe-harbor bonus, kill-switch
+                action mask). ``None`` reproduces the behaviour described above exactly.
 
         Raises:
             ValueError: If ``features``/``prices`` have mismatched or
@@ -160,6 +183,13 @@ class MarketEnv(gym.Env[npt.NDArray[np.float64], int]):
             raise ValueError("transaction_cost_pct must not be negative.")
         if volatility_window < 2:
             raise ValueError("volatility_window must be >= 2.")
+        if vpin_features is not None:
+            if vpin_features.shape != (len(features), N_VPIN_FEATURES):
+                raise ValueError(f"vpin_features must have shape ({len(features)}, {N_VPIN_FEATURES}), got {vpin_features.shape}.")
+            if not np.isfinite(vpin_features).all():
+                raise ValueError("vpin_features contains NaN or infinite values: trim the dataset to the rows where the VPIN is known.")
+        if risk_shaping is not None and risk_shaping.needs_vpin and vpin_features is None:
+            raise ValueError("risk_shaping uses the VPIN (toxicity tax, safe-harbor bonus or kill-switch mask): vpin_features is required.")
 
         self._features = features
         self._prices = prices
@@ -167,6 +197,9 @@ class MarketEnv(gym.Env[npt.NDArray[np.float64], int]):
         self._volatility_window = volatility_window
         self._risk_aversion = risk_aversion
         self._episode_length = episode_length or (len(features) - 1)
+        self._vpin_features = vpin_features
+        self._shaping = risk_shaping if risk_shaping is not None else RiskShapingConfig()
+        observation_dim = OBSERVATION_DIM_WITH_VPIN if vpin_features is not None else _OBSERVATION_DIM
 
         # gym.Env declares action_space/observation_space at the base-class
         # level, so an explicit annotation here (matching the narrower type
@@ -181,13 +214,22 @@ class MarketEnv(gym.Env[npt.NDArray[np.float64], int]):
         # the two are functionally identical at runtime.
         self.action_space: gym.spaces.Discrete = gym.spaces.Discrete(3)  # type: ignore[assignment]
         self.observation_space: gym.spaces.Box = gym.spaces.Box(
-            low=-np.inf, high=np.inf, shape=(_OBSERVATION_DIM,), dtype=np.float64
+            low=-np.inf, high=np.inf, shape=(observation_dim,), dtype=np.float64
         )
 
         self._position: int = 0
         self._current_step: int = 0
         self._episode_start: int = 0
         self._position_return_history: list[float] = []
+        self._entry_price: float | None = None
+
+    def current_vpin(self) -> float | None:
+        """VPIN à l'étape courante, ou ``None`` si l'environnement n'a pas de série VPIN."""
+        return None if self._vpin_features is None else float(self._vpin_features[self._current_step, 0])
+
+    def action_mask(self) -> npt.NDArray[np.bool_]:
+        """Actions permises ``[HOLD, BUY, SELL]`` à l'étape courante (toutes, sans coupe-circuit configuré) : voir :func:`src.rl.risk_shaping.compute_action_mask`."""
+        return compute_action_mask(float(self._position), self.current_vpin(), self._shaping.kill_switch_vpin)
 
     def reset(
         self, *, seed: int | None = None, options: dict[str, Any] | None = None
@@ -209,8 +251,9 @@ class MarketEnv(gym.Env[npt.NDArray[np.float64], int]):
         self._current_step = self._episode_start
         self._position = 0
         self._position_return_history = []
+        self._entry_price = None
 
-        return self._build_observation(), {}
+        return self._build_observation(), {"action_mask": self.action_mask()}
 
     def step(
         self, action: int
@@ -234,6 +277,11 @@ class MarketEnv(gym.Env[npt.NDArray[np.float64], int]):
         if action not in (ACTION_HOLD, ACTION_BUY, ACTION_SELL):
             raise ValueError(f"Invalid action {action!r}; must be 0 (HOLD), 1 (BUY), or 2 (SELL).")
 
+        # Coupe-circuit déterministe : une action masquée n'est jamais exécutée, quelle que soit la politique (même un agent qui hallucine ne peut pas ouvrir dans un VPIN extrême).
+        overridden = not bool(self.action_mask()[action])
+        if overridden:
+            action = safe_action(float(self._position))
+
         previous_position = self._position
         if action == ACTION_BUY:
             new_position = 1
@@ -246,6 +294,16 @@ class MarketEnv(gym.Env[npt.NDArray[np.float64], int]):
         next_price = self._prices[self._current_step + 1]
         log_return = float(np.log(next_price / current_price))
         position_return = float(new_position) * log_return
+        vpin_now = self.current_vpin()  # l'état vu AU MOMENT de la décision : jamais une valeur future
+
+        if new_position == 1 and previous_position == 0:
+            self._entry_price = float(current_price)
+        stop_hit = False
+        stop_loss_realized_bps = 0.0
+        if self._shaping.stop_loss_bps is not None and new_position == 1 and self._entry_price is not None:
+            drawdown_bps = (float(next_price) / self._entry_price - 1.0) * BPS
+            if drawdown_bps <= -self._shaping.stop_loss_bps:
+                stop_hit, stop_loss_realized_bps = True, -drawdown_bps  # sortie forcée au prix du pas suivant : le gap au-delà du stop est la perte réalisée
 
         self._position_return_history.append(position_return)
         if len(self._position_return_history) > self._volatility_window:
@@ -261,6 +319,16 @@ class MarketEnv(gym.Env[npt.NDArray[np.float64], int]):
 
         reward = position_return - self._risk_aversion * volatility_penalty - transaction_cost
 
+        if vpin_now is not None:
+            reward -= toxicity_tax(vpin_now, float(new_position), self._shaping)
+            reward += safe_harbor_reward(action, new_position, vpin_now, self._shaping)
+        if stop_hit:
+            reward -= stop_penalty(stop_loss_realized_bps, self._shaping)
+            reward -= self._transaction_cost_pct  # la sortie forcée est un changement de position de plus
+            new_position = 0
+        if new_position == 0:
+            self._entry_price = None
+
         self._position = new_position
         self._current_step += 1
 
@@ -275,10 +343,17 @@ class MarketEnv(gym.Env[npt.NDArray[np.float64], int]):
             "log_return": log_return,
             "transaction_cost": transaction_cost,
             "volatility_penalty": volatility_penalty,
+            "stop_loss_hit": stop_hit,
+            "stop_loss_bps": stop_loss_realized_bps,
+            "action_overridden": overridden,
+            "action_mask": self.action_mask(),
         }
         return self._build_observation(), reward, terminated, truncated, info
 
     def _build_observation(self) -> npt.NDArray[np.float64]:
         """Assemble the current observation: market features + current position."""
         market_features = self._features[self._current_step]
-        return np.concatenate([market_features, [float(self._position)]]).astype(np.float64)
+        parts = [market_features, [float(self._position)]]
+        if self._vpin_features is not None:
+            parts.append(self._vpin_features[self._current_step])
+        return np.concatenate(parts).astype(np.float64)

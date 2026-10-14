@@ -138,6 +138,7 @@ _MODELS_DIR_ENV: Final[str] = "NOTHIERLY_MODELS_DIR"
 _SUPERVISOR_MODEL_ENV: Final[str] = "NOTHIERLY_SUPERVISOR_MODEL"
 _SUPERVISOR_SCALER_ENV: Final[str] = "NOTHIERLY_SUPERVISOR_SCALER"
 _RL_POLICY_ENV: Final[str] = "NOTHIERLY_RL_POLICY"
+_RL_KILL_SWITCH_ENV: Final[str] = "NOTHIERLY_RL_KILL_SWITCH_VPIN"
 _META_LABEL_ENV: Final[str] = "NOTHIERLY_META_LABEL_MODEL"
 _ARTIFACT_TIMESTAMP: Final[re.Pattern[str]] = re.compile(r"_(\d{8}_\d{6})\.[A-Za-z0-9]+$")
 
@@ -221,6 +222,23 @@ def _resolve_supervisor_model_paths(environ: Mapping[str, str] | None = None) ->
         return None, None
     _log.info("supervisor_model_resolved", model_path=str(models[newest]), scaler_path=str(scalers[newest]), candidates=len(complete))
     return models[newest], scalers[newest]
+
+
+def _resolve_rl_kill_switch_vpin(environ: Mapping[str, str] | None = None) -> float | None:
+    """VPIN au-delà duquel la politique PPO n'a plus le droit d'ouvrir (``NOTHIERLY_RL_KILL_SWITCH_VPIN``, dans ]0, 1]), ou ``None`` (valeur enregistrée avec la politique, sinon aucun masque).
+
+    Échec rapide : une valeur illisible ou hors bornes N'EST PAS ignorée (un coupe-circuit qui se désactive en silence est pire que pas de coupe-circuit) ; le moteur refuse de démarrer.
+    """
+    raw = (os.environ if environ is None else environ).get(_RL_KILL_SWITCH_ENV, "").strip()
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        value = float("nan")
+    if not 0.0 < value <= 1.0:
+        raise ValueError(f"{_RL_KILL_SWITCH_ENV}={raw!r} : attendu un nombre dans ]0, 1] (le VPIN vit dans [0, 1])")
+    return value
 
 
 def _resolve_rl_policy_model_path(environ: Mapping[str, str] | None = None) -> Path | None:
@@ -379,6 +397,7 @@ async def main() -> None:
     # module docstring.
     supervisor_model_path, supervisor_scaler_path = _resolve_supervisor_model_paths()
     rl_policy_model_path = _resolve_rl_policy_model_path()
+    rl_kill_switch_vpin = _resolve_rl_kill_switch_vpin()
 
     agents: list[
         MarketDataAgent
@@ -428,6 +447,7 @@ async def main() -> None:
             RlSignalAgent(
                 instrument,
                 model_path=rl_policy_model_path,
+                kill_switch_vpin=rl_kill_switch_vpin,
                 manage_own_signals=False,
                 zmq_context=shared_zmq_context,
                 manage_own_redis=False,

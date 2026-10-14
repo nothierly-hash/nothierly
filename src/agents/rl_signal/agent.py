@@ -28,10 +28,14 @@ XgboostSignalAgent`'s asset-class note).
 from __future__ import annotations
 
 import asyncio
+import math
 import time
+from collections import deque
 from pathlib import Path
 from typing import Final
 
+import numpy as np
+import numpy.typing as npt
 import zmq.asyncio
 from pydantic import ValidationError
 
@@ -47,12 +51,16 @@ from core.schemas import (
     SentimentSignal,
     TradingSignal,
 )
-from src.agents.rl_signal.policy_model import RLPolicyModel
+from src.agents.rl_signal.policy_model import RLPolicyModel, VpinUnavailableError
 from src.agents.supervisor.feature_confirmation import apply_feature_confirmation
 from src.agents.supervisor.ml_engine import SupervisorMLModel
+from src.rl.risk_shaping import vpin_derivatives
 
 _MACRO_INDICATORS: Final[tuple[str, ...]] = ("US_10Y_YIELD", "BTC_EXCHANGE_FLOW")
 _AGENT_ID: Final[str] = "rl-signal-agent"
+_VPIN_KEY_PREFIX: Final[str] = "market:vpin:"  # écrit par workers/market_data/vpin_tracker.py ; absente = pas de lecture (jamais une valeur)
+_VPIN_HISTORY_MAX: Final[int] = 600           # relevés conservés (à 5 s : 50 minutes) pour calculer la vitesse et l'accélération
+_VPIN_MAX_AGE_S: Final[float] = 600.0         # même borne que l'entraînement (scripts/train_ppo.VPIN_MAX_AGE_S)
 
 
 class RlSignalAgent(BaseAgent):
@@ -74,6 +82,7 @@ class RlSignalAgent(BaseAgent):
         manage_own_signals: bool = True,
         zmq_context: zmq.asyncio.Context | None = None,
         manage_own_redis: bool = True,
+        kill_switch_vpin: float | None = None,
     ) -> None:
         """Wire up the PPO policy.
 
@@ -90,6 +99,8 @@ class RlSignalAgent(BaseAgent):
             manage_own_signals: See :class:`~core.base_agent.BaseAgent`.
             zmq_context: See :class:`~core.base_agent.BaseAgent`.
             manage_own_redis: See :class:`~core.base_agent.BaseAgent`.
+            kill_switch_vpin: VPIN above which ``BUY`` is masked and a held position can only exit (see
+                :class:`~src.agents.rl_signal.policy_model.RLPolicyModel`). ``None``: the value stored with the policy, if any.
         """
         super().__init__(
             _AGENT_ID,
@@ -104,7 +115,8 @@ class RlSignalAgent(BaseAgent):
 
         self._symbol = instrument
         self._poll_interval_seconds = poll_interval_seconds
-        self._policy = RLPolicyModel(model_path=model_path)
+        self._policy = RLPolicyModel(model_path=model_path, kill_switch_vpin=kill_switch_vpin)
+        self._vpin_history: deque[tuple[float, float]] = deque(maxlen=_VPIN_HISTORY_MAX)  # (instant, VPIN) lus dans Redis à chaque cycle
 
     # -- BaseAgent overrides -----------------------------------------
 
@@ -199,7 +211,14 @@ class RlSignalAgent(BaseAgent):
         features = SupervisorMLModel.build_feature_vector(
             market_metrics, macro_snapshots, sentiment_signals
         )
-        raw_signal_value, raw_confidence = self._policy.predict_action(features)
+        vpin_features = await self._read_vpin_features()
+        try:
+            raw_signal_value, raw_confidence = self._policy.predict_action(features, vpin_features=vpin_features)
+        except VpinUnavailableError:
+            # Politique entraînée avec le VPIN mais VPIN absent, périmé ou en phase de chauffe (les deux fenêtres de la vitesse et de l'accélération ne sont pas encore remplies) :
+            # aucune opinion plutôt qu'une opinion fabriquée. Le signal neutre n'ouvre rien dans le consensus.
+            self._log.warning("rl_signal_vpin_unavailable_neutral", agent_id=self.agent_id, instrument=self._symbol)
+            raw_signal_value, raw_confidence = 0, 0.0
         # See src.agents.supervisor.feature_confirmation: adjusts
         # confidence only (never direction) from the Feature Store's RSI
         # read, when one exists for this instrument.
@@ -276,6 +295,34 @@ class RlSignalAgent(BaseAgent):
         feature_vector = await self._read_feature_vector()
 
         return market_metrics, macro_snapshots, sentiment_signals, feature_vector
+
+    async def _read_vpin_features(self) -> npt.NDArray[np.float64] | None:
+        """``[VPIN, vitesse, accélération]`` à cet instant, ou ``None`` (clé absente ou expirée, valeur illisible ou hors [0, 1], historique encore trop court).
+
+        L'historique est tenu en mémoire d'un cycle à l'autre : il faut deux fenêtres (2 x ``vpin_window_s``) de relevés avant que la vitesse et
+        l'accélération existent ; d'ici là la réponse est ``None``, jamais une dérivée inventée.
+        """
+        if self._redis_client is None:
+            return None
+        key = f"{_VPIN_KEY_PREFIX}{''.join(ch for ch in self._symbol.upper() if ch.isalnum())}"
+        try:
+            raw = await self._redis_client.execute("get", key)
+        except RedisUnavailableError:
+            return None
+        now = time.time()
+        if raw is None:
+            return None  # clé absente ou expirée (le tracker est arrêté ou coupé) : le niveau de CE cycle est inconnu, on ne ressert pas le dernier relevé comme s'il était frais
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            value = math.nan
+        if not (math.isfinite(value) and 0.0 <= value <= 1.0):
+            return None  # valeur illisible ou hors de [0, 1] : ignorée, jamais ajoutée à l'historique
+        self._vpin_history.append((now, value))
+        times = np.array([t for t, _ in self._vpin_history], dtype=np.float64)
+        values = np.array([v for _, v in self._vpin_history], dtype=np.float64)
+        derived = vpin_derivatives(np.array([now]), times, values, window_s=self._policy.vpin_window_s, max_age_s=_VPIN_MAX_AGE_S)[0]
+        return derived if bool(np.isfinite(derived).all()) else None
 
     async def _read_feature_vector(self) -> FeatureVector | None:
         """Read the traded symbol's latest :class:`~core.schemas.FeatureVector`, if any.

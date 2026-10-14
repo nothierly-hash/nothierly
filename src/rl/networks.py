@@ -25,6 +25,21 @@ import torch
 from torch import nn
 
 
+def masked_probabilities(probabilities: torch.Tensor, action_mask: torch.Tensor) -> torch.Tensor:
+    """Zero the forbidden actions' probabilities and renormalize.
+
+    The network's actor head ends in a Softmax: it outputs PROBABILITIES, not logits, so masking by writing ``-inf`` (the logit
+    convention) would be wrong here; the equivalent operation is to multiply by the mask and renormalize. If the policy put all its
+    mass on forbidden actions (the sum is ~0), the result is uniform over the ALLOWED actions rather than NaN: a mask never leaves
+    the agent without a legal move as long as at least one action is allowed.
+    """
+    allowed = action_mask.to(probabilities.dtype)
+    masked = probabilities * allowed
+    total = masked.sum(dim=-1, keepdim=True)
+    uniform_over_allowed = allowed / allowed.sum(dim=-1, keepdim=True).clamp_min(1.0)
+    return torch.where(total > 1e-12, masked / total.clamp_min(1e-12), uniform_over_allowed)
+
+
 class ActorCritic(nn.Module):
     """Shared-MLP-trunk Actor-Critic network for a 3-action discrete policy.
 
@@ -90,7 +105,7 @@ class ActorCritic(nn.Module):
 
     @torch.jit.unused
     def get_action_and_value(
-        self, observation: torch.Tensor, action: torch.Tensor | None = None
+        self, observation: torch.Tensor, action: torch.Tensor | None = None, action_mask: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Sample (or re-evaluate) an action under the current policy.
 
@@ -110,11 +125,17 @@ class ActorCritic(nn.Module):
             observation: Shape ``(batch, observation_dim)``.
             action: If given, shape ``(batch,)`` of actions to evaluate
                 instead of sampling fresh ones.
+            action_mask: If given, boolean tensor of shape ``(batch, action_dim)`` (or ``(action_dim,)``):
+                ``False`` = forbidden action. The policy's probabilities are zeroed on forbidden actions and
+                renormalized, for sampling AND for the log-probability and entropy used by the PPO update (so the gradient
+                is consistent with what was actually sampled). Never masks every action: see :func:`masked_probabilities`.
 
         Returns:
             ``(action, log_prob, entropy, value)``, each shape ``(batch,)``.
         """
         action_probabilities, state_value = self.forward(observation)
+        if action_mask is not None:
+            action_probabilities = masked_probabilities(action_probabilities, action_mask)
         distribution = torch.distributions.Categorical(action_probabilities)
 
         # torch.distributions.Categorical's methods are untyped in torch's
