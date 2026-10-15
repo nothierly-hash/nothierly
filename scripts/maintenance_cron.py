@@ -48,6 +48,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final
 
+# `python scripts/maintenance_cron.py` met scripts/ (pas la racine du projet) dans sys.path : sans cette ligne, `from workers.common.alerts`
+# (plus bas) lève ModuleNotFoundError dans le conteneur, dont le WORKDIR n'est pas sur le chemin d'import.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 _log = logging.getLogger("maintenance")
 
 ENV_DATA_DIR: Final[str] = "NOTHIERLY_DATA_DIR"  # même contrat que workers/common/paths.py

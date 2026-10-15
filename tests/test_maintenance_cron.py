@@ -289,3 +289,16 @@ def test_the_data_dir_follows_the_environment(tmp_path: Path, monkeypatch: pytes
     assert mc.data_dir() == tmp_path
     monkeypatch.delenv("NOTHIERLY_DATA_DIR")
     assert mc.data_dir() == Path("data/")
+
+
+def test_the_script_runs_as_a_standalone_file_outside_the_project_root(tmp_path: Path) -> None:
+    """Comme dans le conteneur : `python scripts/maintenance_cron.py` (sys.path[0] = scripts/, ni PYTHONPATH ni répertoire courant du projet)."""
+    import subprocess
+
+    script = Path(mc.__file__).resolve()
+    result = subprocess.run(
+        [sys.executable, "-I", str(script), "--once", "--dry-run", "--skip-timescale", "--startup-delay-s", "0", "--data-dir", str(tmp_path)],
+        cwd=tmp_path, capture_output=True, text=True, timeout=60, env={"WEBHOOK_URL": "", "SYSTEMROOT": __import__("os").environ.get("SYSTEMROOT", "")},
+    )
+    assert result.returncode == 0, result.stderr[-800:]
+    assert "ModuleNotFoundError" not in result.stderr
