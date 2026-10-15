@@ -56,6 +56,11 @@ COPY risk/ ./risk/
 COPY network/ ./network/
 COPY pricing/ ./pricing/
 COPY execution/ ./execution/
+# CI stage: tests import these top-level packages (contracts, crypto, ai_agents, nothierly_genesis); the runtime stage below only needs crypto.
+COPY crypto/ ./crypto/
+COPY contracts/ ./contracts/
+COPY ai_agents/ ./ai_agents/
+COPY nothierly_genesis/ ./nothierly_genesis/
 COPY research/alpha_features.py ./research/alpha_features.py
 COPY simulation/ ./simulation/
 COPY p2p_api.py sandbox.py nemdi.py p2p_oracle.py p2p_websocket.py \
@@ -127,6 +132,9 @@ COPY risk/ ./risk/
 COPY network/ ./network/
 COPY pricing/ ./pricing/
 COPY execution/ ./execution/
+# run_backend.py -> src/execution/shadow_crossing_engine.py imports crypto.zk_matching_engine at module load (py_ecc is in requirements.txt): without this COPY,
+# nothierly-agents crash-loops with ModuleNotFoundError: No module named 'crypto'.
+COPY crypto/ ./crypto/
 COPY research/alpha_features.py ./research/alpha_features.py
 # research/sample_data/ is NOT shipped (~973 MB of Tardis samples, and the single CSV once copied here was untracked, so a clean clone
 # could not even build). Consequence, deliberate: the dashboard's Tier 2 "Lancer une détection réelle" (risk/regime_detector.py's
