@@ -101,7 +101,10 @@ WORKDIR /app
 # requirements.txt re-resolution. PATH so every entrypoint below (`python`, `uvicorn`, `streamlit`)
 # resolves the console-script shims pip installed under this prefix.
 COPY --from=builder /root/.local /root/.local
-ENV PATH=/root/.local/bin:$PATH
+# PYTHONUSERBASE: packages were installed with `pip --user` as root (/root/.local) but the runtime user's HOME is /app, so Python's default
+# user-site would be /app/.local and `import zmq` fails with ModuleNotFoundError (same bug as Dockerfile.platform).
+ENV PATH=/root/.local/bin:$PATH \
+    PYTHONUSERBASE=/root/.local
 
 # This project's real runtime code lives across several top-level packages, not just `src/` --
 # verified directly against this repo's actual layout (a prior version of this image silently
