@@ -32,7 +32,10 @@ FROM python:3.12-slim AS platform-runtime
 WORKDIR /app
 
 COPY --from=builder /root/.local /root/.local
+# PYTHONUSERBASE: packages were installed with `pip --user` as root (/root/.local), but the runtime user's HOME is /app, so Python's default
+# user-site would be /app/.local and `import redis` fails with ModuleNotFoundError -- seen the first time this image actually ran.
 ENV PATH=/root/.local/bin:$PATH \
+    PYTHONUSERBASE=/root/.local \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
