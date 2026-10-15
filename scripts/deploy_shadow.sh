@@ -86,7 +86,7 @@ done
 log "docker compose config"
 "${DOCKER[@]}" compose "${COMPOSE_FILES[@]}" config -q || die "la configuration Compose est invalide (rien n'a été démarré)"
 log "maintenance à blanc (ne modifie rien)"
-"${DOCKER[@]}" compose "${COMPOSE_FILES[@]}" run --rm nothierly-maintenance python scripts/maintenance_cron.py --once --dry-run --skip-timescale \
+"${DOCKER[@]}" compose "${COMPOSE_FILES[@]}" run --rm --build nothierly-maintenance python scripts/maintenance_cron.py --once --dry-run --skip-timescale \
   || die "la maintenance à blanc a échoué (rien n'a été démarré)"
 
 if [ "$UP" -eq 0 ]; then
