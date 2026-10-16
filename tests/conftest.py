@@ -29,6 +29,11 @@ import zmq
 if not Path(".env").exists():
     for _required in ("BROKER_API_KEY", "BROKER_API_SECRET", "OANDA_API_TOKEN", "OANDA_ACCOUNT_ID", "VAULT_MASTER_KEY"):
         os.environ.setdefault(_required, "test-placeholder")
+    # With a broker configured, publishers CONNECT instead of binding ZMQ_PUB_ADDRESS (tcp://127.0.0.1:5555): several tests build two agents in one
+    # process, and without this the second one dies with "Address in use". A developer's .env sets these; a clean checkout has none. Nothing listens
+    # there -- connect() to a dead port is fine for ZMQ, the tests only need the sockets to exist.
+    os.environ.setdefault("ZMQ_BROKER_FRONTEND_ADDRESS", "tcp://127.0.0.1:55559")
+    os.environ.setdefault("ZMQ_BROKER_BACKEND_ADDRESS", "tcp://127.0.0.1:55560")
 
 
 @pytest.fixture(autouse=True, scope="session")

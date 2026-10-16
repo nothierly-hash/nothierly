@@ -219,15 +219,15 @@ init_typed = true
 warn_required_dynamic_aliases = true
 
 [tool.pytest.ini_options]
-# Real gap this closes, found stress-testing the red-team fixes in this same session: `pytest tests/`
-# with no timeout at all could hang indefinitely past its last real test result -- reproduced down to a
-# single file (tests/test_shadow_crossing_engine.py, pre-existing, unrelated to those fixes: every one
-# of its own tests passes, but the *process* doesn't exit afterward). The likely real cause is
-# core/zmq_bus.py's own module-level `asyncio.set_event_loop_policy(WindowsSelectorEventLoopPolicy())`
-# -- a process-wide side effect of merely importing it -- interacting with pytest-asyncio's default of a
-# fresh event loop per test on Windows; not fixed here (touching a policy every agent process also
-# depends on, on a hunch, is a worse risk than the hang itself). This bounds the blast radius instead:
-# a full `pytest tests/` can no longer silently block a terminal/CI run forever, regardless of which
-# test or interaction is the real root cause, known or not-yet-found.
+# Bounds any single test at 120s (thread method: dump every thread's stack, then hard-exit) so a wedged
+# test can't block a terminal/CI run forever. It does NOT cover the hang this comment used to blame on
+# core/zmq_bus.py's WindowsSelectorEventLoopPolicy -- that was a wrong hunch. Real root cause, found by
+# dumping all thread stacks mid-hang: a fixture builds a BaseAgent subclass (real ZMQ PUB/SUB sockets on
+# its own zmq.asyncio.Context) and never close()/term()s them. When the cyclic GC later collects that
+# agent, Context.__del__ -> destroy() -> term() blocks forever -- inside whichever test happens to trigger
+# the GC, or after the last test, so pytest never prints its summary (reproduced in ten lines with a
+# Context + open socket in a reference cycle). Every fixture/test that constructs an agent must close its
+# publisher/subscriber and term() its context in teardown; see tests/test_execution_agent_instrument_lock.py's
+# `agent` fixture for the template.
 timeout = 120
 timeout_method = "thread"
