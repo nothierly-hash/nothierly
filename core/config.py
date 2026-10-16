@@ -930,7 +930,7 @@ class TimescaleSettings(BaseSettings):
         :mod:`src.data_pipeline` module agree on the same URL by
         construction, never by convention.
         """
-        if self.database_url is not None:
+        if self.database_url:  # vide ("DATABASE_URL=" dans un .env) = non défini : sinon asyncpg reçoit un DSN vide et se rabat sur 127.0.0.1
             return self.database_url
         password_part = f":{self.password.get_secret_value()}" if self.password is not None else ""
         return f"postgresql://{self.user}{password_part}@{self.host}:{self.port}/{self.database}"

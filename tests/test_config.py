@@ -51,3 +51,18 @@ def test_staging_never_requires_redis_auth() -> None:
     auth wired up yet, and this validator must not block it."""
     settings = AppSettings(environment=Environment.STAGING, redis=RedisSettings(password=None, use_tls=False))
     assert settings.environment == Environment.STAGING
+
+
+def test_an_empty_database_url_falls_back_to_the_individual_timescale_fields(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`DATABASE_URL=` (vide, comme dans .env.example) ne doit pas écraser TIMESCALE_HOST : sinon asyncpg reçoit un DSN vide et se rabat sur 127.0.0.1."""
+    from core.config import TimescaleSettings
+
+    monkeypatch.setenv("DATABASE_URL", "")
+    monkeypatch.setenv("TIMESCALE_HOST", "timescaledb")
+    monkeypatch.setenv("TIMESCALE_USER", "u")
+    monkeypatch.setenv("TIMESCALE_PASSWORD", "p")
+    monkeypatch.setenv("TIMESCALE_DATABASE", "d")
+    settings = TimescaleSettings(_env_file=None)
+    assert settings.connection_url == "postgresql://u:p@timescaledb:5432/d"
+    monkeypatch.setenv("DATABASE_URL", "postgresql://x:y@elsewhere:5432/z")
+    assert TimescaleSettings(_env_file=None).connection_url == "postgresql://x:y@elsewhere:5432/z"
