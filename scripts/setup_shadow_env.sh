@@ -8,7 +8,8 @@
 #   bash scripts/setup_shadow_env.sh --force      recrée tout (régénère les mots de passe : casse l'accès à une base DÉJÀ initialisée)
 #
 # Valeurs renseignées : CLIENT_ID, MOCK_MODE=true, REDIS_PASSWORD, DB_PASSWORD (+ TIMESCALE_PASSWORD identique), NOTHIERLY_ZMQ_SECRET,
-# VAULT_MASTER_KEY (aléatoire), et des VALEURS BIDON non secrètes pour BROKER_API_KEY/SECRET, OANDA_API_TOKEN/ACCOUNT_ID : le moteur refuse de
+# VAULT_MASTER_KEY et DASHBOARD_PASSWORD (aléatoires ; DASHBOARD_USER=admin : le tableau de bord en crée le compte administrateur au premier
+# démarrage),  et des VALEURS BIDON non secrètes pour BROKER_API_KEY/SECRET, OANDA_API_TOKEN/ACCOUNT_ID : le moteur refuse de
 # démarrer sans elles (core/config.py, « required, no default ») alors qu'avec MOCK_MODE=true il n'appelle aucun broker. Aucune vraie clé
 # d'exchange n'est écrite ici. N'affiche JAMAIS un secret.
 
@@ -63,6 +64,7 @@ redis_password="$(gen)"
 db_password="$(gen)"
 zmq_secret="$(gen)"
 vault_key="$(gen)"
+dashboard_password="$(gen)"
 
 if [ "$MODE" != complete ]; then
   rm -f .env platform.env reporter.env
@@ -79,11 +81,13 @@ fillk .env DB_PASSWORD "$db_password"
 fillk .env TIMESCALE_PASSWORD "$(grep -E '^DB_PASSWORD=' .env | cut -d= -f2-)"
 fillk platform.env NOTHIERLY_ZMQ_SECRET "$zmq_secret"
 fillk .env VAULT_MASTER_KEY "$vault_key"
+fillk .env DASHBOARD_USER admin
+fillk .env DASHBOARD_PASSWORD "$dashboard_password"
 fillk .env BROKER_API_KEY "$PLACEHOLDER"
 fillk .env BROKER_API_SECRET "$PLACEHOLDER"
 fillk .env OANDA_API_TOKEN "$PLACEHOLDER"
 fillk .env OANDA_ACCOUNT_ID "$PLACEHOLDER"
 
 echo "[setup] mode=$MODE, droits 600. Valeurs renseignées :"
-grep -E "^(CLIENT_ID|MOCK_MODE|DB_USER|REDIS_PASSWORD|DB_PASSWORD|TIMESCALE_PASSWORD|VAULT_MASTER_KEY|BROKER_API_KEY|BROKER_API_SECRET|OANDA_API_TOKEN|OANDA_ACCOUNT_ID)=" .env | sed -E 's/=.+/=<rempli>/'
+grep -E "^(CLIENT_ID|MOCK_MODE|DB_USER|REDIS_PASSWORD|DB_PASSWORD|TIMESCALE_PASSWORD|VAULT_MASTER_KEY|BROKER_API_KEY|BROKER_API_SECRET|OANDA_API_TOKEN|OANDA_ACCOUNT_ID|DASHBOARD_USER|DASHBOARD_PASSWORD)=" .env | sed -E 's/=.+/=<rempli>/'
 grep -E "^NOTHIERLY_ZMQ_SECRET=" platform.env | sed -E 's/=.+/=<rempli>/'
