@@ -36,6 +36,7 @@ from tests.test_metalabel_pipeline import agent_factory  # noqa: F401 -- fixture
 from workers.market_data.vpin import VolumeBucketVpin
 from workers.market_data.vpin_tracker import (
     BinanceAggTradeFeed,
+    BybitPublicTradeFeed,
     HyperliquidTradesFeed,
     RedisVpinSink,
     VpinTracker,
@@ -192,6 +193,70 @@ def test_hyperliquid_subscribes_to_each_coin_and_pings() -> None:
     asyncio.run(feed.handshake(rec))  # type: ignore[arg-type]  # le faux ne fournit que send(), seule méthode appelée par le handshake
     assert [json.loads(m)["subscription"] for m in rec.sent] == [{"type": "trades", "coin": "BTC"}, {"type": "trades", "coin": "ETH"}]
     assert json.loads(feed.heartbeat_message() or "{}") == {"method": "ping"}
+
+
+# --- Bybit (forme du message : documentation v5, « publicTrade » ; non vérifié contre le vrai serveur) ---------------------------------------
+
+
+BYBIT_TRADE: dict[str, Any] = {
+    "T": 1672304486865, "s": "BTCUSDT", "S": "Buy", "v": "0.001", "p": "16578.50", "L": "PlusTick", "i": "20f43950-d8dd-5b31-9112-a178eb6023af",
+    "BT": False, "seq": 1783284617,
+}
+
+
+def _by(*trades: dict[str, Any]) -> str:
+    return json.dumps({"topic": "publicTrade.BTCUSDT", "type": "snapshot", "ts": 1672304486868, "data": list(trades)})
+
+
+def test_bybit_trades_are_parsed_with_the_taker_side_and_no_trade_id() -> None:
+    feed = BybitPublicTradeFeed(["BTCUSDT", "ETHUSDT"], "testnet")
+    buy, sell = feed.parse(_by(BYBIT_TRADE, {**BYBIT_TRADE, "S": "Sell", "s": "ETHUSDT", "T": 1672304486900}))
+    assert (buy.symbol, buy.is_buy, buy.price, buy.qty, buy.time_ms, buy.trade_id) == ("BTCUSDT", True, D("16578.50"), D("0.001"), 1672304486865, None)
+    assert (sell.symbol, sell.is_buy) == ("ETHUSDT", False)  # S = côté du PRENEUR : Sell = il a vendu
+
+
+def test_a_bybit_suffix_keeps_its_symbols_apart_from_binance_but_subscribes_to_the_real_ones() -> None:
+    feed = BybitPublicTradeFeed(["BTCUSDT"], suffix="BYBIT")
+    (trade,) = feed.parse(_by(BYBIT_TRADE))
+    assert trade.symbol == "BTCUSDTBYBIT"
+    sent: list[str] = []
+
+    class Recorder:
+        async def send(self, text: str) -> None:
+            sent.append(text)
+
+    asyncio.run(feed.handshake(Recorder()))  # type: ignore[arg-type]
+    assert json.loads(sent[0])["args"] == ["publicTrade.BTCUSDT"]  # l'abonnement garde le vrai nom Bybit
+
+
+def test_bybit_ignores_acks_pongs_untracked_symbols_and_block_trades_but_rejects_garbage() -> None:
+    feed = BybitPublicTradeFeed(["BTCUSDT"])
+    assert feed.parse(json.dumps({"success": True, "ret_msg": "pong", "conn_id": "x", "req_id": "", "op": "ping"})) == []
+    assert feed.parse(json.dumps({"success": True, "ret_msg": "", "conn_id": "x", "req_id": "", "op": "subscribe"})) == []
+    assert feed.parse(_by({**BYBIT_TRADE, "s": "DOGEUSDT"})) == []   # symbole non suivi
+    assert feed.parse(_by({**BYBIT_TRADE, "BT": True})) == []         # trade de bloc : hors flux continu
+    with pytest.raises(ValueError):
+        feed.parse(_by({**BYBIT_TRADE, "S": "?"}))
+    with pytest.raises(ValueError):
+        feed.parse(_by({**BYBIT_TRADE, "p": "abc"}))
+    assert BybitPublicTradeFeed(["BTCUSDT"], "mainnet").url == "wss://stream.bybit.com/v5/public/linear"
+    assert BybitPublicTradeFeed(["BTCUSDT"], "testnet").url == "wss://stream-testnet.bybit.com/v5/public/linear"
+    assert BybitPublicTradeFeed(["BTCUSDT"], url="ws://127.0.0.1:1/x").url == "ws://127.0.0.1:1/x"
+
+
+def test_bybit_subscribes_in_one_message_and_pings_every_twenty_seconds() -> None:
+    class Recorder:
+        def __init__(self) -> None:
+            self.sent: list[str] = []
+
+        async def send(self, text: str) -> None:
+            self.sent.append(text)
+
+    feed = BybitPublicTradeFeed(["BTCUSDT", "ETHUSDT"])
+    rec = Recorder()
+    asyncio.run(feed.handshake(rec))  # type: ignore[arg-type]  # le faux ne fournit que send(), seule méthode appelée par le handshake
+    assert [json.loads(m) for m in rec.sent] == [{"op": "subscribe", "args": ["publicTrade.BTCUSDT", "publicTrade.ETHUSDT"]}]
+    assert json.loads(feed.heartbeat_message() or "{}") == {"op": "ping"} and feed.heartbeat_interval_s == 20.0
 
 
 # --- Démon sur faux flux ---------------------------------------------------------------------
@@ -447,6 +512,14 @@ def test_the_command_line_builds_the_documented_defaults(monkeypatch: pytest.Mon
     assert (calc.bucket_size, calc.window_size) == (D(100_000), 50)  # VOLUME_BUCKET_SIZE et WINDOW_SIZE par défaut
     custom = _run_cli(monkeypatch, "--dry-run", "--source", "hyperliquid", "--symbols", "btcusdt", "--bucket-size", "5000", "--window", "20")
     assert isinstance(custom["feed"], HyperliquidTradesFeed) and custom["calcs"]["BTCUSDT"].window_size == 20 and custom["calcs"]["BTCUSDT"].bucket_size == D(5000)
+    bybit = _run_cli(monkeypatch, "--dry-run", "--source", "bybit", "--network", "testnet")
+    assert isinstance(bybit["feed"], BybitPublicTradeFeed) and bybit["feed"].url == "wss://stream-testnet.bybit.com/v5/public/linear"
+    suffixed = _run_cli(monkeypatch, "--dry-run", "--source", "bybit", "--symbol-suffix", "bybit")
+    assert sorted(suffixed["calcs"]) == ["BTCUSDTBYBIT", "ETHUSDTBYBIT"]  # clés distinctes de celles de Binance : aucun écrasement
+    with pytest.raises(SystemExit):
+        vt.main(["--dry-run", "--source", "binance", "--symbol-suffix", "BYBIT"])
+    with pytest.raises(SystemExit):
+        vt.main(["--dry-run", "--source", "bybit", "--symbol-suffix", "A" * 20])
 
 
 def test_the_command_line_writes_to_redis_unless_dry_run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

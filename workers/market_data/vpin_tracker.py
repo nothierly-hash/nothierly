@@ -15,6 +15,11 @@ l'architecture, pour que le moteur lui-même n'ait aucune sortie internet.
 - ``hyperliquid`` : abonnement ``trades`` par pièce. La doc ne définit pas ``side`` ; on lit ``B`` = achat, ``A`` = vente. Sans effet sur
   le VPIN (voir ``vpin.py`` : seul ``|achat - vente|`` compte), mais à ne pas réutiliser ailleurs sans l'avoir vérifié.
 
+- ``bybit`` : ``publicTrade.<symbole>`` du flux public ``v5/public/linear`` (perpétuels USDT). ``S`` = côté du PRENEUR (``Buy`` = il a acheté). Les
+  trades de bloc (``BT`` vrai) sont ignorés : hors carnet, ils ne reflètent pas le flux du marché continu. L'identifiant ``i`` est un UUID (pas un
+  entier croissant) et ``seq`` n'est pas unique : ces trades n'ont donc pas d'identifiant (``trade_id=None``) et ne sont pas dédoublonnés par le démon.
+  Ping applicatif toutes les 20 s (``{"op": "ping"}``), comme le préconise la documentation.
+
 Ne pas lancer les deux sources pour le même symbole : elles écriraient la même clé avec des flux différents.
 
 **Clé et fraîcheur.** La valeur est écrite avec une durée de vie (``--ttl-s``, 120 s) à chaque seau fermé et ré-écrite toutes
@@ -72,6 +77,9 @@ _log = logging.getLogger(__name__)
 KEY_PREFIX: Final[str] = "market:vpin:"
 BINANCE_MARKET_WS: Final[str] = "wss://fstream.binance.com"
 HYPERLIQUID_WS: Final[Mapping[str, str]] = {"mainnet": "wss://api.hyperliquid.xyz/ws", "testnet": "wss://api.hyperliquid-testnet.xyz/ws"}
+BYBIT_WS: Final[Mapping[str, str]] = {
+    "mainnet": "wss://stream.bybit.com/v5/public/linear", "testnet": "wss://stream-testnet.bybit.com/v5/public/linear",
+}
 _SYMBOL_RE: Final[re.Pattern[str]] = re.compile(r"^[A-Z0-9]{3,20}$")
 
 
@@ -167,6 +175,39 @@ class HyperliquidTradesFeed:
             if side not in ("A", "B"):
                 raise ValueError(f"côté de trade inconnu : {side[:10]!r}")
             trades.append(Trade(symbol, _number(item["px"]), _number(item["sz"]), side == "B", int(item["time"]), int(item["tid"])))
+        return trades
+
+
+class BybitPublicTradeFeed:
+    """``publicTrade.<symbole>`` sur le flux public linéaire de Bybit ; les symboles sont ceux de Bybit (``BTCUSDT``), comme les clés Redis."""
+
+    heartbeat_interval_s = 20.0
+
+    def __init__(self, symbols: Sequence[str], network: str = "mainnet", url: str | None = None, suffix: str = "") -> None:
+        """``suffix`` s'ajoute au symbole des trades émis (clé Redis et archive) : sans lui, ``BTCUSDT`` de Bybit écraserait celui de Binance."""
+        self.url = url or BYBIT_WS[network]
+        self._symbols = list(symbols)
+        self._suffix = suffix
+
+    async def handshake(self, conn: WsConnection) -> None:
+        await conn.send(json.dumps({"op": "subscribe", "args": [f"publicTrade.{symbol}" for symbol in self._symbols]}))
+
+    def heartbeat_message(self) -> str | None:
+        return json.dumps({"op": "ping"})
+
+    def parse(self, raw: str) -> list[Trade]:
+        message = json.loads(raw)
+        if not isinstance(message, dict) or not str(message.get("topic", "")).startswith("publicTrade."):
+            return []  # accusé d'abonnement, pong
+        trades = []
+        for item in message.get("data", []):
+            symbol = str(item["s"]).upper()
+            if symbol not in self._symbols or item.get("BT"):
+                continue  # symbole non suivi, ou trade de bloc
+            side = str(item["S"])
+            if side not in ("Buy", "Sell"):
+                raise ValueError(f"côté de trade inconnu : {side[:10]!r}")
+            trades.append(Trade(symbol + self._suffix, _number(item["p"]), _number(item["v"]), side == "Buy", int(item["T"]), None))
         return trades
 
 
@@ -445,12 +486,13 @@ class VpinTracker:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="VPIN en temps réel à partir des trades publics, écrit dans Redis (market:vpin:<SYMBOLE>).")
-    parser.add_argument("--source", choices=["binance", "hyperliquid"], default="binance")
+    parser.add_argument("--source", choices=["binance", "hyperliquid", "bybit"], default="binance")
     parser.add_argument("--symbols", nargs="+", default=["BTCUSDT", "ETHUSDT"], help="noms de clé Redis, ex. BTCUSDT (Hyperliquid : BTCUSDT -> pièce BTC)")
     parser.add_argument("--bucket-size", type=Decimal, default=Decimal(100_000), help="notionnel d'un seau (VOLUME_BUCKET_SIZE)")
     parser.add_argument("--window", type=int, default=50, help="nombre de seaux de la moyenne glissante (WINDOW_SIZE)")
-    parser.add_argument("--network", choices=["mainnet", "testnet"], default="mainnet", help="Hyperliquid seulement")
-    parser.add_argument("--ws-base-url", default=None, help="adresse WebSocket (Binance : base, sans /market ; Hyperliquid : adresse complète)")
+    parser.add_argument("--network", choices=["mainnet", "testnet"], default="mainnet", help="Hyperliquid et Bybit seulement")
+    parser.add_argument("--ws-base-url", default=None, help="adresse WebSocket (Binance : base, sans /market ; Hyperliquid et Bybit : adresse complète)")
+    parser.add_argument("--symbol-suffix", default="", help="Bybit seulement : suffixe ajouté au symbole de la clé Redis et de l'archive (ex. BYBIT -> BTCUSDTBYBIT), pour ne pas écraser Binance")
     parser.add_argument("--ttl-s", type=float, default=120.0, help="durée de vie de la clé Redis")
     parser.add_argument("--refresh-s", type=float, default=30.0, help="ré-écriture de la dernière valeur tant que la connexion vit")
     parser.add_argument("--max-gap-s", type=float, default=30.0, help="coupure au-delà de laquelle la fenêtre est remise à zéro")
@@ -468,10 +510,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--ttl-s doit être strictement supérieur à --refresh-s (sinon la clé expire entre deux ré-écritures)")
     if args.stale_after_s < 0:
         parser.error("--stale-after-s doit être >= 0")
+    suffix = args.symbol_suffix.upper()
+    if suffix and args.source != "bybit":
+        parser.error("--symbol-suffix ne s'applique qu'à --source bybit")
     symbols = [s.upper() for s in args.symbols]
     bad = [s for s in symbols if not _SYMBOL_RE.match(s)]
     if bad:
         parser.error(f"symbole invalide : {bad[0]!r}")
+    tracked = [s + suffix for s in symbols]  # noms de clé Redis / d'archive : avec le suffixe pour Bybit
+    bad = [s for s in tracked if not _SYMBOL_RE.match(s)]
+    if bad:
+        parser.error(f"symbole invalide : {bad[0]!r} (suffixe trop long ou non alphanumérique)")
     try:
         alerter = WebhookAlerter.from_env(source="vpin-tracker")
     except AlertConfigError as exc:
@@ -480,13 +529,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     feed: TradeFeed
     if args.source == "binance":
         feed = BinanceAggTradeFeed(symbols, args.ws_base_url or BINANCE_MARKET_WS)
+    elif args.source == "bybit":
+        feed = BybitPublicTradeFeed(symbols, args.network, args.ws_base_url, suffix)
     else:
         feed = HyperliquidTradesFeed(symbols, args.network, args.ws_base_url)
     sink: VpinSink = LogOnlySink() if args.dry_run else RedisVpinSink(
         host=os.environ.get("REDIS_HOST", "127.0.0.1"), port=int(os.environ.get("REDIS_PORT", "6379")),
         password=os.environ.get("REDIS_PASSWORD") or None, db=int(os.environ.get("REDIS_DB", "0")),
     )
-    calculators = {s: VolumeBucketVpin(args.bucket_size, args.window) for s in symbols}
+    calculators = {s: VolumeBucketVpin(args.bucket_size, args.window) for s in tracked}
     archive: VpinArchive | None = None
     if not args.dry_run and not args.no_archive:
         try:
@@ -495,7 +546,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             parser.error(f"archive VPIN inutilisable ({type(exc).__name__}: {exc}) ; corriger NOTHIERLY_DATA_DIR / --archive-db, ou --no-archive")
     tracker = VpinTracker(feed, calculators, sink, ttl_s=args.ttl_s, refresh_s=args.refresh_s, max_gap_s=args.max_gap_s, alerter=alerter, archive=archive, stale_after_s=args.stale_after_s)
     _log.info(
-        "vpin_tracker_start source=%s symbols=%s bucket=%s window=%d mode=%s archive=%s", args.source, symbols, args.bucket_size, args.window,
+        "vpin_tracker_start source=%s symbols=%s bucket=%s window=%d mode=%s archive=%s", args.source, tracked, args.bucket_size, args.window,
         "DRY-RUN" if args.dry_run else "REDIS", "off" if archive is None else archive.path,
     )
 
