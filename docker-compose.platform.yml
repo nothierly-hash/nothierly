@@ -175,6 +175,36 @@ services:
       redis-broker:
         condition: service_healthy
 
+  # Même démon sur le flux PUBLIC d'Hyperliquid (aucune clé). Symboles = noms de pièces Hyperliquid (BTC, ETH) : la clé Redis (market:vpin:BTC) et la
+  # colonne `symbol` de l'archive diffèrent de celles de Binance (BTCUSDT), donc aucun conflit avec le tracker ci-dessus. Flux non vérifié contre le
+  # vrai serveur (voir le docstring de workers/market_data/vpin_tracker.py) : lire ses logs au premier démarrage.
+  nothierly-vpin-tracker-hyperliquid:
+    <<: *platform-hardening
+    build: *platform-build
+    image: nothierly-platform:local
+    container_name: nothierly-${CLIENT_ID:?Set CLIENT_ID}-vpin-tracker-hl
+    command:
+      - python
+      - -m
+      - workers.market_data.vpin_tracker
+      - --source
+      - hyperliquid
+      - --symbols
+      - BTC
+      - ETH
+      - --bucket-size
+      - "100000"
+      - --window
+      - "50"
+    environment:
+      REDIS_HOST: redis-broker
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD}
+      WEBHOOK_URL: ${WEBHOOK_URL:-}
+    depends_on:
+      redis-broker:
+        condition: service_healthy
+
   # Réconciliation d'état (src/agents/execution/reconciliation.py) : publie les positions RÉELLES de chaque plateforme dans Redis (exchange:positions:<PLATEFORME>)
   # pour que le moteur les ADOPTE au redémarrage au lieu de repartir à plat (ce qui ferait fermer toutes les positions au marché). N'a AUCUN droit de trading :
   # Hyperliquid n'exige aucune clé (adresse publique) ; Bybit/Binance : clés *_READONLY_* créées SANS droit de trading ni de retrait (voir reporter.env.example).
