@@ -16,11 +16,19 @@ a rate-limit test never depends on where in the real second it happens to run.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 
 import pytest
 import zmq
+
+# core.config refuses to load without these ("required, no default"), and several test modules call get_settings() while being collected. A
+# machine with a .env supplies them; a clean checkout (CI image) has none, so give them test-only placeholders there. Never overrides a real value.
+if not Path(".env").exists():
+    for _required in ("BROKER_API_KEY", "BROKER_API_SECRET", "OANDA_API_TOKEN", "OANDA_ACCOUNT_ID", "VAULT_MASTER_KEY"):
+        os.environ.setdefault(_required, "test-placeholder")
 
 
 @pytest.fixture(autouse=True, scope="session")

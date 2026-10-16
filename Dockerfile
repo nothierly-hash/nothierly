@@ -56,14 +56,17 @@ COPY risk/ ./risk/
 COPY network/ ./network/
 COPY pricing/ ./pricing/
 COPY execution/ ./execution/
-# CI stage: tests import these top-level packages (contracts, crypto, ai_agents, nothierly_genesis); the runtime stage below only needs crypto.
+# CI stage: tests import these top-level packages (contracts, crypto, ai_agents, nothierly_genesis, workers, ai_core, hypervisor, market_discovery.py); the runtime stage below only needs crypto.
 COPY crypto/ ./crypto/
 COPY contracts/ ./contracts/
 COPY ai_agents/ ./ai_agents/
 COPY nothierly_genesis/ ./nothierly_genesis/
+COPY workers/ ./workers/
+COPY ai_core/ ./ai_core/
+COPY hypervisor/ ./hypervisor/
 COPY research/alpha_features.py ./research/alpha_features.py
 COPY simulation/ ./simulation/
-COPY p2p_api.py sandbox.py nemdi.py p2p_oracle.py p2p_websocket.py \
+COPY p2p_api.py sandbox.py nemdi.py p2p_oracle.py p2p_websocket.py market_discovery.py \
      political_agent.py scout_agent.py analyst_agent.py risk_gate_agent.py \
      pyproject.toml ./
 COPY tests/ ./tests/
