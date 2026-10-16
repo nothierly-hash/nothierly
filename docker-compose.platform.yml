@@ -205,6 +205,38 @@ services:
       redis-broker:
         condition: service_healthy
 
+  # Même démon sur le flux PUBLIC linéaire de Bybit (perpétuels USDT, mainnet : lecture publique, aucune clé). --symbol-suffix BYBIT : sans lui, BTCUSDT de
+  # Bybit écraserait celui de Binance (même clé Redis market:vpin:BTCUSDT, même colonne `symbol` de l'archive) ; ici : market:vpin:BTCUSDTBYBIT.
+  # Flux non vérifié contre le vrai serveur (le format vient de la documentation Bybit v5) : lire ses logs au premier démarrage.
+  nothierly-vpin-tracker-bybit:
+    <<: *platform-hardening
+    build: *platform-build
+    image: nothierly-platform:local
+    container_name: nothierly-${CLIENT_ID:?Set CLIENT_ID}-vpin-tracker-bybit
+    command:
+      - python
+      - -m
+      - workers.market_data.vpin_tracker
+      - --source
+      - bybit
+      - --symbols
+      - BTCUSDT
+      - ETHUSDT
+      - --symbol-suffix
+      - BYBIT
+      - --bucket-size
+      - "100000"
+      - --window
+      - "50"
+    environment:
+      REDIS_HOST: redis-broker
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD}
+      WEBHOOK_URL: ${WEBHOOK_URL:-}
+    depends_on:
+      redis-broker:
+        condition: service_healthy
+
   # Réconciliation d'état (src/agents/execution/reconciliation.py) : publie les positions RÉELLES de chaque plateforme dans Redis (exchange:positions:<PLATEFORME>)
   # pour que le moteur les ADOPTE au redémarrage au lieu de repartir à plat (ce qui ferait fermer toutes les positions au marché). N'a AUCUN droit de trading :
   # Hyperliquid n'exige aucune clé (adresse publique) ; Bybit/Binance : clés *_READONLY_* créées SANS droit de trading ni de retrait (voir reporter.env.example).

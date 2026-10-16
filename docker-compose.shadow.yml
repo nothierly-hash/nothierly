@@ -63,6 +63,10 @@ services:
   nothierly-vpin-tracker-hyperliquid:
     <<: *shadow-worker-storage
 
+  # Idem pour Bybit (symboles BTCUSDTBYBIT / ETHUSDTBYBIT dans la même archive).
+  nothierly-vpin-tracker-bybit:
+    <<: *shadow-worker-storage
+
   # Maintenance (scripts/maintenance_cron.py) : purge des SQLite par lots + VACUUM conditionnel + rétention/compression de TimescaleDB, toutes les 24 h.
   # Sans elle, rien ne borne la croissance : aucun autre service ne purge (les workers ne purgent qu'à leur démarrage). Rétentions par défaut :
   # VPIN 180 j, bus_messages 120 j (compressé après 7 j) ; l'entraînement lit 30 j. Premier réglage à valider sur le serveur :
