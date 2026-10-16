@@ -24,3 +24,7 @@ fakeredis==2.37.1
 # see Dockerfile's own disclosed constraint). First real CI run should treat
 # this as unverified until it goes green once.
 pytest-cov==5.0.0
+
+# tests/test_data_lake_sync.py runs an in-process S3 server (moto.server.ThreadedMotoServer) against the real boto3 code path; the [server] extra
+# brings flask/flask-cors. Pinned to the version installed in the local dev venv where those tests pass.
+moto[server]==5.2.3
