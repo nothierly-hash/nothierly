@@ -1,0 +1,278 @@
+"""Worker Hyperliquid : amène la position réelle vers l'exposition cible des ``PlatformSignal`` signés.
+
+La réception signée, la file « dernier signal par actif », le coupe-circuit de drawdown et la boucle ZMQ
+sont dans ``workers.common.base`` (voir ses choix de conception). Ce module ne contient que ce qui est propre
+à Hyperliquid : traduction des symboles, lecture du compte, planification (``planner``) et envoi de l'ordre.
+
+Sûr par défaut : dry-run et testnet, sauf demande explicite. Le mainnet exige ``--live`` ET
+``--network mainnet`` ET ``--i-understand-real-funds``.
+
+Ce worker n'a jamais été exécuté contre Hyperliquid (ni testnet ni mainnet) : voir ``client``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import hashlib
+import logging
+import os
+import time
+from collections.abc import Sequence
+from dataclasses import dataclass
+from decimal import Decimal
+from pathlib import Path
+from typing import ClassVar
+
+from contracts.curve_transport import CurveClientConfig, CurveConfigError, transport_refusal
+from contracts.platform_signal import PlatformSignal, TargetVenue
+from contracts.secure_signal_bus import load_secret_from_env
+from workers.common.paths import default_db_path, ensure_parent
+from workers.common.ratelimit import RateLimitError
+from workers.common.alerts import AlertConfigError, WebhookAlerter
+from workers.common.base import (
+    DEFAULT_MAX_AGE_MS,
+    RATE_LIMITED,
+    EmergencyOrder,
+    ExposureWorkerBase,
+    ExposureWorkerConfig,
+    clear_execution_halt,
+    dead_man_timeout_problem,
+)
+from workers.common.exposure import emergency_slippage_bps
+from workers.common.fills_db import FillsDatabase
+from workers.common.logging_setup import configure_logging
+from workers.common.ws_tracker import FillTracker, HyperliquidFillFeed
+from workers.hyperliquid.client import AccountSnapshot, HyperliquidClient, Network, OrderRequest, SdkHyperliquidClient
+from workers.hyperliquid.planner import ZERO, OrderPlan, hl_asset, plan_order, round_price, size_for_pct
+from workers.hyperliquid.state import HlState
+
+_log = logging.getLogger(__name__)
+
+__all__ = ["DEFAULT_MAX_AGE_MS", "HyperliquidWorker", "HyperliquidWorkerConfig", "main"]
+
+
+@dataclass(frozen=True)
+class HyperliquidWorkerConfig(ExposureWorkerConfig):
+    db_path: str | Path = "hyperliquid_worker.sqlite3"
+
+
+class HyperliquidWorker(ExposureWorkerBase):
+    venue: ClassVar[TargetVenue] = TargetVenue.HYPERLIQUID
+    _tag: ClassVar[str] = "hl"
+    supports_dead_man: ClassVar[bool] = True
+
+    def __init__(self, config: HyperliquidWorkerConfig, client: HyperliquidClient, state: HlState | None = None) -> None:
+        super().__init__(config, state)
+        self._client = client
+
+    def map_symbol(self, symbol: str) -> str | None:
+        return hl_asset(symbol, self._cfg.symbol_overrides)
+
+    async def _calculate_order_size(
+        self, asset: str, pct: float, *, snapshot: AccountSnapshot | None = None, mid: Decimal | None = None
+    ) -> Decimal:
+        """Taille absolue (unités de ``asset``) correspondant à ``pct`` % de l'equity, arrondie vers zéro à ``szDecimals``.
+
+        Interroge le compte et le prix si ``snapshot``/``mid`` ne sont pas fournis. Lève ``KeyError`` pour un actif inconnu.
+        """
+        decimals = (await asyncio.to_thread(self._client.asset_decimals))[asset]
+        if snapshot is None:
+            snapshot = await asyncio.to_thread(self._client.snapshot)
+        if mid is None:
+            mid = (await asyncio.to_thread(self._client.mids))[asset]
+        return size_for_pct(snapshot.equity, mid, Decimal(str(pct)), decimals)
+
+    async def execute_signal(self, signal: PlatformSignal, asset: str, *, now_ms: int | None = None) -> str:
+        """Lit le compte, planifie et (hors dry-run) envoie l'ordre. Renvoie un code court, toujours journalisé."""
+        now = int(time.time() * 1000) if now_ms is None else now_ms
+        if signal.is_expired(now) or now - signal.timestamp_ms > self._cfg.max_age_ms:
+            self._record(signal, asset, "stale_at_execution", now, None, "")
+            return "stale_at_execution"
+        try:
+            decimals_map = await asyncio.to_thread(self._client.asset_decimals)
+            if asset not in decimals_map:
+                self._record(signal, asset, "unknown_asset", now, None, "")
+                return "unknown_asset"
+            snapshot, mids = await asyncio.gather(
+                asyncio.to_thread(self._client.snapshot), asyncio.to_thread(self._client.mids)
+            )
+        except RateLimitError as exc:  # limite de débit : rien n'est envoyé, le worker attend la fin de la pause (ratelimit.py)
+            self._record(signal, asset, RATE_LIMITED, now, None, f"status={exc.status} pause={exc.retry_after_s:.0f}s")
+            return RATE_LIMITED
+        except Exception as exc:  # noqa: BLE001 -- lecture réseau : on n'ordonne pas à l'aveugle
+            _log.exception("hl_read_failed")
+            self._record(signal, asset, "read_error", now, None, repr(exc)[:200])
+            return "read_error"
+        mid = mids.get(asset)
+        if mid is None:
+            self._record(signal, asset, "no_price", now, None, "")
+            return "no_price"
+
+        halted = self._update_halt(snapshot.equity, now)
+        target_abs = await self._calculate_order_size(asset, signal.position_size_pct, snapshot=snapshot, mid=mid)
+        others = sum(
+            (abs(size) * mids.get(coin, ZERO) for coin, size in snapshot.positions.items() if coin != asset), ZERO
+        )
+        plan = plan_order(
+            signal,
+            asset=asset,
+            target_abs_size=target_abs,
+            equity=snapshot.equity,
+            position=snapshot.positions.get(asset, ZERO),
+            mid=mid,
+            sz_decimals=decimals_map[asset],
+            others_notional=others,
+            limits=self._cfg.limits,
+            halted=halted,
+        )
+        if not isinstance(plan, OrderPlan):
+            self._record(signal, asset, f"skipped:{plan.reason}", now, None, "")
+            return plan.reason
+        if self._cfg.dry_run:
+            self._record(signal, asset, "dry_run", now, plan, "")
+            _log.info("hl_dry_run %s %s sz=%s px=%s reduce_only=%s", asset, "BUY" if plan.is_buy else "SELL", plan.size, plan.limit_px, plan.reduce_only)
+            return "dry_run"
+        request = OrderRequest(plan.asset, plan.is_buy, plan.size, plan.limit_px, plan.tif, plan.reduce_only, plan.cloid)
+        self._intent_before_send(plan.cloid, asset, plan.is_buy, mid, plan.size)
+        try:
+            outcome = await asyncio.to_thread(self._client.place_order, request)
+        except RateLimitError as exc:  # refusé avant traitement (429/418) : l'ordre n'existe pas, il sera renvoyé après la pause
+            self._record(signal, asset, RATE_LIMITED, now, plan, f"status={exc.status} pause={exc.retry_after_s:.0f}s")
+            return RATE_LIMITED
+        except Exception as exc:  # noqa: BLE001 -- ambigu : pas de nouvel essai, le prochain signal relit la position
+            _log.exception("hl_place_order_failed")
+            self._record(signal, asset, "error", now, plan, repr(exc)[:200])
+            return "error"
+        self._intent_order_id(plan.cloid, outcome.oid)
+        self._record(signal, asset, outcome.status, now, plan, outcome.detail or f"oid={outcome.oid} filled={outcome.filled_size}")
+        return outcome.status
+
+    async def emergency_flatten(self, asset: str, *, attempt: int, now_ms: int) -> str:
+        """Ferme la position de ``asset`` : ordre ``reduce_only`` IOC, prix à ``mid`` +/- un écart qui double à chaque tentative."""
+        try:
+            decimals_map = await asyncio.to_thread(self._client.asset_decimals)
+            if asset not in decimals_map:
+                self._record_emergency(asset, "unknown_asset", now_ms, None)
+                return "unknown_asset"
+            snapshot, mids = await asyncio.gather(
+                asyncio.to_thread(self._client.snapshot), asyncio.to_thread(self._client.mids)
+            )
+        except RateLimitError as exc:  # pause de débit : aucune requête, réessayé au cycle suivant sans compter de tentative
+            self._record_emergency(asset, RATE_LIMITED, now_ms, None, f"status={exc.status} pause={exc.retry_after_s:.0f}s")
+            return RATE_LIMITED
+        except Exception as exc:  # noqa: BLE001 -- lecture réseau : on réessaiera au prochain cycle
+            _log.exception("hl_dead_man_read_failed")
+            self._record_emergency(asset, "read_error", now_ms, None, repr(exc)[:200])
+            return "read_error"
+        position = snapshot.positions.get(asset, ZERO)
+        if position == 0:
+            return "no_position"
+        mid = mids.get(asset)
+        if mid is None:
+            self._record_emergency(asset, "no_price", now_ms, None)
+            return "no_price"
+        slippage = emergency_slippage_bps(self._cfg.emergency_slippage_bps, attempt) / Decimal(10_000)
+        is_buy = position < 0  # une position courte se ferme en achetant
+        raw = mid * (1 + slippage) if is_buy else mid * (1 - slippage)
+        order = EmergencyOrder(is_buy, abs(position), round_price(raw, decimals_map[asset]))
+        if self._cfg.dry_run:
+            self._record_emergency(asset, "dry_run", now_ms, order)
+            _log.warning("hl_dead_man_dry_run %s %s sz=%s px=%s (aucun ordre envoyé)", asset, "BUY" if is_buy else "SELL", order.size, order.limit_px)
+            return "dry_run"
+        cloid = "0x" + hashlib.sha256(f"deadman:{asset}:{now_ms}:{attempt}".encode()).hexdigest()[:32]
+        request = OrderRequest(asset, is_buy, order.size, order.limit_px, "Ioc", True, cloid)
+        self._intent_before_send(cloid, asset, is_buy, mid, order.size, "emergency")
+        try:
+            outcome = await asyncio.to_thread(self._client.place_order, request)
+        except RateLimitError as exc:  # refusé avant traitement : la fermeture sera retentée après la pause
+            self._record_emergency(asset, RATE_LIMITED, now_ms, order, f"status={exc.status} pause={exc.retry_after_s:.0f}s")
+            return RATE_LIMITED
+        except Exception as exc:  # noqa: BLE001 -- ambigu : la position est relue au prochain cycle, qui décide
+            _log.exception("hl_dead_man_place_order_failed")
+            self._record_emergency(asset, "error", now_ms, order, repr(exc)[:200])
+            return "error"
+        self._intent_order_id(cloid, outcome.oid)
+        self._record_emergency(asset, outcome.status, now_ms, order, outcome.detail or f"oid={outcome.oid} filled={outcome.filled_size}")
+        return outcome.status
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Worker Hyperliquid (dry-run testnet par défaut).")
+    parser.add_argument("--address", default=os.environ.get("NOTHIERLY_ZMQ_ADDRESS"), help="endpoint ZMQ du publisher")
+    parser.add_argument("--db", default=str(default_db_path("hyperliquid_worker.sqlite3")), help="base SQLite d'état (défaut : $NOTHIERLY_DATA_DIR ou data/)")
+    parser.add_argument("--network", choices=[n.value for n in Network], default=Network.TESTNET.value)
+    parser.add_argument("--live", action="store_true", help="envoie réellement les ordres ; sinon dry-run (lecture seule)")
+    parser.add_argument("--i-understand-real-funds", action="store_true", help="requis pour --live sur mainnet")
+    parser.add_argument("--clear-halt", action="store_true", help="lève les verrous (drawdown et homme mort) puis quitte")
+    parser.add_argument("--allow-plaintext-remote", action="store_true", help="autorise un endpoint non local SANS chiffrement CURVE")
+    parser.add_argument("--fills-db", default=None, help="base SQLite des fills et du slippage (défaut : hyperliquid_fills.sqlite3 à côté de --db)")
+    parser.add_argument("--no-fill-tracking", action="store_true", help="désactive l'écoute des fills (activée avec --live)")
+    parser.add_argument("--log-dir", default=None, help="dossier d'un fichier de journal tournant (10 Mo x 5) en plus de stdout ; défaut : NOTHIERLY_LOG_DIR")
+    parser.add_argument("--dead-man-timeout", type=float, default=300.0, metavar="SECONDES",
+                        help="ferme toutes les positions puis se verrouille après ce délai sans signal valide (0 = désactivé)")
+    args = parser.parse_args(argv)
+    ensure_parent(args.db)
+    if args.clear_halt:  # ne touche que la base locale : ni réseau, ni SDK, ni clé
+        configure_logging("hyperliquid-worker", log_dir=args.log_dir)
+        clear_execution_halt(HlState(args.db))
+        _log.info("hl_halt_cleared")
+        return
+    if args.dead_man_timeout < 0:
+        parser.error("--dead-man-timeout doit être >= 0")
+    if (timeout_problem := dead_man_timeout_problem(args.dead_man_timeout)) is not None:
+        parser.error(timeout_problem)
+    if not args.address:
+        parser.error("--address ou NOTHIERLY_ZMQ_ADDRESS requis")
+    try:
+        curve = CurveClientConfig.from_env()
+    except CurveConfigError as exc:
+        parser.error(str(exc))
+    refusal = transport_refusal(args.address, curve_enabled=curve is not None, allow_plaintext_remote=args.allow_plaintext_remote)
+    if refusal:
+        parser.error(refusal)
+    network = Network(args.network)
+    if args.live and network is Network.MAINNET and not args.i_understand_real_funds:
+        parser.error("--live sur mainnet exige --i-understand-real-funds")
+    if args.live and network is Network.MAINNET and args.dead_man_timeout == 0:
+        parser.error("--live sur mainnet exige l'homme mort : --dead-man-timeout doit être > 0")
+    account = os.environ.get("HL_ACCOUNT_ADDRESS")
+    if not account:
+        parser.error("HL_ACCOUNT_ADDRESS requis (compte principal dont l'equity sert de base)")
+    secret = os.environ.get("HL_AGENT_SECRET") if args.live else None
+    if args.live and not secret:
+        parser.error("--live exige HL_AGENT_SECRET (clé d'un API wallet sans droit de retrait)")
+    try:
+        alerter = WebhookAlerter.from_env(source="hyperliquid-worker")
+    except AlertConfigError as exc:
+        parser.error(str(exc))
+    configure_logging("hyperliquid-worker", log_dir=args.log_dir)
+    client = SdkHyperliquidClient(
+        network=network, account_address=account, agent_secret=secret, vault_address=os.environ.get("HL_VAULT_ADDRESS")
+    )
+    fills_db: FillsDatabase | None = None
+    tracker: FillTracker | None = None
+    if args.live and not args.no_fill_tracking:  # en dry-run aucun ordre ne part : rien à mesurer
+        fills_db = FillsDatabase(args.fills_db or Path(args.db).with_name("hyperliquid_fills.sqlite3"))
+        feed = HyperliquidFillFeed(user=os.environ.get("HL_VAULT_ADDRESS") or account, network=network.value)
+        tracker = FillTracker(feed, fills_db, alerter=alerter)
+    config = HyperliquidWorkerConfig(
+        rate_gate=client.rate_gate, address=args.address, secret_key=load_secret_from_env(), db_path=args.db, dry_run=not args.live,
+        dead_man_timeout_s=args.dead_man_timeout or None, curve=curve, alerter=alerter, fills_db=fills_db, fill_tracker=tracker,
+    )
+    worker = HyperliquidWorker(config, client)
+    _log.info("hl_worker_start network=%s mode=%s", network.value, "LIVE" if args.live else "DRY-RUN")
+    try:
+        # Boucle Selector explicite : sous Windows, la boucle Proactor par défaut est incompatible avec zmq.asyncio.
+        asyncio.run(worker.run(), loop_factory=asyncio.SelectorEventLoop)
+    except KeyboardInterrupt:
+        _log.info("hl_worker_stopped")
+    finally:
+        if alerter is not None:
+            alerter.close(2.0)
+        if fills_db is not None:
+            fills_db.close()
+
+
+if __name__ == "__main__":
+    main()

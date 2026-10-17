@@ -1,0 +1,233 @@
+[tool.mypy]
+plugins = ["pydantic.mypy"]
+python_version = "3.13"
+strict = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_return_any = true
+namespace_packages = true
+explicit_package_bases = true
+mypy_path = "."
+exclude = ["\\.venv", "venv", "_archive"]
+
+[[tool.mypy.overrides]]
+module = "zmq.*"
+ignore_missing_imports = true
+
+# Paquets d'exchange et de données importés À L'USAGE (dépendances optionnelles des workers) : ils n'ont ni stubs tiers ni marqueur
+# py.typed, ou ne s'installent pas partout (MetaTrader5 : Windows seulement ; le SDK Hyperliquid n'est pas dans toutes les venv).
+# Un override par module remplace des `# type: ignore[import-...]` en ligne, qui devaient en plus se taire quand le paquet est
+# présent (`unused-ignore`). Les paquets typés (websockets, eth-account) n'ont besoin d'aucune exception.
+[[tool.mypy.overrides]]
+module = ["hyperliquid.*", "MetaTrader5.*", "MetaTrader5", "numerapi.*", "numerapi"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "ccxt.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "reportlab.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "simplefix.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "qrcode.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "ib_async.*"
+ignore_missing_imports = true
+# ib_async ships real (installable) source but without full type
+# annotations internally -- ignore_missing_imports alone still lets
+# mypy follow into that untyped source and flag "Call to untyped
+# function" under strict mode. follow_imports="skip" instead treats
+# every symbol from this module as Any without analyzing its source,
+# matching how ccxt/twilio/v20 are effectively treated here too.
+follow_imports = "skip"
+
+[[tool.mypy.overrides]]
+module = "transformers.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "sklearn.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "asyncpg.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "joblib.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "v20.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "plotly.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "apscheduler.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "boto3.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "botocore.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "pynvml.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "shap.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "twilio.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "ripser.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "persim.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "geopy.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "scipy.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "cma.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "simulated_bifurcation.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "snntorch.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "dowhy.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "networkx.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "msgpack.*"
+ignore_missing_imports = true
+# msgpack ships a real, prebuilt wheel (msgpack-1.2.2-cp314-cp314-win_amd64)
+# but no py.typed marker / stubs of its own.
+
+[[tool.mypy.overrides]]
+module = "streamlit_autorefresh.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "feedparser.*"
+ignore_missing_imports = true
+
+# scripts/finetune_political_llm.py's own real, GPU-only extra deps (see that module's docstring) --
+# never installed in this project's own CPU-only requirements.txt, only on a rented GPU instance.
+[[tool.mypy.overrides]]
+module = "datasets.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "peft.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "trl.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "bitsandbytes.*"
+ignore_missing_imports = true
+
+# p2p_oracle.py's own real time-series forecasting dependency (Amazon's Chronos foundation model).
+[[tool.mypy.overrides]]
+module = "chronos.*"
+ignore_missing_imports = true
+
+# protoc-generated gRPC stubs (src/grpc_service/execution_pb2*.py) -- "DO NOT EDIT" generated
+# code, regenerated wholesale from execution.proto (see that file's own regeneration comment), so
+# holding it to this project's own strict standards (full annotations on every generated method)
+# would just get overwritten on the next `protoc` run. src/grpc_service/grpc_server.py, the real
+# hand-written code that calls into these stubs, is still checked at full strictness.
+[[tool.mypy.overrides]]
+module = ["src.grpc_service.execution_pb2", "src.grpc_service.execution_pb2_grpc"]
+ignore_errors = true
+
+# strawberry-graphql's own @strawberry.field/@strawberry.type decorators are not precisely typed
+# enough for this project's disallow_untyped_decorators=true under mypy strict (verified: the
+# error is on the decorator itself, not on any real missing annotation in src/graphql_api/schema.py's
+# own resolver methods -- every one of them is fully annotated). Scoped to this one module rather
+# than relaxed project-wide.
+[[tool.mypy.overrides]]
+module = "src.graphql_api.schema"
+disallow_untyped_decorators = false
+
+# tests/test_grpc_service.py calls directly into the same protoc-generated, untyped functions
+# (add_TradeExecutorServicer_to_server, TradeExecutorStub) as grpc_server.py's own single,
+# individually-annotated `# type: ignore[no-untyped-call]` call site -- scoped here instead of
+# repeating that comment at four call sites in one test file.
+[[tool.mypy.overrides]]
+module = "tests.test_grpc_service"
+disallow_untyped_calls = false
+
+# Retail Gateway (retail_gateway/) -- the air-gapped B2C signup microservice's own Celery task
+# queue. celery ships no py.typed marker/stubs (same gap class as ccxt/v20/simplefix above), and
+# its own @celery_app.task decorator is consequently untyped -- same real, scoped fix as
+# src.graphql_api.schema's strawberry decorators above, not a project-wide relaxation.
+[[tool.mypy.overrides]]
+module = "celery.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "retail_gateway.tasks"
+disallow_untyped_decorators = false
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
+warn_required_dynamic_aliases = true
+
+[tool.pytest.ini_options]
+# Bounds any single test at 120s (thread method: dump every thread's stack, then hard-exit) so a wedged
+# test can't block a terminal/CI run forever. It does NOT cover the hang this comment used to blame on
+# core/zmq_bus.py's WindowsSelectorEventLoopPolicy -- that was a wrong hunch. Real root cause, found by
+# dumping all thread stacks mid-hang: a fixture builds a BaseAgent subclass (real ZMQ PUB/SUB sockets on
+# its own zmq.asyncio.Context) and never close()/term()s them. When the cyclic GC later collects that
+# agent, Context.__del__ -> destroy() -> term() blocks forever -- inside whichever test happens to trigger
+# the GC, or after the last test, so pytest never prints its summary (reproduced in ten lines with a
+# Context + open socket in a reference cycle). Every fixture/test that constructs an agent must close its
+# publisher/subscriber and term() its context in teardown; see tests/test_execution_agent_instrument_lock.py's
+# `agent` fixture for the template.
+timeout = 120
+timeout_method = "thread"

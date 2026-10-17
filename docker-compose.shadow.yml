@@ -1,0 +1,144 @@
+# Shadow Run (collecte de données 24/7) : persistance des données d'entraînement. Overlay, comme docker-compose.prod.yml.
+#
+#   # UNE SEULE FOIS par serveur, avant le premier `up` (les volumes ci-dessous sont `external`, voir plus bas) :
+#   docker volume create nothierly_shadow_data      # bases SQLite des workers : fills, slippage, état
+#   docker volume create nothierly_shadow_logs      # journaux tournants des workers
+#   docker volume create nothierly_timescaledb_data # archive du bus (carnet, décisions du méta-label) : ce que lit train_model.py
+#   docker volume create nothierly_redis_data       # Redis (AOF)
+#
+#   docker compose -p nothierly-${CLIENT_ID} --env-file .env.${CLIENT_ID} \
+#       -f docker-compose.yml -f docker-compose.platform.yml -f docker-compose.shadow.yml up -d --build
+#   (SANS docker-compose.prod.yml : cet overlay isole redis-broker/timescaledb/moteur sur `internal_core`, que les services de la plateforme et de ce fichier ne rejoignent pas ;
+#    les empiler ensemble coupe leur accès à Redis et à TimescaleDB tant que `networks: [internal_core]` n'y est pas ajouté.)
+#
+#   # Extraction, quelques semaines plus tard (écrit dans ./research/exports/ ; ne modifie rien) :
+#   docker compose ... -f docker-compose.shadow.yml run --rm nothierly-exporter --symbol BTCUSDT --since-days 30
+#
+# **Écart avec la demande, et pourquoi.** (1) Un `docker-compose.prod.yml` existe déjà : c'est l'overlay de durcissement (réseaux isolés,
+# plafonds de ressources, services gRPC/Swarm). Le remplacer par un fichier autonome aurait supprimé tout cela ; la persistance vit donc
+# dans ce fichier-ci, empilé en dernier. (2) Redis a déjà son volume et son AOF dans docker-compose.yml (`redis:7-alpine`, `--appendonly
+# yes`) : un second conteneur Redis aurait donné deux états séparés (voir l'en-tête de docker-compose.prod.yml). On ne change que la
+# durabilité du volume.
+#
+# **Pourquoi `external: true`.** Un volume nommé ordinaire survit à un crash et à `docker compose up` (mise à jour), mais pas à
+# `docker compose down -v` ni à un `docker volume prune` lancé au mauvais moment. Un volume `external` n'est jamais supprimé par Compose :
+# la perte de jours d'historique exige alors une commande `docker volume rm` explicite. Contrepartie voulue : sans le `docker volume
+# create` ci-dessus, `up` échoue tout de suite avec un message clair, au lieu de démarrer sur un volume vide.
+#
+# **Ce qui n'est PAS persistant ici (à savoir).**
+#  - La clé Redis `market:vpin:<SYMBOLE>` : dernière valeur avec expiration, aucun historique. L'historique du VPIN est écrit à part, seau par
+#    seau, par nothierly-vpin-tracker dans /data/vpin_history.sqlite3 (même volume que les fills).
+#  - Rien ne purgeait ces données avant nothierly-maintenance (ci-dessous) : ses rétentions sont des choix, à ajuster.
+#  - Les journaux du moteur (nothierly-agents) : stdout, pilote json-file (20 Mo x 5). Seuls les workers écrivent des fichiers (/logs).
+#  - Les anciens volumes `platform_*_data` (un par worker) ne sont plus montés : les workers écrivent dans le volume commun. Les fichiers
+#    ont des noms distincts par plateforme (`bybit.sqlite3`, `bybit_fills.sqlite3`, ...), sans collision.
+#
+# NON exécuté : Docker n'est pas installé sur la machine où ce fichier a été écrit. Il se lit comme du YAML et ses références de services
+# ont été recoupées avec les autres fichiers, ce qui n'est pas `docker compose config`. Lancer `docker compose ... config` avant le premier `up`.
+
+x-shadow-worker-storage: &shadow-worker-storage
+  environment:
+    NOTHIERLY_DATA_DIR: /data
+    NOTHIERLY_LOG_DIR: /logs
+  volumes:
+    - nothierly_shadow_data:/data
+    - nothierly_shadow_logs:/logs
+
+services:
+  nothierly-worker-hyperliquid:
+    <<: *shadow-worker-storage
+
+  nothierly-worker-bybit:
+    <<: *shadow-worker-storage
+
+  nothierly-worker-binance:
+    <<: *shadow-worker-storage
+
+  # Archive continue du VPIN (workers/market_data/vpin_archive.py) : sans ce volume, l'historique de microstructure disparaîtrait avec le
+  # conteneur. C'est le seul producteur de données de marché continues du Shadow Run tant qu'aucun modèle ne décide.
+  nothierly-vpin-tracker:
+    <<: *shadow-worker-storage
+
+  # Même archive (vpin_history.sqlite3, un seau par ligne et par symbole) pour le flux Hyperliquid : symboles BTC/ETH, distincts de BTCUSDT/ETHUSDT.
+  nothierly-vpin-tracker-hyperliquid:
+    <<: *shadow-worker-storage
+
+  # Idem pour Bybit (symboles BTCUSDTBYBIT / ETHUSDTBYBIT dans la même archive).
+  nothierly-vpin-tracker-bybit:
+    <<: *shadow-worker-storage
+
+  # Maintenance (scripts/maintenance_cron.py) : purge des SQLite par lots + VACUUM conditionnel + rétention/compression de TimescaleDB, toutes les 24 h.
+  # Sans elle, rien ne borne la croissance : aucun autre service ne purge (les workers ne purgent qu'à leur démarrage). Rétentions par défaut :
+  # VPIN 180 j, bus_messages 120 j (compressé après 7 j) ; l'entraînement lit 30 j. Premier réglage à valider sur le serveur :
+  #   docker compose ... -f docker-compose.shadow.yml run --rm nothierly-maintenance --once --dry-run
+  # Même volume de données que les workers/le tracker (locks SQLite partagés via le volume : non vérifié sous Docker) ; mêmes réglages TIMESCALE_*
+  # et WEBHOOK_URL que le moteur (une panne de maintenance alerte comme une panne de worker).
+  nothierly-maintenance:
+    build: .
+    container_name: nothierly-${CLIENT_ID:?Set CLIENT_ID}-maintenance
+    command: ["python", "scripts/maintenance_cron.py", "--heartbeat-file", "/tmp/maintenance.heartbeat"]
+    restart: unless-stopped
+    env_file:
+      - ${CLIENT_ENV_FILE:-.env}
+    environment:
+      CLIENT_ID: ${CLIENT_ID:?Set CLIENT_ID}
+      NOTHIERLY_DATA_DIR: /data
+      TIMESCALE_HOST: timescaledb
+      TIMESCALE_PORT: "5432"
+      WEBHOOK_URL: ${WEBHOOK_URL:-}
+    volumes:
+      - nothierly_shadow_data:/data
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    healthcheck:
+      # Le démon touche ce fichier chaque minute, même pendant ses 24 h de sommeil : un fichier de plus de 5 minutes = process figé.
+      test: ["CMD", "python", "-c", "import os,sys,time; sys.exit(0 if time.time() - os.path.getmtime('/tmp/maintenance.heartbeat') < 300 else 1)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 180s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Outil d'extraction : hors `up` (profil `tools`), lancé à la demande avec `run --rm`. Même image que le moteur (scripts/ y est), mêmes
+  # réglages TIMESCALE_* / REDIS_* que nothierly-agents. Le volume de données est monté en lecture-écriture parce qu'une base SQLite en
+  # mode WAL ne s'ouvre pas depuis un montage en lecture seule ; le script, lui, n'ouvre les bases qu'en lecture seule.
+  nothierly-exporter:
+    build: .
+    profiles: ["tools"]
+    entrypoint: ["python", "scripts/export_training_data.py"]
+    env_file:
+      - ${CLIENT_ENV_FILE:-.env}
+    environment:
+      CLIENT_ID: ${CLIENT_ID:?Set CLIENT_ID}
+      NOTHIERLY_DATA_DIR: /data
+      REDIS_HOST: redis-broker
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD}
+      TIMESCALE_HOST: timescaledb
+      TIMESCALE_PORT: "5432"
+    # Pas de `user:` : le conteneur tourne sous l'utilisateur `nothierly` de l'image, propriétaire des fichiers du volume (nécessaire pour que
+    # SQLite crée son fichier -shm). Le dossier d'export de l'hôte doit donc être accessible en écriture : `chmod a+w research/exports`.
+    volumes:
+      - nothierly_shadow_data:/data
+      - ./research/exports:/app/research/exports
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+
+volumes:
+  nothierly_shadow_data:
+    external: true
+  nothierly_shadow_logs:
+    external: true
+  # Redéfinissent les volumes des mêmes noms de docker-compose.yml : Compose fusionne par clé, `external` + `name` remplacent le volume géré.
+  timescaledb_data:
+    external: true
+    name: nothierly_timescaledb_data
+  redis_data:
+    external: true
+    name: nothierly_redis_data

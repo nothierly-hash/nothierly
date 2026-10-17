@@ -1,0 +1,762 @@
+"""XGBoost signal micro-agent: signal fusion, ML inference, and a local Kill Switch.
+
+:class:`XgboostSignalAgent` (module kept at its original ``supervisor``
+path for historical continuity, even though it no longer supervises
+execution -- see below) fuses the other agents' latest published state
+into a directional opinion on one instrument, and publishes it as a
+:class:`~core.schemas.TradingSignal`. It never places, cancels, or even
+knows about an order: **execution now lives entirely in
+:class:`~src.agents.execution.agent.ExecutionAgent`**, the only thing in
+this system authorized to touch a broker.
+
+This split (the "Portfolio Manager" pattern) exists to prevent exactly
+the failure mode a single execution-capable agent per signal source would
+invite: two independent decision-makers (this one, XGBoost-based, and
+:class:`~src.agents.rl_signal.agent.RlSignalAgent`, RL-based) each able to
+place real orders on the same OANDA account would risk contradicting and
+fighting each other. Neither can place an order at all now; only
+:class:`ExecutionAgent` can, and only once it has independently
+arbitrated consensus between both agents' signals.
+
+Safety-by-default carries over even though execution moved out: this
+agent's local Kill Switch still exists, but since it no longer holds a
+trading client of its own to cancel orders on, tripping it escalates to
+the *global* Kill Switch -- stopping :class:`ExecutionAgent` from acting
+on *anyone's* signal. **Only systemic threats trip it**, and, since a
+real 24h Chaos Shadow Run (2026-09-24), not all of them the same way:
+
+- **Flash crash** (:class:`~core.circuit_breaker.MarketAnomalyDetector`)
+  still escalates to :func:`core.security.trip_kill_switch`'s real
+  ``PANIC`` -- a condition serious enough that only a real human,
+  via :func:`~core.security.reset_kill_switch`/:func:`~core.security.
+  manual_authenticated_reset`, may clear it.
+- **Total market-data feed loss** (no fresh reading for
+  ``feed_loss_grace_seconds``) now escalates to
+  :func:`core.security.latch_data_loss`'s real, distinct
+  ``LATCHED_DATA`` instead -- a real halt (trading stays blocked exactly
+  like ``PANIC``), but one this agent can itself lift, automatically,
+  once a real, continuous window of fresh ticks (measured from the
+  ticks' own timestamps, ``data_loss_probation_seconds``, default 60s)
+  has elapsed -- see :meth:`_track_data_loss_probation` and
+  :func:`core.security.auto_recover_from_data_loss`. The real gap this
+  closes: a single 30s WebSocket blip used to latch the *entire* system
+  on ``PANIC`` -- indistinguishable from a flash crash -- for as long as
+  a human took to notice and manually reset it.
+
+Everything else (an isolated Redis read failure, a torn/invalid signature,
+a latency spike, a spread anomaly, a briefly stale reading) is still a
+*soft veto*: a warning, no signal this cycle, and the loop keeps ingesting
+-- a 1% transient read failure used to latch the global switch on within
+~15 minutes before the 2026-09-20 fix that introduced soft vetoes at all.
+
+**Asset-class note** (carried over, still true): this agent evaluates
+OANDA forex instruments (e.g. ``"EUR_USD"``), but the market data it
+reads from Redis (:class:`~core.schemas.MarketMetrics`) is still
+published by :class:`~src.agents.market_data.agent.MarketDataAgent`,
+which watches a *crypto* order book via ``ccxt.pro``. Feeding a crypto
+order book's spread/imbalance into a forex signal has no economic basis
+-- a real, not-yet-addressed prerequisite for this agent to produce
+economically meaningful signals in practice.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import statistics
+import time
+from collections import deque
+from pathlib import Path
+from typing import Final, Literal
+
+import zmq.asyncio
+from pydantic import ValidationError
+
+from core.base_agent import AgentControlState, BaseAgent
+from core.circuit_breaker import MarketAnomalyDetector
+from core.config import AppSettings
+from core.message_integrity import MARKET_METRICS_SIG_SUFFIX, SignatureVerificationError, verified_market_metrics
+from core.redis_client import RedisUnavailableError
+from core.schemas import (
+    FEATURE_VECTOR_REDIS_KEY_PREFIX,
+    MARKET_METRICS_REDIS_KEY_PREFIX,
+    TRADING_SIGNALS_TOPIC,
+    FeatureVector,
+    MacroSnapshot,
+    MarketMetrics,
+    SentimentSignal,
+    TradingSignal,
+)
+from core.security import auto_recover_from_data_loss, latch_data_loss, trip_kill_switch
+from core.stale_check import staleness_reason
+from src.agents.supervisor.feature_confirmation import apply_feature_confirmation
+from src.agents.supervisor.ml_engine import SupervisorMLModel
+
+# The two macro indicators SupervisorMLModel.build_feature_vector looks
+# for by name (see that module). Kept here, not imported, since this is
+# this agent's own Redis-key-naming concern, not the model's.
+_MACRO_INDICATORS: Final[tuple[str, ...]] = ("US_10Y_YIELD", "BTC_EXCHANGE_FLOW")
+
+_AGENT_ID: Final[str] = "supervisor-agent"
+
+
+class EmergencyStopError(Exception):
+    """Raised internally to unwind the current cycle once the local Kill Switch trips.
+
+    Never escapes :meth:`XgboostSignalAgent.run`: it is caught there to
+    break the main loop and fall through to the normal graceful-shutdown
+    path, which the Kill Switch has already triggered via
+    :meth:`~core.base_agent.BaseAgent.request_shutdown`.
+    """
+
+
+class SignalState:
+    """One cycle's snapshot of every sub-agent's latest published state.
+
+    Attributes:
+        market_metrics: Latest order book metrics for the traded symbol,
+            or ``None`` if :class:`~src.agents.market_data.agent.
+            MarketDataAgent` hasn't published anything yet.
+        macro_snapshots: Latest :class:`~core.schemas.MacroSnapshot` per
+            indicator name currently in Redis.
+        sentiment_signals: Every currently-live (TTL not yet expired)
+            :class:`~core.schemas.SentimentSignal`.
+        feature_vector: The traded symbol's latest :class:`~core.schemas.
+            FeatureVector`, or ``None`` if :class:`~src.data_pipeline.
+            feature_store.FeatureStore` has never published one for it
+            (e.g. a forex instrument -- see that class's crypto-only
+            default) or the key has expired. See :mod:`~src.agents.
+            supervisor.feature_confirmation` for how this is used.
+        redis_latency_ms: Wall-clock time this whole read took. Doubles
+            as the Kill Switch's Redis-latency health check.
+    """
+
+    __slots__ = (
+        "market_metrics",
+        "macro_snapshots",
+        "sentiment_signals",
+        "feature_vector",
+        "redis_latency_ms",
+    )
+
+    def __init__(
+        self,
+        market_metrics: MarketMetrics | None,
+        macro_snapshots: dict[str, MacroSnapshot],
+        sentiment_signals: list[SentimentSignal],
+        feature_vector: FeatureVector | None = None,
+        redis_latency_ms: float = 0.0,
+    ) -> None:
+        self.market_metrics = market_metrics
+        self.macro_snapshots = macro_snapshots
+        self.sentiment_signals = sentiment_signals
+        self.feature_vector = feature_vector
+        self.redis_latency_ms = redis_latency_ms
+
+
+class XgboostSignalAgent(BaseAgent):
+    """Fuses market/macro/NLP signals into an XGBoost-based trading opinion.
+
+    Publishes a :class:`~core.schemas.TradingSignal` on
+    :data:`~core.schemas.TRADING_SIGNALS_TOPIC` every cycle -- including a
+    neutral (``0``) signal on ``HOLD``, since :class:`~src.agents.
+    execution.agent.ExecutionAgent`'s consensus arbitration needs to see
+    an explicit veto, not silence, to tell "no opinion yet" apart from
+    "opinion not published this cycle".
+
+    See the module docstring for the local Kill Switch's new
+    global-escalation behavior.
+    """
+
+    def __init__(
+        self,
+        instrument: str,
+        *,
+        poll_interval_seconds: float = 5.0,
+        decision_threshold: float = 0.1,
+        redis_latency_threshold_ms: float = 1000.0,
+        spread_anomaly_multiplier: float = 3.0,
+        spread_history_window: int = 20,
+        max_consecutive_errors: int = 3,
+        flash_crash_window_seconds: float = 60.0,
+        flash_crash_max_move_fraction: float = 0.05,
+        max_market_metrics_age_ms: float = 500.0,
+        feed_loss_grace_seconds: float = 30.0,
+        data_loss_probation_seconds: float = 60.0,
+        model_path: str | Path | None = None,
+        scaler_path: str | Path | None = None,
+        settings: AppSettings | None = None,
+        manage_own_signals: bool = True,
+        zmq_context: zmq.asyncio.Context | None = None,
+        manage_own_redis: bool = True,
+    ) -> None:
+        """Wire up the ML model and the local Kill Switch.
+
+        Args:
+            instrument: The single OANDA instrument this instance
+                evaluates (e.g. ``"EUR_USD"``). See the module
+                docstring's asset-class note: the market data this agent
+                reads is still crypto-flavored, a real gap this does not
+                close.
+            poll_interval_seconds: Time between the start of one
+                evaluation cycle and the next.
+            decision_threshold: How far the ML model's up-probability
+                must be from ``0.5`` before this agent signals a
+                direction instead of neutral (e.g. ``0.1`` means signal
+                only outside ``[0.4, 0.6]``).
+            redis_latency_threshold_ms: Soft-veto condition: skip this
+                cycle if a full state read from Redis takes longer than this.
+            spread_anomaly_multiplier: Soft-veto condition: skip this cycle
+                if the current spread exceeds this many times the rolling
+                average of the last ``spread_history_window`` readings.
+            spread_history_window: Number of past spread readings kept
+                for the anomaly baseline. The check only activates once
+                this many *prior* readings exist.
+            max_consecutive_errors: Consecutive failed state reads after
+                which the soft-fail warning escalates to an ``error`` log
+                (never a Kill Switch trip -- see the module docstring).
+            flash_crash_window_seconds: Systemic trigger #1: lookback
+                window :class:`~core.circuit_breaker.MarketAnomalyDetector`
+                measures a price move over -- independent of spread (see
+                that class's own docstring for why this exists alongside
+                condition #2, not instead of it).
+            flash_crash_max_move_fraction: Systemic trigger #1:
+                absolute fractional price move within
+                ``flash_crash_window_seconds`` that trips it.
+            max_market_metrics_age_ms: A reading older than this is
+                *stale*: soft veto for the cycle (see :mod:`core.stale_check`).
+            feed_loss_grace_seconds: Systemic trigger #2: latch the global
+                Kill Switch's ``LATCHED_DATA`` status (see module
+                docstring) only once no *fresh* reading has been seen for
+                this long (total feed loss, not a blip).
+            data_loss_probation_seconds: How long a *continuous* streak
+                of fresh ticks (measured from the ticks' own timestamps)
+                must hold before this agent attempts to automatically
+                lift a real ``LATCHED_DATA`` halt -- see
+                :meth:`_track_data_loss_probation`. Never applies to
+                ``PANIC`` (flash crash) -- that still requires a real
+                human reset regardless of this value.
+            model_path: Passed through to :class:`SupervisorMLModel`; see
+                its docstring for the untrained-skeleton fallback.
+            scaler_path: Passed through to :class:`SupervisorMLModel`
+                alongside ``model_path`` -- without this, a real
+                ``model_path`` still loads and runs, but against a
+                skeleton (synthetic-data-fitted) scaler, silently
+                degrading prediction quality (see that class's own
+                docstring). Real bug fixed here: this parameter never
+                existed on this constructor at all, so no caller could
+                ever supply a real fitted scaler alongside a real model.
+            settings: Application settings. Defaults to ``get_settings()``
+                (see :class:`~core.base_agent.BaseAgent`).
+            manage_own_signals: See :class:`~core.base_agent.BaseAgent`.
+            zmq_context: See :class:`~core.base_agent.BaseAgent`.
+            manage_own_redis: See :class:`~core.base_agent.BaseAgent`.
+        """
+        super().__init__(
+            _AGENT_ID,
+            # Real bug, found and fixed alongside Chapter 13's "Red
+            # Phone" heartbeat-staleness alert: without this,
+            # tick_interval_seconds silently stayed at BaseAgent's 1.0s
+            # default even though this agent's real cadence is
+            # poll_interval_seconds (5.0s default) -- since run() is
+            # fully overridden below and never consults
+            # tick_interval_seconds for its own timing, this had no
+            # visible effect until _write_heartbeat started reading it
+            # for its TTL calculation, which would then have raced (a
+            # 5.0s-TTL heartbeat written only every real 5.0s).
+            tick_interval_seconds=poll_interval_seconds,
+            settings=settings,
+            manage_own_signals=manage_own_signals,
+            zmq_context=zmq_context,
+            manage_own_redis=manage_own_redis,
+        )
+
+        self._symbol = instrument
+        self._poll_interval_seconds = poll_interval_seconds
+        self._decision_threshold = decision_threshold
+        self._redis_latency_threshold_ms = redis_latency_threshold_ms
+        self._spread_anomaly_multiplier = spread_anomaly_multiplier
+        self._max_consecutive_errors = max_consecutive_errors
+
+        self._ml_model = SupervisorMLModel(model_path=model_path, scaler_path=scaler_path)
+
+        self._consecutive_error_count = 0
+        self._spread_history_window = spread_history_window
+        self._spread_history: deque[float] = deque(maxlen=spread_history_window)
+        self._emergency_mode = False
+
+        self._anomaly_detector = MarketAnomalyDetector(
+            window_seconds=flash_crash_window_seconds, max_move_fraction=flash_crash_max_move_fraction
+        )
+        self._max_market_metrics_age_ms = max_market_metrics_age_ms
+        self._feed_loss_grace_seconds = feed_loss_grace_seconds
+        # None until the first fresh reading: a cold start (feed not up yet) is not a feed *loss*.
+        self._last_fresh_metrics_at: float | None = None
+
+        # "Resilient Kill Switch" (2026-09-24): real probation tracking for auto-recovering a
+        # LATCHED_DATA halt -- see _track_data_loss_probation. _fresh_streak_started_at is a real
+        # tick timestamp (epoch seconds, from MarketMetrics.timestamp), not time.monotonic() -- the
+        # probation window is about how long the *data itself* has been continuously fresh, not how
+        # long this process happened to be polling.
+        self._data_loss_probation_seconds = data_loss_probation_seconds
+        self._fresh_streak_started_at: float | None = None
+        self._probation_recovery_attempted_for_streak = False
+
+    # -- BaseAgent overrides -----------------------------------------
+
+    async def on_tick(self) -> None:
+        """Unused: this agent polls on its own schedule inside :meth:`run`.
+
+        :meth:`run` is fully overridden with a fetch-decide-publish loop
+        instead of :class:`~core.base_agent.BaseAgent`'s tick loop, so
+        this is never called. Implemented (rather than omitted) only to
+        satisfy the abstract base class, and raises loudly if it is ever
+        invoked by mistake.
+        """
+        raise NotImplementedError("XgboostSignalAgent overrides run() and never ticks.")
+
+    async def on_start(self) -> None:
+        """Log readiness. No trading client to connect -- this agent never executes."""
+        self._log.info(
+            "xgboost_signal_agent_ready",
+            agent_id=self.agent_id,
+            symbol=self._symbol,
+        )
+
+    async def run(self) -> None:
+        """Connect dependencies, then run the fetch-decide-publish loop.
+
+        Mirrors :meth:`BaseAgent.run`'s lifecycle (signal handling, Redis
+        connection, cancellation-safe shutdown). Every iteration first
+        checks the local Kill Switch (see :meth:`_check_kill_switch`);
+        tripping it ends the loop and falls through to the normal
+        shutdown sequence, which the Kill Switch has already put in
+        motion via :meth:`~core.base_agent.BaseAgent.request_shutdown`.
+
+        Raises:
+            RuntimeError: If ``run`` is called while already running.
+        """
+        if self._running:
+            raise RuntimeError(f"Agent {self.agent_id!r} is already running.")
+
+        self._main_task = asyncio.current_task()
+        self._install_signal_handlers()
+
+        try:
+            await self._connect_redis()
+            await self.on_start()
+
+            self._running = True
+            self._log.info(
+                "agent_started",
+                agent_id=self.agent_id,
+                symbol=self._symbol,
+                poll_interval_seconds=self._poll_interval_seconds,
+            )
+
+            await asyncio.gather(self._run_polling_loop(), self._listen_for_control_commands())
+        except asyncio.CancelledError:
+            self._log.info("agent_run_loop_cancelled_for_shutdown", agent_id=self.agent_id)
+        finally:
+            self._running = False
+            await self._shutdown()
+
+    async def _run_polling_loop(self) -> None:
+        """The real fetch-decide-publish loop -- a separate coroutine (not inlined in :meth:`run`) so it can run alongside :meth:`~core.base_agent.BaseAgent._listen_for_control_commands`.
+
+        **Real bug found live (2026-09-14), during this project's own
+        multi-hour shadow-run stress test**: a real, transient Redis
+        contention spike during the concurrent 17-agent startup burst
+        made two live instances' very first ``_fetch_latest_state()``
+        call see ``redis_latency_ms=inf`` -- a real, correctly-detected
+        condition -- but the *old* behavior here (``break``ing out of
+        this loop entirely on :class:`EmergencyStopError`) meant one
+        transient, one-off blip permanently silenced that instance's
+        real signal generation for the rest of the process's life
+        (73+ minutes and counting, confirmed live), with no self-healing
+        and no way for an operator to recover it short of restarting the
+        whole backend. **Not a relaxation of the actual safety
+        condition** -- :meth:`_check_kill_switch`'s own trip conditions
+        are untouched, exactly as strict as before, and the *global*
+        Kill Switch this trips still requires a real human
+        :func:`~core.security.reset_kill_switch` call regardless (see
+        that function's own docstring) -- :class:`~src.agents.execution.
+        agent.ExecutionAgent` still refuses every real order until that
+        happens. This only fixes what happens to *this one instance's
+        own polling loop* afterward: it keeps re-checking every cycle
+        (the same real condition it already re-evaluates for every other
+        exception type below) instead of going permanently dark, so a
+        genuinely transient trip clears itself on the next real, healthy
+        read -- and an instance that was never actually recovered stays
+        silent for exactly as long as the real condition keeps failing,
+        no differently than before.
+        """
+        while self._running:
+            cycle_started_at = time.monotonic()
+            try:
+                await self._run_signal_cycle()
+            except EmergencyStopError as exc:
+                self._log.warning(
+                    "xgboost_signal_cycle_skipped_emergency_mode",
+                    agent_id=self.agent_id,
+                    reason=str(exc),
+                    detail="Local Kill Switch condition still active this cycle -- re-checking next cycle, not permanently stopping.",
+                )
+            except Exception:
+                self._consecutive_error_count += 1
+                self._log.exception(
+                    "xgboost_signal_cycle_failed",
+                    agent_id=self.agent_id,
+                    consecutive_error_count=self._consecutive_error_count,
+                )
+
+            await self._write_heartbeat()
+
+            elapsed = time.monotonic() - cycle_started_at
+            remaining = max(0.0, self._poll_interval_seconds - elapsed)
+            await asyncio.sleep(remaining)
+
+    # -- Signal cycle -------------------------------------------------
+
+    async def _run_signal_cycle(self) -> None:
+        """Fetch state, enforce the Kill Switch, then decide and publish -- unless ``control_state`` says not to.
+
+        ``AgentControlState.OFF``/``SHADOW`` both suppress the real
+        publish onto :data:`~core.schemas.TRADING_SIGNALS_TOPIC` -- see
+        the identical real reasoning in :meth:`~src.agents.rl_signal.
+        agent.RlSignalAgent._run_signal_cycle`'s own docstring.
+
+        Raises:
+            EmergencyStopError: If the Kill Switch trips (the global
+                Kill Switch has already been tripped -- see
+                :meth:`_trigger_kill_switch` -- by the time this raises;
+                it exists purely to unwind this agent's own cycle).
+        """
+        try:
+            state = await self._fetch_latest_state()
+        except (RedisUnavailableError, ValidationError, SignatureVerificationError) as exc:
+            # Soft fail: an isolated read failure vetoes THIS cycle only. It never touches the global
+            # Kill Switch and never stops the loop -- the next tick simply reads again.
+            self._consecutive_error_count += 1
+            log = self._log.error if self._consecutive_error_count > self._max_consecutive_errors else self._log.warning
+            log(
+                "xgboost_signal_state_fetch_failed",
+                agent_id=self.agent_id,
+                error_type=type(exc).__name__,
+                consecutive_error_count=self._consecutive_error_count,
+                detail="soft veto: cycle skipped, no signal published, global Kill Switch untouched",
+            )
+            return
+        self._consecutive_error_count = 0
+
+        veto_reasons = await self._check_kill_switch(state)  # raises EmergencyStopError on a systemic threat only
+        if veto_reasons:
+            self._log.warning(
+                "xgboost_signal_soft_veto", agent_id=self.agent_id, symbol=self._symbol, reasons=veto_reasons,
+            )
+            return
+
+        # Reaching here means no systemic threat and no local veto.
+        self._emergency_mode = False
+
+        if state.market_metrics is None:
+            self._log.debug("xgboost_signal_no_market_data_yet", agent_id=self.agent_id)
+            return
+
+        signal_value, confidence = self._make_decision(state)
+        signal = TradingSignal(
+            timestamp=time.time(),
+            agent_id=self.agent_id,
+            instrument=self._symbol,
+            signal=signal_value,
+            confidence=confidence,
+        )
+        if self.control_state == AgentControlState.OFF:
+            self._log.warning(
+                "xgboost_signal_suppressed_agent_off", agent_id=self.agent_id, instrument=self._symbol,
+                detail="control_state=OFF: not published to the real bus.",
+            )
+            return
+        if self.control_state == AgentControlState.SHADOW:
+            self._log.warning(
+                "xgboost_signal_suppressed_agent_shadow",
+                agent_id=self.agent_id, instrument=self._symbol, signal=signal_value, confidence=confidence,
+                detail="control_state=SHADOW: this is what would have been published -- not sent to the real bus.",
+            )
+            return
+
+        self._log.info(
+            "xgboost_signal_published",
+            agent_id=self.agent_id,
+            instrument=self._symbol,
+            signal=signal_value,
+            confidence=confidence,
+        )
+        await self.publish(TRADING_SIGNALS_TOPIC, signal.model_dump(mode="json"))
+
+    # -- State fetching / Redis latency measurement ----------------------
+
+    async def _fetch_latest_state(self) -> SignalState:
+        """Read every sub-agent's latest published state: one ``MGET`` for every fixed key, plus one for the sentiment keys.
+
+        Fixed keys (signed market metrics value + signature, feature vector, macro snapshots) come
+        back from a single atomic ``MGET`` -- the value/signature pair can no longer be torn by a
+        concurrent write, and the read costs one round trip instead of ``3 + len(_MACRO_INDICATORS)``.
+        Sentiment keys are discovered with ``SCAN`` (never ``KEYS``: it would block a shared Redis)
+        and fetched with a second ``MGET``. The wall-clock time of the whole read is the local
+        latency health signal (a soft veto, see :meth:`_check_kill_switch`).
+
+        Raises:
+            RedisUnavailableError: If a read fails after Redis's own bounded reconnect attempts.
+            pydantic.ValidationError: If a value doesn't deserialize into its schema.
+            SignatureVerificationError: If the metrics signature is missing or wrong.
+        """
+        if self._redis_client is None:
+            return SignalState(None, {}, [], redis_latency_ms=float("inf"))
+
+        start = time.monotonic()
+        metrics_key = f"{MARKET_METRICS_REDIS_KEY_PREFIX}{self._symbol}"
+        raw_metrics, raw_signature, raw_feature, *raw_macros = await self._redis_client.execute(
+            "mget",
+            metrics_key,
+            f"{metrics_key}{MARKET_METRICS_SIG_SUFFIX}",
+            f"{FEATURE_VECTOR_REDIS_KEY_PREFIX}{self._symbol}",
+            *(f"macro_snapshot:{indicator}" for indicator in _MACRO_INDICATORS),
+        )
+        sentiment_keys = [key async for key in self._redis_client.client.scan_iter(match="nlp_signal:*")]
+        raw_sentiments = await self._redis_client.execute("mget", *sentiment_keys) if sentiment_keys else []
+        elapsed_ms = (time.monotonic() - start) * 1000.0
+
+        market_metrics = verified_market_metrics(self._symbol, raw_metrics, raw_signature)
+        macro_snapshots = {
+            indicator: MacroSnapshot.model_validate_json(raw)
+            for indicator, raw in zip(_MACRO_INDICATORS, raw_macros)
+            if raw is not None
+        }
+        sentiment_signals = [SentimentSignal.model_validate_json(raw) for raw in raw_sentiments if raw is not None]
+        feature_vector: FeatureVector | None = None
+        if raw_feature is not None:
+            try:
+                feature_vector = FeatureVector.model_validate_json(raw_feature)
+            except ValidationError:
+                self._log.warning("xgboost_signal_feature_vector_malformed", agent_id=self.agent_id)
+
+        return SignalState(
+            market_metrics, macro_snapshots, sentiment_signals, feature_vector, redis_latency_ms=elapsed_ms
+        )
+
+    # -- Local Kill Switch -----------------------------------------------
+
+    async def _check_kill_switch(self, state: SignalState) -> list[str]:
+        """Escalate a systemic threat to the GLOBAL Kill Switch; otherwise return this cycle's soft-veto reasons.
+
+        Systemic (raises): a flash crash (:func:`~core.security.trip_kill_switch`, real ``PANIC``,
+        human-reset-only), or total loss of the market-data feed -- no *fresh*
+        :class:`~core.schemas.MarketMetrics` for ``feed_loss_grace_seconds`` (a cold start that
+        never saw a fresh reading is not a loss) -- (:func:`~core.security.latch_data_loss`, real
+        ``LATCHED_DATA``, auto-recoverable -- see :meth:`_track_data_loss_probation`). Soft veto
+        (returned, nothing tripped): Redis latency over threshold, spread anomaly, a stale reading
+        that is not yet a lost feed.
+
+        Args:
+            state: This cycle's fetched state.
+
+        Returns:
+            Human-readable soft-veto reasons; empty when the cycle may proceed.
+
+        Raises:
+            EmergencyStopError: On a systemic threat, after the appropriate global Kill Switch
+                status has already been written.
+        """
+        fatal_reasons: list[str] = []
+        vetoes: list[str] = []
+        now = time.monotonic()
+
+        if state.redis_latency_ms > self._redis_latency_threshold_ms:
+            vetoes.append(
+                f"redis_latency_ms={state.redis_latency_ms:.1f} exceeds threshold "
+                f"{self._redis_latency_threshold_ms:.1f} (possible system freeze or network outage)"
+            )
+
+        fresh = False
+        if state.market_metrics is not None:
+            spread = state.market_metrics.spread
+            if len(self._spread_history) >= self._spread_history_window:
+                baseline = statistics.fmean(self._spread_history)
+                if baseline > 0 and spread > self._spread_anomaly_multiplier * baseline:
+                    vetoes.append(
+                        f"spread={spread:.6f} exceeds {self._spread_anomaly_multiplier}x "
+                        f"the recent average {baseline:.6f} (destructive slippage risk)"
+                    )
+            # Recorded *after* the check so the current reading never contaminates its own baseline.
+            self._spread_history.append(spread)
+
+            price_move_reason = self._anomaly_detector.check(state.market_metrics.mid_price)
+            if price_move_reason is not None:
+                fatal_reasons.append(price_move_reason)
+
+            stale_reason = staleness_reason(state.market_metrics.timestamp, max_age_ms=self._max_market_metrics_age_ms)
+            if stale_reason is None:
+                fresh = True
+            else:
+                vetoes.append(stale_reason)
+
+        if fresh:
+            self._last_fresh_metrics_at = now
+            assert state.market_metrics is not None  # fresh=True is only ever set inside the block above
+            await self._track_data_loss_probation(state.market_metrics.timestamp.timestamp())
+        else:
+            self._fresh_streak_started_at = None
+            self._probation_recovery_attempted_for_streak = False
+            if self._last_fresh_metrics_at is not None and now - self._last_fresh_metrics_at >= self._feed_loss_grace_seconds:
+                reason = (
+                    f"market data feed lost: no fresh MarketMetrics for "
+                    f"{now - self._last_fresh_metrics_at:.1f}s (grace {self._feed_loss_grace_seconds:.1f}s)"
+                )
+                self._last_fresh_metrics_at = now  # re-arm: at most one latch per grace period while the loss persists
+                await self._trigger_data_loss_latch(reason)
+                raise EmergencyStopError(reason)
+
+        if fatal_reasons:
+            await self._trigger_kill_switch(fatal_reasons)
+            raise EmergencyStopError("; ".join(fatal_reasons))
+        return vetoes
+
+    async def _track_data_loss_probation(self, tick_timestamp: float) -> None:
+        """Advance this cycle's continuous-fresh-tick streak; auto-recover a real ``LATCHED_DATA`` halt once it holds long enough.
+
+        Called on every fresh reading (see :meth:`_check_kill_switch`).
+        ``tick_timestamp`` is the real tick's own embedded timestamp
+        (epoch seconds), not wall-clock polling time -- a probation
+        window measured against *when the data itself says it is* stays
+        correct even if this agent's own loop briefly stalls.
+
+        At most one real :func:`~core.security.auto_recover_from_data_loss`
+        call per streak: once the probation window has been checked for
+        the current unbroken streak, this does nothing further until the
+        streak resets (a fresh break, see :meth:`_check_kill_switch`) --
+        never a real Redis round-trip on every single healthy cycle.
+
+        Args:
+            tick_timestamp: The current cycle's fresh
+                :class:`~core.schemas.MarketMetrics`' own ``timestamp``,
+                as epoch seconds.
+        """
+        if self._fresh_streak_started_at is None:
+            self._fresh_streak_started_at = tick_timestamp
+            self._probation_recovery_attempted_for_streak = False
+            return
+        if self._probation_recovery_attempted_for_streak:
+            return
+        if tick_timestamp - self._fresh_streak_started_at >= self._data_loss_probation_seconds:
+            self._probation_recovery_attempted_for_streak = True
+            recovered = await auto_recover_from_data_loss()
+            if recovered:
+                self._log.warning(
+                    "supervisor_agent_data_loss_probation_cleared",
+                    agent_id=self.agent_id,
+                    symbol=self._symbol,
+                    probation_seconds=self._data_loss_probation_seconds,
+                )
+
+    async def _trigger_data_loss_latch(self, reason: str) -> None:
+        """Enter emergency mode for a total market-data feed loss: latch (not ``PANIC``-trip) the global Kill Switch.
+
+        See module docstring / :func:`~core.security.latch_data_loss`'s
+        own docstring for why this is deliberately a different,
+        auto-recoverable status than :meth:`_trigger_kill_switch`'s
+        ``PANIC``.
+
+        Args:
+            reason: Human-readable description of the feed-loss condition.
+        """
+        self._emergency_mode = True
+        self._log.critical(
+            "LOCAL_KILL_SWITCH_LATCHED_DATA",
+            agent_id=self.agent_id,
+            symbol=self._symbol,
+            reason=reason,
+        )
+        await latch_data_loss(f"{self.agent_id} local Kill Switch latched (data loss) for {self._symbol}: {reason}")
+
+    async def _trigger_kill_switch(self, reasons: list[str]) -> None:
+        """Enter emergency mode: log critical, trip the global Kill Switch.
+
+        Unlike this agent's previous (chapter 8) design, this no longer
+        cancels orders directly -- it has no trading client to cancel
+        them on. Instead it trips the *global* Kill Switch (see
+        :mod:`core.security`), which blocks :class:`~src.agents.
+        execution.agent.ExecutionAgent` from placing any new order on
+        *any* agent's signal, a stronger and more appropriate reaction
+        now that execution is centralized there.
+
+        **Real bug fixed here (2026-09-14, the other half of the same
+        real fix in :meth:`_run_polling_loop`)**: this used to also set
+        ``self._running = False`` directly -- independent of, and
+        completely bypassing, :meth:`_run_polling_loop`'s own
+        ``except EmergencyStopError`` handling. Fixing that ``except``
+        branch alone (so it logs and continues instead of ``break``-ing)
+        was not sufficient on its own: the polling loop's *own*
+        ``while self._running:`` condition still went false on this
+        line the very first time any real trip occurred, ending the
+        loop after exactly one cycle regardless -- confirmed live via a
+        standalone repro (``task.done()`` was already ``True`` after
+        the first trip, with no exception, precisely because of this
+        line). Removed for the identical reason the other half was
+        fixed: this stays a real, correctly-detected trip -- the
+        *global* Kill Switch it trips below is completely unaffected
+        and still requires a real human :func:`~core.security.
+        reset_kill_switch` call regardless of this instance's own
+        ``_running`` state.
+
+        Args:
+            reasons: Human-readable description of every Kill Switch
+                condition that was met.
+        """
+        self._emergency_mode = True
+        self._log.critical(
+            "LOCAL_KILL_SWITCH_ACTIVATED",
+            agent_id=self.agent_id,
+            symbol=self._symbol,
+            reasons=reasons,
+        )
+        await trip_kill_switch(
+            f"{self.agent_id} local Kill Switch tripped for {self._symbol}: {'; '.join(reasons)}"
+        )
+
+    # -- Decision ---------------------------------------------------------
+
+    def _make_decision(self, state: SignalState) -> tuple[Literal[-1, 0, 1], float]:
+        """Fuse this cycle's state into a signed signal + confidence via the ML model.
+
+        The ML model's own call always determines direction. When this
+        cycle also has a fresh :class:`~core.schemas.FeatureVector` for
+        this instrument, :func:`~src.agents.supervisor.
+        feature_confirmation.apply_feature_confirmation` additionally
+        adjusts confidence (never direction) from its RSI momentum read
+        -- see that function's docstring.
+
+        Args:
+            state: This cycle's fetched state. ``state.market_metrics``
+                must not be ``None`` (checked by the caller).
+
+        Returns:
+            ``(signal, confidence)``: ``signal`` is ``1`` (buy), ``-1``
+            (sell), or ``0`` (neutral); ``confidence`` is in ``[0, 1]``.
+        """
+        assert state.market_metrics is not None
+        features = self._ml_model.build_feature_vector(
+            state.market_metrics, state.macro_snapshots, state.sentiment_signals
+        )
+        probability_up = self._ml_model.predict_probability(features)
+
+        if probability_up > 0.5 + self._decision_threshold:
+            signal_value: Literal[-1, 0, 1] = 1
+            confidence = probability_up
+        elif probability_up < 0.5 - self._decision_threshold:
+            signal_value = -1
+            confidence = 1.0 - probability_up
+        else:
+            signal_value = 0
+            confidence = 1.0 - 2.0 * abs(probability_up - 0.5)
+
+        return apply_feature_confirmation(signal_value, confidence, state.feature_vector)

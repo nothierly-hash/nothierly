@@ -1,0 +1,473 @@
+# Nothierly EMS -- single-tenant deployment manifest.
+#
+# "Un client = un cluster Docker indépendant": this file is a TEMPLATE
+# meant to be launched once per client, each with its own .env and its
+# own Compose *project name* -- Docker Compose already namespaces every
+# resource (containers, the default network, named volumes) under the
+# project name, which is the real, idiomatic mechanism for "one
+# independent cluster per client" (not manual ${CLIENT_ID} string
+# interpolation on every resource, which would be redundant with what
+# Compose already does, and easy to get inconsistent across resources).
+# Launch one client's real, isolated stack with:
+#
+#   docker compose -p nothierly-${CLIENT_ID} --env-file .env.${CLIENT_ID} up -d
+#
+# CLIENT_ID itself is still required as a real, visible environment
+# variable inside every container (see the ${CLIENT_ID:?...} guards
+# below) -- for human operators running `docker ps`/reading logs across
+# many concurrently-running client stacks on the same Docker host, not
+# for resource isolation (the project name already provides that).
+#
+# Real scope note: this template covers ONE region/host. Multi-region
+# failover, a container orchestrator's own scheduling (k8s/ECS), and
+# secrets-manager integration (Vault/AWS Secrets Manager, as opposed to
+# the .env file this project already uses everywhere) are real,
+# separate infrastructure this project has no established story for --
+# not fabricated here.
+
+# Log rotation, applied to every service below via `<<: *default-logging`.
+#
+# Real incident (2026-09-10): the `json-file` driver Docker uses by
+# default has NO size limit or rotation. `nothierly-agents` (17 async
+# agents, continuous structured JSON stdout -- heartbeats every few
+# seconds, per-agent signal/ZMQ event logs) grew its own container log
+# file to 40GB with zero rotation configured anywhere in this file,
+# repeatedly filling the host disk to 100% and blocking rebuilds/redeploys
+# of unrelated services. Capping every service here prevents recurrence.
+x-default-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg15
+    container_name: nothierly-${CLIENT_ID:?Set CLIENT_ID in this client's .env -- see file header}-timescaledb
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      - POSTGRES_USER=${DB_USER:?Set DB_USER}
+      - POSTGRES_PASSWORD=${DB_PASSWORD:?Set DB_PASSWORD}
+      - POSTGRES_DB=market_data
+    # Not published to the host by default in this single-tenant template --
+    # only nothierly-gateway and nothierly-dashboard need a host-reachable
+    # port; every other service is reached by the other containers via this
+    # project's own internal network, never from outside the cluster.
+    expose:
+      - "5432"
+    volumes:
+      - timescaledb_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d market_data"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis-broker:
+    image: redis:7-alpine
+    container_name: nothierly-${CLIENT_ID:?Set CLIENT_ID}-redis-broker
+    # --requirepass: real password protection on this client's own internal
+    # broker -- the brief's own ask ("protégé par mot de passe réseau
+    # interne"). --appendonly yes: AOF persistence, not just periodic RDB
+    # snapshots -- the Kill Switch's SYSTEM_STATUS is exactly the kind of
+    # state where losing the last few seconds/minutes to an RDB snapshot
+    # window would be unacceptable.
+    command: redis-server --requirepass ${REDIS_PASSWORD:?Set REDIS_PASSWORD -- redis-broker refuses to start without one} --appendonly yes
+    expose:
+      - "6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "--no-auth-warning", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    logging: *default-logging
+
+  nothierly-gateway:
+    build: .
+    container_name: nothierly-${CLIENT_ID:?Set CLIENT_ID}-gateway
+    command: ["uvicorn", "api_middleware.gateway:app", "--host", "0.0.0.0", "--port", "8000", "--no-server-header"]
+    ports:
+      - "${GATEWAY_HOST_PORT:-8000}:8000"
+    env_file:
+      - ${CLIENT_ENV_FILE:-.env}
+    environment:
+      CLIENT_ID: ${CLIENT_ID:?Set CLIENT_ID}
+      REDIS_HOST: redis-broker
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD}
+      TIMESCALE_HOST: timescaledb
+      TIMESCALE_PORT: "5432"
+      # Same real bug, same fix, as the alpha-engine service block's identical two lines (see that
+      # block's own comment for the full verified reasoning): without these, api_middleware/
+      # gateway.py's _build_zmq_publisher falls back to binding its OWN isolated ZMQ PUB port
+      # instead of connecting to nothierly-agents' shared broker -- CLIENT_ORDERS_TOPIC (every real
+      # order submit_order publishes) then reaches no subscriber at all. Found live: src/execution/
+      # shadow_crossing_engine.py's ShadowCrossingEngine subscribes to exactly that topic and would
+      # stay permanently empty even once actually run (see run_backend.py), because this gateway was
+      # never actually connected to the bus that engine listens on.
+      ZMQ_BROKER_FRONTEND_ADDRESS: tcp://nothierly-agents:5559
+      ZMQ_BROKER_BACKEND_ADDRESS: tcp://nothierly-agents:5560
+    depends_on:
+      redis-broker:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+      nothierly-agents:
+        condition: service_healthy
+    healthcheck:
+      # The gateway's own real liveness endpoint (api_middleware/gateway.py,
+      # excluded from the OpenAPI schema but genuinely served) -- not a
+      # fabricated check.
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status == 200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+    logging: *default-logging
+
+  nothierly-agents:
+    build: .
+    container_name: nothierly-${CLIENT_ID:?Set CLIENT_ID}-agents
+    # "Protocole AEGIS" (2026-09-16) -- same real, already-proven mechanism as alpha-engine's own
+    # `autoheal: "true"` label below (see that service's own comment for the full reasoning: a
+    # healthcheck failing alone does not make plain Compose restart a container; autoheal is the
+    # real external watcher that does). Previously scoped to alpha-engine only -- extended here
+    # because the identical failure mode (a fully deadlocked event loop, still running, never
+    # exiting on its own) can happen to any one of this container's own 7 agents just as easily,
+    # and until now nothing would have force-restarted this container for it.
+    labels:
+      autoheal: "true"
+    # Real, not a fabricated 3-container split: this project's actual agent
+    # fleet (scripts/run_backend.py -- MarketDataAgent, MacroAgent, NlpAgent,
+    # XgboostSignalAgent, RlSignalAgent, ExecutionAgent, ArchivistAgent) runs
+    # as one process sharing one ZMQ broker, exactly as it does outside
+    # Docker (see that script's own docstring on why: one shared zmq.asyncio.
+    # Context, one shared RedisClient singleton, coordinated shutdown). There
+    # is no separate real "Guardrail" agent process to split out --
+    # src/agents/guardian_ai.py's assess_risk_sync is a synchronous utility
+    # function called directly by the dashboard, not a ZMQ pub/sub agent.
+    command: ["python", "scripts/run_backend.py"]
+    env_file:
+      - ${CLIENT_ENV_FILE:-.env}
+    environment:
+      CLIENT_ID: ${CLIENT_ID:?Set CLIENT_ID}
+      REDIS_HOST: redis-broker
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD}
+      TIMESCALE_HOST: timescaledb
+      TIMESCALE_PORT: "5432"
+      # What every publisher/subscriber CONNECTS to -- this container's own agents (unchanged: a
+      # container can always reach its own published service name over the Compose network) AND
+      # alpha-engine's separate container, both alike. Resolved via Compose's embedded DNS (the
+      # service name below is also its automatic network alias, independent of container_name above).
+      ZMQ_BROKER_FRONTEND_ADDRESS: tcp://nothierly-agents:5559
+      ZMQ_BROKER_BACKEND_ADDRESS: tcp://nothierly-agents:5560
+      # What the broker itself BINDS -- deliberately a DIFFERENT address (0.0.0.0, not
+      # nothierly-agents): 0.0.0.0 is only ever valid to bind, never to connect to (see
+      # ZmqSettings.broker_bind_frontend_address's own docstring). Without this, the connect-facing
+      # addresses above would have nothing real listening cross-container -- the fix this whole split
+      # exists for (see src/agents/alpha_engine/agent.py's _publish_audit_event docstring for the gap
+      # this closes: the ORDER_AUDIT_EVENTS_TOPIC publish previously reached no subscriber).
+      ZMQ_BROKER_BIND_FRONTEND_ADDRESS: tcp://0.0.0.0:5559
+      ZMQ_BROKER_BIND_BACKEND_ADDRESS: tcp://0.0.0.0:5560
+    depends_on:
+      redis-broker:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+    healthcheck:
+      # Real liveness proxy, not a fabricated per-agent health matrix: every
+      # BaseAgent writes a short-TTL heartbeat:{agent_id} key on each real
+      # tick (core/base_agent.py's _write_heartbeat) -- the key's own TTL
+      # already handles staleness (an unhealthy/stalled agent's key simply
+      # expires), so this only needs to confirm at least one is currently
+      # present. Not a full per-agent breakdown -- that would need this
+      # project's own heartbeat keys enumerated and cross-checked against
+      # the real expected agent_id set, real future work, not fabricated here.
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - "import redis,sys; r=redis.Redis(host='redis-broker',port=6379,password='${REDIS_PASSWORD}'); sys.exit(0 if r.keys('heartbeat:*') else 1)"
+      # interval x retries = 30s worst-case time-to-unhealthy, matching the brief's own "30 secondes"
+      # example (tightened from 15s x 5 = 75-90s, now that a failing healthcheck here actually
+      # triggers a real restart via the autoheal label above -- previously only affected `docker ps`
+      # status, so the old, looser cadence carried no operational cost either way).
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+    logging: *default-logging
+
+  alpha-engine:
+    build: .
+    container_name: nothierly-${CLIENT_ID:?Set CLIENT_ID}-alpha-engine
+    # Read by the autoheal service below -- see that service's own comment for the real gap this
+    # closes (a failing healthcheck alone does not make plain Docker Compose restart a container).
+    labels:
+      autoheal: "true"
+    # Deliberately its OWN container, not folded into nothierly-agents' shared 7-agent process -- see
+    # scripts/run_alpha_engine.py's own docstring: this project's multi-agent-coordination audit found
+    # that shared-process design's real blast-radius problem (one agent's crash kills every agent
+    # sharing that process). An autonomous engine placing real orders 24/7 gets its own failure domain.
+    command: ["python", "scripts/run_alpha_engine.py", "--symbol", "BTC/USDT", "--exchange", "binance"]
+    env_file:
+      - ${CLIENT_ENV_FILE:-.env}
+    environment:
+      CLIENT_ID: ${CLIENT_ID:?Set CLIENT_ID}
+      REDIS_HOST: redis-broker
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD}
+      # CONNECTS to nothierly-agents' real ZMQ broker across containers, resolved via Compose's
+      # embedded DNS (the service name is also nothierly-agents' automatic network alias) -- both
+      # services must share a network, which they do by default: neither this file nor any other
+      # service in it declares a custom `networks:` key, so Compose puts every service in this file on
+      # its one automatic default network already. This container never binds a broker itself -- only
+      # nothierly-agents does (see that service's own ZMQ_BROKER_BIND_*_ADDRESS) -- so no bind-facing
+      # vars are set here. This is what makes ORDER_AUDIT_EVENTS_TOPIC (see
+      # src/agents/alpha_engine/agent.py's _publish_audit_event) actually reach
+      # CryptographicAuditLedger and land in the real WORM ledger -- previously reached no subscriber;
+      # verified end-to-end (bind-wildcard + cross-process connect, this project's exact ZmqBroker/
+      # ZmqPublisher/ZmqSubscriber classes) before this was wired, not assumed. The one piece that
+      # genuinely could not be verified from this environment (no Docker available here) is Compose's
+      # own service-name DNS resolution itself -- standard, well-established behavior, but confirm with
+      # `docker compose logs alpha-engine` after first deploy that "zmq_publisher_connected" appears
+      # with no immediately-following connection error.
+      ZMQ_BROKER_FRONTEND_ADDRESS: tcp://nothierly-agents:5559
+      ZMQ_BROKER_BACKEND_ADDRESS: tcp://nothierly-agents:5560
+    depends_on:
+      redis-broker:
+        condition: service_healthy
+      nothierly-agents:
+        condition: service_healthy
+    # Real, strict resource ceiling (crash-prevention Mission 3) -- honored by plain `docker compose up`
+    # on the modern Compose v2 CLI plugin (this file's own lack of a top-level `version:` key already
+    # marks it as a Compose Specification file, not a legacy `version: "3.x"` one) *without* Swarm; only
+    # legacy `docker-compose` (the old standalone Python v1 tool) silently ignores `deploy:` outside
+    # Swarm mode. core.watchdog.SystemWatchdog reads this exact 1 GiB figure back via the real cgroup
+    # v2/v1 files this limit produces (/sys/fs/cgroup/memory.max) -- see that module's own docstring on
+    # why psutil.virtual_memory() alone cannot see a cgroup limit at all.
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+    healthcheck:
+      # Real file-based liveness (crash-prevention Mission 3), written every healthy tick by
+      # core.watchdog.SystemWatchdog -- checked entirely inside this container's own filesystem, no
+      # volume mount needed. Deliberately replaces the previous Redis-based
+      # `heartbeat:alpha-engine-btc-usdt` check (kept working, but coupled this container's own health
+      # to Redis's availability too: if Redis blipped, THIS check would also report unhealthy even for
+      # a perfectly fine engine process, autoheal-restarting something that didn't need it) -- a stale
+      # local file now means exactly one thing: this specific process stopped ticking, which is what a
+      # container healthcheck should actually be answering. `find -mmin -1` = modified within the last
+      # 60s, comfortably above SystemWatchdog's own 10s check_interval_seconds default.
+      test: ["CMD-SHELL", "find /tmp/nothierly_heartbeat.txt -mmin -1 | grep -q . || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    # restart: on-failure:5 (crash-prevention Mission 3's own explicit requirement) -- NOT `always`
+    # (this service's previous policy, see git history): a genuinely broken build should stop retrying
+    # after 5 consecutive failed attempts instead of crash-looping forever. Safe for the same reason
+    # `always` was: this engine's real safety state (AgentControlState LIVE/SHADOW/OFF) lives in Redis,
+    # not the process, so on_start() resumes into whatever an operator last set on every real restart.
+    # **Real, disclosed limit of this exact policy, not papered over**: Docker cannot distinguish "the
+    # code is genuinely broken" from "core.watchdog/core.exception_manager deliberately exited to
+    # protect capital during a transient Redis/RAM incident" -- both are a nonzero process exit to
+    # Compose. Five consecutive *legitimate* self-protective shutdowns (e.g. a flaky Redis host on a bad
+    # day) would exhaust this budget and leave the engine down exactly like five real crashes would.
+    # Compose's restart policy has no finer-grained signal than "exit code was nonzero" to work with --
+    # this is the real tradeoff `on-failure:5` makes, not a gap unique to this file. The `autoheal`
+    # label above still matters for the one failure mode neither Python-side layer can self-detect: a
+    # fully deadlocked event loop never runs core.watchdog's own task either, so it never exits on its
+    # own at all -- only the external healthcheck-driven restart below can recover that case.
+    restart: on-failure:5
+    logging: *default-logging
+
+  # The real, disclosed gap this closes: a `healthcheck:` block alone (see alpha-engine's above)
+  # only makes `docker ps` report "unhealthy" -- plain Docker Compose does NOT itself restart a
+  # container just because its healthcheck starts failing, only on real process exit. A genuine
+  # asyncio deadlock (the process still running, just no longer making progress -- core.watchdog's
+  # own task stops ticking along with everything else sharing that frozen event loop) would sit
+  # there marked "unhealthy" forever without this -- `alpha-engine`'s own `restart: on-failure:5`
+  # above only fires on a real process exit, which a true deadlock never produces on its own.
+  # `willfarrell/autoheal` is the standard, widely-used real answer for plain Docker/Compose (no
+  # Swarm/Kubernetes liveness probes here): it watches the Docker socket and force-restarts any
+  # container Docker has marked unhealthy. Scoped via the `autoheal: "true"` label +
+  # AUTOHEAL_CONTAINER_LABEL below -- **updated 2026-09-16, "Protocole AEGIS"**: previously only
+  # alpha-engine carried this label; nothierly-agents and nothierly-political-agent now carry it too
+  # (see each service's own comment), since the same real deadlock-without-exit failure mode isn't
+  # unique to alpha-engine. nothierly-dashboard/-gateway/-p2p-api remain untouched, not silently
+  # opted in -- a stuck web server restarts on its own supervisor's terms, and this label's real
+  # cost (see below) is best kept to the processes where a silent deadlock is genuinely dangerous
+  # (running trading logic) rather than applied blanket. **Real, disclosed limit**: unlike
+  # `on-failure:5` above, autoheal's own restarts are not bounded by that retry count -- it keeps
+  # restarting on every unhealthy status it observes, indefinitely. A genuinely broken build that
+  # never recovers would still crash-loop forever via this path even though the Python-side restart
+  # budget on alpha-engine specifically is capped.
+  autoheal:
+    image: willfarrell/autoheal:latest
+    container_name: nothierly-${CLIENT_ID:?Set CLIENT_ID}-autoheal
+    environment:
+      AUTOHEAL_CONTAINER_LABEL: autoheal
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      - alpha-engine
+      - nothierly-agents
+      - nothierly-political-agent
+    restart: unless-stopped
+    logging: *default-logging
+
+  nothierly-dashboard:
+    build: .
+    container_name: nothierly-${CLIENT_ID:?Set CLIENT_ID}-dashboard
+    command: ["streamlit", "run", "src/dashboard/nothierly_ems.py", "--server.address=0.0.0.0", "--server.port=8503"]
+    ports:
+      - "${DASHBOARD_HOST_PORT:-8503}:8503"
+    env_file:
+      # Only REDIS_*/VAULT_* are actually read by the dashboard pages, but
+      # core.config.AppSettings validates every settings group eagerly on
+      # construction -- this service needs the same real client .env for
+      # get_settings() to succeed at all, even though it never uses every
+      # value itself (unchanged reasoning from this file's prior version).
+      - ${CLIENT_ENV_FILE:-.env}
+    environment:
+      CLIENT_ID: ${CLIENT_ID:?Set CLIENT_ID}
+      REDIS_HOST: redis-broker
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD}
+      # Order Audit Trail (src/dashboard/ems_pages/audit_trail.py) queries TimescaleDB from THIS process. Without these two lines the dashboard used the
+      # default 127.0.0.1 (this container itself) and showed "TimescaleDB n'est pas joignable" while the database was healthy. User/password/database
+      # still come from the env_file above.
+      TIMESCALE_HOST: timescaledb
+      TIMESCALE_PORT: "5432"
+      # This container's own copy of p2p_api.py's real internal client key (the P2P Premium
+      # Scanner page sends it as X-API-Key against the now-authenticated production endpoint --
+      # see src/dashboard/ems_pages/p2p_premium_scanner.py). Only this raw value lives here; only
+      # its SHA-256 hash is ever configured on the p2p-api service below (zero-knowledge, even for
+      # this project's own internal traffic).
+      P2P_API_INTERNAL_KEY: ${P2P_API_INTERNAL_KEY:-}
+    depends_on:
+      redis-broker:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+    healthcheck:
+      # Streamlit's own real built-in endpoint (verified live: GET
+      # /_stcore/health -> 200 "ok" on this project's actual dashboard),
+      # not a fabricated check.
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8503/_stcore/health', timeout=3).status == 200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+    logging: *default-logging
+
+  # Real, standalone B2B SaaS pivot -- p2p_api.py's own module docstring for the full design.
+  # No TimescaleDB dependency -- every market-data source this service reads (Binance P2P,
+  # open.er-api.com, CoinGecko) is a real *external* public API. Redis IS a real dependency below
+  # (added for sandbox.py's 30-day history ZSET, and for the SOC 2 rate limiter/audit trail) --
+  # this comment previously said "no redis-broker dependency at all", true when this service was
+  # first built, no longer true; corrected here rather than left stale next to code that
+  # contradicts it.
+  #
+  # **Host port note, corrected from the original brief**: the brief asked for host port 8000,
+  # but that is already claimed by nothierly-gateway above (see its own `ports:` -- a second
+  # service publishing the same host port would fail this whole `docker compose up` outright,
+  # not just conflict silently). The *container's own* internal port is still 8000, exactly as
+  # asked (`--port 8000` below) -- only the host-side mapping moves, the same
+  # `${..._HOST_PORT:-default}` pattern nothierly-gateway/-dashboard already use.
+  nothierly-p2p-api:
+    build: .
+    container_name: nothierly-${CLIENT_ID:?Set CLIENT_ID}-p2p-api
+    command: ["uvicorn", "p2p_api:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "${P2P_API_HOST_PORT:-8001}:8000"
+    # Added for sandbox.py's real 30-day-delayed replay endpoint (p2p_api.py's own
+    # _store_history_snapshot writes each scan's candidates into a per-fiat Redis ZSET) -- this
+    # service's own real-time endpoint (GET /api/v1/p2p-premiums) still needs no Redis/TimescaleDB
+    # at all and degrades gracefully (best-effort history write, see that function's own docstring)
+    # if Redis is ever unreachable; this dependency only gates startup ordering, not correctness.
+    env_file:
+      - ${CLIENT_ENV_FILE:-.env}
+    environment:
+      CLIENT_ID: ${CLIENT_ID:?Set CLIENT_ID}
+      REDIS_HOST: redis-broker
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD}
+      # Zero-knowledge: SHA-256 hex digests only, never a raw key -- see
+      # core/config.py's own P2PApiSettings docstring and p2p_api.py's require_production_api_key.
+      # Unset means the production endpoint fails closed (every request rejected), matching this
+      # project's own established convention for every other API-key setting.
+      P2P_API_KEY_SHA256_HASHES: ${P2P_API_KEY_SHA256_HASHES:-}
+    depends_on:
+      redis-broker:
+        condition: service_healthy
+    healthcheck:
+      # This service's own real liveness endpoint (p2p_api.py's /health) -- not a fabricated check.
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status == 200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+    logging: *default-logging
+
+  # Real, standalone background worker -- political_agent.py's own module docstring for the
+  # full design (RSS in, real LLM crisis scoring, Redis out). Named nothierly-political-agent
+  # deliberately, not "macro_agent" as the brief itself suggested -- this project already has a
+  # real, distinct src.agents.macro.agent.MacroAgent (numeric macro indicators, runs inside
+  # nothierly-agents) with that exact name; reusing it here would collide with an existing,
+  # unrelated real process, not create a new one. No ZMQ broker or TimescaleDB dependency --
+  # this service's entire real contract is RSS in, Redis out (see that module's own docstring
+  # on why it is not a core.base_agent.BaseAgent subclass).
+  nothierly-political-agent:
+    build: .
+    container_name: nothierly-${CLIENT_ID:?Set CLIENT_ID}-political-agent
+    # "Protocole AEGIS" (2026-09-16) -- same real autoheal mechanism as nothierly-agents/alpha-engine
+    # above. Healthcheck cadence below is deliberately left at its own existing, slower pace (this
+    # is a background RSS-poll worker, not a latency-sensitive trading process) rather than copying
+    # the 30s trading-path threshold onto a process with a naturally longer real duty cycle.
+    labels:
+      autoheal: "true"
+    command: ["python", "political_agent.py"]
+    env_file:
+      - ${CLIENT_ENV_FILE:-.env}
+    environment:
+      CLIENT_ID: ${CLIENT_ID:?Set CLIENT_ID}
+      REDIS_HOST: redis-broker
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD}
+    depends_on:
+      redis-broker:
+        condition: service_healthy
+    healthcheck:
+      # Same real "heartbeat:{agent_id} key exists" liveness proxy as nothierly-agents' own
+      # healthcheck above, scoped to this one specific agent_id (a single standalone process,
+      # not a fleet, so a precise check is the honest one here). A generous start_period: one
+      # real cycle (RSS fetch across 5 feeds + any real LLM calls) must complete once before
+      # this first writes its own heartbeat.
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - "import redis,sys; r=redis.Redis(host='redis-broker',port=6379,password='${REDIS_PASSWORD}'); sys.exit(0 if r.exists('heartbeat:political-macro-sentiment-agent') else 1)"
+      interval: 60s
+      timeout: 5s
+      retries: 5
+      start_period: 120s
+    restart: unless-stopped
+    logging: *default-logging
+
+volumes:
+  redis_data:
+  timescaledb_data:

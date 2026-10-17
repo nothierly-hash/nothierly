@@ -1,0 +1,279 @@
+# Platform chain overlay: bridge + execution workers, on top of the engine stack.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.platform.yml up -d --build \
+#       nothierly-platform-bridge nothierly-worker-bybit nothierly-worker-hyperliquid nothierly-worker-binance
+#
+# It is an overlay, not a standalone stack, on purpose: the engine (nothierly-agents) writes its state to the
+# `redis-broker` defined in docker-compose.yml, and the bridge must read THAT Redis. A second Redis here would be empty.
+# The services below join the base file's default network and reach `redis-broker` by name.
+#
+# Prerequisites (nothing here creates them):
+#   1. CURVE keys:   python scripts/generate_curve_keys.py --clients hyperliquid bybit binance --out-dir secrets/curve
+#                    (secrets/ is git-ignored; the script never prints a secret and never overwrites).
+#   2. A platform env file (copy platform.env.example to platform.env): NOTHIERLY_ZMQ_SECRET (>= 32 bytes) and the
+#      exchange credentials. REDIS_PASSWORD and CLIENT_ID come from the same environment as the base file.
+#
+# Nothing here goes live: every worker starts in dry-run on the exchange's testnet. Going live is a reviewed edit of the
+# worker's `command` (add `--live`; mainnet also needs `--network mainnet --i-understand-real-funds`), not an environment
+# variable, so that a typo in an .env file can never send a real order.
+#
+# NOT run: Docker is not installed on the machine this file was written on. It parses as YAML and its service
+# references were checked against the base file by a script, which is not the same as `docker compose config`.
+
+x-platform-logging: &platform-logging
+  driver: "json-file"
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+# Hardening shared by every service here. read_only works because the only writable paths are /data (a volume) and /tmp.
+x-platform-hardening: &platform-hardening
+  restart: unless-stopped
+  logging: *platform-logging
+  read_only: true
+  tmpfs:
+    - /tmp
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+
+x-platform-build: &platform-build
+  context: .
+  dockerfile: Dockerfile.platform
+
+services:
+  nothierly-platform-bridge:
+    <<: *platform-hardening
+    build: *platform-build
+    image: nothierly-platform:local
+    container_name: nothierly-${CLIENT_ID:?Set CLIENT_ID}-platform-bridge
+    # The bridge is the CURVE server: it binds, workers connect. No `ports:` -- reachable only from the compose network.
+    # Workers on OTHER hosts would need a published port and, above all, the CURVE keys (never plaintext).
+    command: ["python", "scripts/run_platform_bridge.py", "--endpoint", "tcp://0.0.0.0:25570", "--venue", "ALL"]
+    # The bridge reads the global kill switch, whose signature is checked with the engine's vault key: core.config
+    # validates the engine's whole configuration, so it needs the engine's env file too. This puts the engine's secrets
+    # (broker credentials included) in this container. Open item: decouple the kill-switch check from the full AppSettings.
+    env_file:
+      - ${CLIENT_ENV_FILE:-.env}
+      - platform.env
+      - secrets/curve/curve_server.env
+    environment:
+      REDIS_HOST: redis-broker
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD}
+      NOTHIERLY_ZMQ_ENCRYPTION: "true"   # CURVE mandatory: missing keys are a startup error, not a plaintext fallback
+    expose:
+      - "25570"
+    depends_on:
+      redis-broker:
+        condition: service_healthy
+
+  nothierly-worker-hyperliquid:
+    <<: *platform-hardening
+    build: *platform-build
+    image: nothierly-platform:local
+    container_name: nothierly-${CLIENT_ID:?Set CLIENT_ID}-worker-hyperliquid
+    # Dry-run on testnet. See the header for how to go live.
+    command:
+      - python
+      - -m
+      - workers.hyperliquid.worker
+      - --address
+      - tcp://nothierly-platform-bridge:25570
+      - --network
+      - testnet
+      - --db
+      - /data/hyperliquid.sqlite3
+    env_file:
+      - platform.env
+      - secrets/curve/curve_hyperliquid.env
+    environment:
+      NOTHIERLY_ZMQ_ENCRYPTION: "true"
+    volumes:
+      - platform_hyperliquid_data:/data
+    depends_on:
+      - nothierly-platform-bridge
+
+  nothierly-worker-bybit:
+    <<: *platform-hardening
+    build: *platform-build
+    image: nothierly-platform:local
+    container_name: nothierly-${CLIENT_ID:?Set CLIENT_ID}-worker-bybit
+    command:
+      - python
+      - -m
+      - workers.bybit.worker
+      - --address
+      - tcp://nothierly-platform-bridge:25570
+      - --network
+      - testnet
+      - --db
+      - /data/bybit.sqlite3
+    env_file:
+      - platform.env
+      - secrets/curve/curve_bybit.env
+    environment:
+      NOTHIERLY_ZMQ_ENCRYPTION: "true"
+    volumes:
+      - platform_bybit_data:/data
+    depends_on:
+      - nothierly-platform-bridge
+
+  nothierly-worker-binance:
+    <<: *platform-hardening
+    build: *platform-build
+    image: nothierly-platform:local
+    container_name: nothierly-${CLIENT_ID:?Set CLIENT_ID}-worker-binance
+    # Dry-run sur le réseau de test (l'adresse du réseau de test de Binance est à confirmer : voir docs, §4.5).
+    command:
+      - python
+      - -m
+      - workers.binance.worker
+      - --address
+      - tcp://nothierly-platform-bridge:25570
+      - --network
+      - testnet
+      - --db
+      - /data/binance.sqlite3
+    env_file:
+      - platform.env
+      - secrets/curve/curve_binance.env
+    environment:
+      NOTHIERLY_ZMQ_ENCRYPTION: "true"
+    volumes:
+      - platform_binance_data:/data
+    depends_on:
+      - nothierly-platform-bridge
+
+  # VPIN en temps réel à partir des trades PUBLICS : aucune clé d'exchange, donc pas de platform.env. Écrit market:vpin:<SYMBOLE> dans
+  # le Redis du moteur ; le moteur n'a ainsi aucun accès sortant. Un seul démon par symbole (Binance OU Hyperliquid, jamais les deux).
+  # Taille de seau VPIN (notionnel USDT). 100 000 etait ~1/114 000 du volume quotidien de BTCUSDT (~11 Md$/jour) : le VPIN sortait a 0,85 en moyenne, 98 % des seaux au-dessus
+  # de 0,7 -- un indicateur sature qui ne separe plus rien (mesure sur 28 jours reconstitues et sur 48 h d'archive en direct). 5 M$ : ~2 700 seaux/jour, moyenne 0,41, aucun
+  # seau au-dessus de 0,7. L'archive garde la taille de chaque seau : ne JAMAIS entrainer sur un melange (train_ppo/train_price_vpin exigent --vpin-bucket-size).
+  nothierly-vpin-tracker:
+    <<: *platform-hardening
+    build: *platform-build
+    image: nothierly-platform:local
+    container_name: nothierly-${CLIENT_ID:?Set CLIENT_ID}-vpin-tracker
+    command:
+      - python
+      - -m
+      - workers.market_data.vpin_tracker
+      - --source
+      - binance
+      - --symbols
+      - BTCUSDT
+      - ETHUSDT
+      - --bucket-size
+      - "5000000"
+      - --window
+      - "50"
+    environment:
+      REDIS_HOST: redis-broker
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD}
+      WEBHOOK_URL: ${WEBHOOK_URL:-}
+    depends_on:
+      redis-broker:
+        condition: service_healthy
+
+  # Même démon sur le flux PUBLIC d'Hyperliquid (aucune clé). Symboles = noms de pièces Hyperliquid (BTC, ETH) : la clé Redis (market:vpin:BTC) et la
+  # colonne `symbol` de l'archive diffèrent de celles de Binance (BTCUSDT), donc aucun conflit avec le tracker ci-dessus. Flux non vérifié contre le
+  # vrai serveur (voir le docstring de workers/market_data/vpin_tracker.py) : lire ses logs au premier démarrage.
+  # 1 M$ : volume ~4x plus faible que Binance, meme logique de dimensionnement (un seau toutes les ~1-2 min, ~1 500 a 2 700 seaux/jour). A recalibrer sur son archive.
+  nothierly-vpin-tracker-hyperliquid:
+    <<: *platform-hardening
+    build: *platform-build
+    image: nothierly-platform:local
+    container_name: nothierly-${CLIENT_ID:?Set CLIENT_ID}-vpin-tracker-hl
+    command:
+      - python
+      - -m
+      - workers.market_data.vpin_tracker
+      - --source
+      - hyperliquid
+      - --symbols
+      - BTC
+      - ETH
+      - --bucket-size
+      - "1000000"
+      - --window
+      - "50"
+    environment:
+      REDIS_HOST: redis-broker
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD}
+      WEBHOOK_URL: ${WEBHOOK_URL:-}
+    depends_on:
+      redis-broker:
+        condition: service_healthy
+
+  # Même démon sur le flux PUBLIC linéaire de Bybit (perpétuels USDT, mainnet : lecture publique, aucune clé). --symbol-suffix BYBIT : sans lui, BTCUSDT de
+  # Bybit écraserait celui de Binance (même clé Redis market:vpin:BTCUSDT, même colonne `symbol` de l'archive) ; ici : market:vpin:BTCUSDTBYBIT.
+  # Flux non vérifié contre le vrai serveur (le format vient de la documentation Bybit v5) : lire ses logs au premier démarrage.
+  # 1 M$ : Bybit a ~1/4 du volume de Binance (cadence mesuree : 753 seaux/h sur ETH a 100 000), meme logique de dimensionnement. A recalibrer sur son archive.
+  nothierly-vpin-tracker-bybit:
+    <<: *platform-hardening
+    build: *platform-build
+    image: nothierly-platform:local
+    container_name: nothierly-${CLIENT_ID:?Set CLIENT_ID}-vpin-tracker-bybit
+    command:
+      - python
+      - -m
+      - workers.market_data.vpin_tracker
+      - --source
+      - bybit
+      - --symbols
+      - BTCUSDT
+      - ETHUSDT
+      - --symbol-suffix
+      - BYBIT
+      - --bucket-size
+      - "1000000"
+      - --window
+      - "50"
+    environment:
+      REDIS_HOST: redis-broker
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD}
+      WEBHOOK_URL: ${WEBHOOK_URL:-}
+    depends_on:
+      redis-broker:
+        condition: service_healthy
+
+  # Réconciliation d'état (src/agents/execution/reconciliation.py) : publie les positions RÉELLES de chaque plateforme dans Redis (exchange:positions:<PLATEFORME>)
+  # pour que le moteur les ADOPTE au redémarrage au lieu de repartir à plat (ce qui ferait fermer toutes les positions au marché). N'a AUCUN droit de trading :
+  # Hyperliquid n'exige aucune clé (adresse publique) ; Bybit/Binance : clés *_READONLY_* créées SANS droit de trading ni de retrait (voir reporter.env.example).
+  # Pour l'activer côté moteur : NOTHIERLY_RECONCILE_VENUES=HYPERLIQUID,BYBIT dans l'environnement de nothierly-agents (même ordre = priorité d'adoption).
+  nothierly-position-reporter:
+    <<: *platform-hardening
+    build: *platform-build
+    image: nothierly-platform:local
+    container_name: nothierly-${CLIENT_ID:?Set CLIENT_ID}-position-reporter
+    command:
+      - python
+      - -m
+      - workers.reconciliation.reporter
+      - --venues
+      - hyperliquid
+      - bybit
+      - --network
+      - testnet
+      - --interval-s
+      - "30"
+    env_file:
+      - reporter.env   # PAS platform.env : ce service ne doit recevoir aucune clé de trading (modèle : reporter.env.example)
+    environment:
+      REDIS_HOST: redis-broker
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD}
+      WEBHOOK_URL: ${WEBHOOK_URL:-}
+    depends_on:
+      redis-broker:
+        condition: service_healthy
+
+volumes:
+  platform_hyperliquid_data:
+  platform_bybit_data:
+  platform_binance_data:

@@ -1,0 +1,32 @@
+// Internal Ultra-Low-Latency EaaS transport -- binary protobuf over HTTP/2 (gRPC), chosen over
+// the project's existing ZMQ PUB/SUB bus (core/zmq_bus.py) specifically for its request/response
+// (unary RPC) shape: the swarm bus is fire-and-forget broadcast, with no built-in "caller waits
+// for exactly this one reply" contract -- gRPC's aio stub gives that natively, which is what a
+// synchronous "execute this trade, tell me what happened" call needs.
+//
+// Regenerate the Python stubs after editing this file:
+//   .venv/Scripts/python.exe -m grpc_tools.protoc -I src/grpc_service \
+//       --python_out=src/grpc_service --grpc_python_out=src/grpc_service \
+//       src/grpc_service/execution.proto
+
+syntax = "proto3";
+
+package nothierly.grpc_service;
+
+service TradeExecutor {
+  rpc ExecuteArbitrage (TradeRequest) returns (TradeResponse);
+}
+
+message TradeRequest {
+  string uuid = 1;
+  string asset = 2;
+  string fiat = 3;
+  double volume = 4;
+  double max_slippage = 5;
+}
+
+message TradeResponse {
+  string status = 1;
+  double executed_price = 2;
+  double timestamp = 3;
+}

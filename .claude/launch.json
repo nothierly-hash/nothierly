@@ -1,0 +1,36 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "gateway",
+      "runtimeExecutable": ".venv/Scripts/uvicorn.exe",
+      "runtimeArgs": ["api_middleware.gateway:app", "--host", "127.0.0.1", "--port", "8000", "--no-server-header"],
+      "port": 8000
+    },
+    {
+      "name": "nothierly-ems",
+      "runtimeExecutable": "cmd.exe",
+      "runtimeArgs": ["/c", ".venv\\Scripts\\streamlit.exe run src/dashboard/nothierly_ems.py --server.headless true --server.port %PORT%"],
+      "port": 8503,
+      "autoPort": true
+    },
+    {
+      "name": "p2p-api",
+      "runtimeExecutable": ".venv/Scripts/uvicorn.exe",
+      "runtimeArgs": ["p2p_api:app", "--host", "127.0.0.1", "--port", "8020"],
+      "port": 8020
+    },
+    {
+      "name": "genesis-static",
+      "runtimeExecutable": ".venv/Scripts/python.exe",
+      "runtimeArgs": ["-m", "http.server", "8090", "--directory", "nothierly_genesis"],
+      "port": 8090
+    },
+    {
+      "name": "arbitrage-dashboard-dev",
+      "runtimeExecutable": "powershell.exe",
+      "runtimeArgs": ["-NoProfile", "-Command", "$env:PATH = 'C:/Program Files/nodejs;' + $env:PATH; Set-Location 'C:/Users/DELL/projet arbitrage/frontend'; & 'C:/Program Files/nodejs/npm.cmd' run dev"],
+      "port": 5173
+    }
+  ]
+}

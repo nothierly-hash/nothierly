@@ -1,0 +1,472 @@
+"""Pont Cerveau -> plateformes externes : l'état réel des positions du moteur devient des ``PlatformSignal``.
+
+**D'où vient le signal.** Les agents de signal (``XgboostSignalAgent``, ``RlSignalAgent``) sortent chacun une
+opinion ``(signal ∈ {-1, 0, 1}, confiance ∈ [0, 1])`` (``core.schemas.TradingSignal``). L'``ExecutionAgent`` les
+arbitre (consensus, 8 portes) et tient les positions qui en résultent. Le pont ne refait AUCUN arbitrage et ne lit
+pas les opinions brutes : il lit l'**état arbitré** que l'``ExecutionAgent`` publie dans Redis
+(``NOTHIERLY_ACTIVE_POSITIONS``, ``NOTHIERLY_EQUITY_CURVE``). Un état plutôt qu'un flux d'événements, parce que :
+
+- les workers raisonnent en **exposition cible** : republier l'état courant est idempotent et se répare seul ;
+- un événement de sortie manqué (par exemple une fermeture simulée en MOCK/SHADOW, qui ne publie pas toujours
+  ``TRADE_EXECUTED``) laisserait une position externe ouverte ; un état, jamais.
+
+**Traduction.** Position ``LONG``/``SHORT`` -> direction ; absence de position -> ``FLAT``. Taille :
+``|unités| x prix / equity du moteur`` en %, donc le dimensionnement du moteur (risque, Kelly, plafonds) est
+réutilisé tel quel ; plafonné par ``max_position_pct`` ; les workers l'appliquent ensuite à LEUR equity.
+La taille publiée est **quantifiée** (``size_bucket_pct``, 2,5 % par défaut, ``quantize_size``) : la taille exacte du
+moteur dépend de sa conviction (multiplicateur de confiance x0,7 à x1,5) et révélerait ce que ``confidence_score``
+interdit de transmettre. La grille réduit la résolution, elle ne la supprime pas : un saut de palier reste un indice.
+
+**Durée minimale de maintien** (``min_hold_s``, 60 s par défaut, 0 = aucune). Le moteur ouvre et ferme parfois en quelques
+secondes ; chaque aller-retour coûterait deux fois frais et glissement à un worker connecté. Le pont ne publie donc la
+fermeture ou l'inversion d'une position qu'une fois la position publiée vieille de ``min_hold_s`` ; en attendant, il
+republie la cible qu'il tient. Ouvertures et changements de taille dans le même sens ne sont jamais retardés. Le kill
+switch et le moteur silencieux passent outre : ils réduisent l'exposition immédiatement. Pendant le délai l'exposition
+externe peut dépasser celle du moteur (elle reste ouverte alors que le moteur est sorti) : c'est le prix assumé.
+Le délai se compte depuis la première publication de la position par CE processus : au redémarrage, une position déjà
+ouverte est tenue ``min_hold_s`` de plus.
+Le ``confidence_score`` n'est pas transmis : il est interdit pour toute plateforme crypto (le flux d'ordres y est
+visible, la magnitude de la conviction fuiterait l'alpha). Voir ``contracts.platform_signal``.
+
+**Sécurité de repli** (sens sûr = réduire) :
+
+- kill switch global actif (``PANIC``/``LATCHED_DATA``, Redis injoignable, signature invalide) -> ``FLAT`` tout de suite ;
+- moteur silencieux (heartbeat de l'``ExecutionAgent`` absent) ou état illisible plus de ``engine_grace_s`` -> ``FLAT`` ;
+  en deçà, on ne publie rien (pas de bascule sur une coupure d'une seconde) ;
+- equity inconnue ou nulle -> on ne publie rien pour une position ouverte (on ne devine pas une taille).
+
+**Alertes** (``alerter`` optionnel, ``workers.common.alerts`` : non bloquant, ne lève jamais). Le pont prévient l'opérateur
+quand il agit de sa propre initiative ou qu'il ne peut plus faire son travail, une fois par épisode, avec un message
+de fin d'épisode :
+
+- ``FLAT`` forcé par le kill switch du moteur ; ``FLAT`` forcé parce que le moteur est muet au-delà du délai de grâce
+  (le message liste les positions que le pont tenait publiées) ;
+- ``publish_failure_threshold`` publications consécutives refusées par le bus (``publish`` renvoie ``False``) : les
+  workers ne reçoivent plus rien ;
+- position ouverte du moteur dont la taille est indéterminable (equity inconnue) : rien n'est publié pour elle.
+
+Ni les ouvertures, ni les fermetures ordinaires, ni les republications n'alertent. Un pont arrêté ou tué n'alerte pas :
+c'est l'homme mort des workers qui protège alors (voir plus bas), et seule une surveillance extérieure le voit.
+
+**Limites connues, à ne pas ignorer :**
+
+- Seules les paires crypto ``BASE/USDT`` sont traduites. Le moteur n'a **aucun modèle d'actions** : rien ne peut
+  alimenter ``NUMERAI_SIGNALS`` (qui exige 100+ scores par jour). Le forex (``EUR_USD``) exigerait un ``stop_loss_price``
+  que le moteur ne fournit pas : ignoré, avec un avertissement.
+- Si le moteur tourne en ``MOCK_MODE``/``SHADOW``, ses positions sont **simulées** : un worker en mode live
+  tradera de l'argent réel d'après des décisions simulées. Garder les workers en dry-run/testnet/démo dans ce cas.
+- Un worker ramène le compte à la cible pour CHAQUE symbole suivi, y compris ``FLAT`` : une position ouverte à la
+  main sur ce symbole serait fermée. Utiliser des comptes dédiés.
+- Si le pont meurt, ce sont les workers qui protègent : leur homme mort (``--dead-man-timeout``, 300 s par défaut)
+  ferme toutes leurs positions après N secondes sans signal valide, puis les verrouille (``workers/common/base.py``).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import time
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
+from decimal import ROUND_HALF_UP, Decimal
+from typing import Any, Final, Protocol
+
+from contracts.platform_signal import AssetClass, OrderType, PlatformSignal, SignalDirection, TargetVenue
+from workers.common.alerts import Alerter, Severity
+
+_log = logging.getLogger(__name__)
+
+ACTIVE_POSITIONS_KEY: Final[str] = "NOTHIERLY_ACTIVE_POSITIONS"
+EQUITY_CURVE_KEY: Final[str] = "NOTHIERLY_EQUITY_CURVE"
+ENGINE_HEARTBEAT_KEY: Final[str] = "heartbeat:execution-agent"
+ENGINE_STATE_KEY: Final[str] = "engine:state"  # écrit par core.heartbeat avec le heartbeat
+STATE_STARTING: Final[str] = "STARTING"
+STATE_RECONCILING: Final[str] = "RECONCILING"  # le moteur adopte les positions réelles de l'exchange (voir src/agents/execution/reconciliation.py)
+# États où le moteur est vivant mais ne tient pas encore ses positions : le pont ne publie RIEN (ni cible, ni FLAT) et la tolérance est bornée.
+HOLD_STATES: Final[frozenset[str]] = frozenset({STATE_STARTING, STATE_RECONCILING})
+_QUOTES: Final[frozenset[str]] = frozenset({"USDT", "USD"})
+_MIN_PCT: Final[Decimal] = Decimal("0.01")
+
+
+@dataclass(frozen=True)
+class EnginePosition:
+    instrument: str  # ex. "BTC/USDT"
+    status: str  # "LONG" | "SHORT"
+    units: Decimal  # valeur absolue
+    price: Decimal  # prix courant (sinon prix d'entrée)
+
+
+@dataclass(frozen=True)
+class EngineView:
+    positions: tuple[EnginePosition, ...]
+    equity: Decimal | None  # equity du moteur en USD, ou None si inconnue
+    engine_alive: bool  # heartbeat de l'ExecutionAgent présent
+    system_safe: bool  # kill switch global : False = halte
+    engine_state: str | None = None  # « STARTING » (modèles en chargement) ou « ACTIVE » ; None = clé absente (ancien moteur) : traité comme prêt
+
+
+class EngineStateReader(Protocol):
+    async def read(self) -> EngineView:
+        """Lit l'état du moteur. Lève si l'état est illisible (Redis injoignable, JSON invalide...)."""
+        ...
+
+
+class SignalSink(Protocol):
+    def publish(self, signal: PlatformSignal) -> bool:
+        """``True`` si le message est en file d'envoi, ``False`` s'il est abandonné."""
+        ...
+
+
+@dataclass(frozen=True)
+class BridgeConfig:
+    instruments: tuple[str, ...] = ("BTC/USDT", "ETH/USDT")
+    venue: TargetVenue = TargetVenue.ALL  # ALL = toutes les plateformes crypto
+    max_position_pct: Decimal = Decimal("20")
+    change_threshold_pct: Decimal = Decimal("0.25")  # variation de cible qui déclenche une republication
+    size_bucket_pct: Decimal | None = Decimal("2.5")  # pas de quantification de la taille publiée ; None = taille exacte
+    min_hold_s: float = 60.0  # durée minimale entre l'ouverture publiée d'une position et sa fermeture/inversion ; 0 = aucune
+    refresh_s: float = 10.0  # republication périodique : les workers se recalent, un worker tardif rattrape
+    engine_grace_s: float = 30.0
+    # Démarrage à froid : tant que le moteur n'a jamais été vu prêt (ou qu'il annonce STARTING), son silence est un AVERTISSEMENT, pas un
+    # ordre FLAT ni une alerte. Borné : passé ce délai le silence redevient une panne (délai ``engine_grace_s`` ensuite).
+    engine_startup_grace_s: float = 300.0  # chargement des modèles puis adoption des positions : les deux phases se cumulent
+    ttl_ms: int = 10_000
+    poll_s: float = 2.0
+    publish_failure_threshold: int = 3  # publications refusées d'affilée avant d'alerter
+    flatten_on_halt: bool = True
+    flatten_when_engine_down: bool = True
+    symbol_overrides: Mapping[str, str] = field(default_factory=dict)
+
+
+def to_internal_symbol(instrument: str, overrides: Mapping[str, str] | None = None) -> str | None:
+    """``BTC/USDT`` -> ``CRYPTO_BTC_USD``. ``None`` pour tout ce qui n'est pas une paire crypto ``BASE/USDT|USD``."""
+    if overrides and instrument in overrides:
+        return overrides[instrument]
+    base, sep, quote = instrument.partition("/")
+    if not sep or quote not in _QUOTES or not base.isalnum() or not base.isupper():
+        return None
+    return f"CRYPTO_{base}_USD"
+
+
+def quantize_size(raw_pct: Decimal, bucket: Decimal, cap: Decimal, previous: Decimal | None = None) -> Decimal:
+    """Ramène une taille exacte (% d'equity) sur une grille de pas ``bucket``.
+
+    Le dimensionnement du moteur (risque fixe x multiplicateur de confiance, ``size_multiplier_from_confidence``)
+    fait varier la taille avec la conviction : publiée telle quelle sur une plateforme publique, elle la révèle. La
+    grille en réduit la résolution ; elle ne l'efface pas (un saut de palier reste un indice).
+
+    - arrondi au palier le plus proche, moitié vers le haut (``ROUND_HALF_UP`` sur des ``Decimal``, pas l'arrondi
+      du banquier de ``round()``) ;
+    - jamais moins d'un palier : une position ouverte ne devient pas un signal ``0``, que le contrat refuse pour
+      ``LONG``/``SHORT``. Conséquence assumée : une position plus petite qu'un demi-palier est publiée à un palier ;
+    - plafonné à ``cap`` (le plafond prime sur la grille s'il n'en est pas un multiple) ;
+    - hystérésis : si ``previous`` (palier déjà publié) est à moins de 0,75 palier de la taille exacte, on le garde.
+      Une taille qui oscille autour d'une frontière de palier ne fait donc pas basculer le signal à chaque cycle.
+    """
+    if previous is not None and abs(raw_pct - previous) < bucket * Decimal("0.75"):
+        return previous
+    steps = (raw_pct / bucket).to_integral_value(rounding=ROUND_HALF_UP)
+    return min(max(steps, Decimal(1)) * bucket, cap)
+
+
+def desired_target(
+    position: EnginePosition | None, equity: Decimal | None, cfg: BridgeConfig, previous: Decimal | None = None,
+) -> tuple[SignalDirection, Decimal] | None:
+    """``(direction, % d'equity)`` visé pour un instrument, ou ``None`` si la taille est indéterminable.
+
+    ``previous`` : taille déjà publiée dans le même sens, pour l'hystérésis de la quantification.
+    """
+    if position is None:
+        return SignalDirection.FLAT, Decimal(0)
+    if equity is None or equity <= 0:
+        return None
+    pct = min(position.units * position.price / equity * 100, cfg.max_position_pct)
+    if pct < _MIN_PCT:
+        return SignalDirection.FLAT, Decimal(0)  # trop petit pour être un signal LONG/SHORT valide
+    direction = SignalDirection.LONG if position.status == "LONG" else SignalDirection.SHORT
+    if cfg.size_bucket_pct is not None:
+        return direction, quantize_size(pct, cfg.size_bucket_pct, cfg.max_position_pct, previous).quantize(Decimal("0.01"))
+    return direction, pct.quantize(Decimal("0.01"))
+
+
+@dataclass
+class _Published:
+    direction: SignalDirection
+    pct: Decimal
+    at: float
+    opened_at: float  # instant où CETTE direction (non FLAT) a été publiée pour la première fois ; conservé tant qu'elle dure
+
+
+class PlatformBridge:
+    def __init__(
+        self, reader: EngineStateReader, sink: SignalSink, config: BridgeConfig | None = None,
+        *, clock: Callable[[], float] = time.monotonic, alerter: Alerter | None = None,
+    ) -> None:
+        self._alerter = alerter
+        self._episodes: set[str] = set()  # épisodes d'alerte en cours (une alerte au début, une à la fin)
+        self._publish_failures = 0
+        self._reader = reader
+        self._sink = sink
+        self._cfg = config or BridgeConfig()
+        self._clock = clock
+        self._last: dict[str, _Published] = {}
+        self._unhealthy_since: float | None = None
+        self._started_at = clock()
+        self._engine_ready_seen = False  # le moteur a-t-il déjà été vu vivant ET prêt (pas STARTING) depuis le démarrage du pont ?
+        self._starting_since: float | None = None
+        self._last_starting_log = float("-inf")
+        self._warned: set[str] = set()
+        self._held: set[str] = set()  # instruments dont une fermeture/inversion est en attente du délai minimal
+        self._symbols = {i: to_internal_symbol(i, self._cfg.symbol_overrides) for i in self._cfg.instruments}
+        for instrument, symbol in self._symbols.items():
+            if symbol is None:
+                _log.warning("bridge_instrument_ignored instrument=%s : seules les paires crypto BASE/USDT sont traduites", instrument)
+
+    def _begin(self, key: str, text: str) -> None:
+        """Alerte critique au début d'un épisode ; silencieuse tant qu'il dure."""
+        if key in self._episodes:
+            return
+        self._episodes.add(key)
+        self._notify(key, text, Severity.CRITICAL)
+
+    def _end(self, key: str, text: str) -> None:
+        if key in self._episodes:
+            self._episodes.discard(key)
+            self._notify(f"end:{key}", text, Severity.INFO)
+
+    def _notify(self, key: str, text: str, severity: Severity) -> None:
+        if self._alerter is None:
+            return
+        try:
+            self._alerter.alert(text, key=key, severity=severity)
+        except Exception:  # noqa: BLE001 -- une alerte ne doit jamais arrêter le pont
+            _log.exception("bridge_alert_failed key=%s", key)
+
+    def _held_exposure(self) -> str:
+        held = [f"{i} {p.direction.value} {p.pct}%" for i, p in self._last.items() if p.direction is not SignalDirection.FLAT]
+        return ", ".join(held) if held else "aucune position publiée"
+
+    def _build(self, symbol: str, direction: SignalDirection, pct: Decimal) -> PlatformSignal:
+        return PlatformSignal(
+            target_venue=self._cfg.venue,
+            asset_class=AssetClass.CRYPTO,
+            symbol=symbol,
+            direction=direction,
+            position_size_pct=float(pct),
+            order_type=OrderType.MARKET,
+            ttl_ms=self._cfg.ttl_ms,
+        )
+
+    def _should_publish(self, instrument: str, direction: SignalDirection, pct: Decimal, now: float) -> bool:
+        last = self._last.get(instrument)
+        if last is None or last.direction is not direction:
+            return True
+        return abs(pct - last.pct) >= self._cfg.change_threshold_pct or now - last.at >= self._cfg.refresh_s
+
+    def _apply_min_hold(self, instrument: str, direction: SignalDirection, pct: Decimal, now: float) -> tuple[SignalDirection, Decimal]:
+        """Retient la cible déjà publiée tant que la position publiée n'a pas vécu ``min_hold_s``.
+
+        Ne retient que ce qui défait une position publiée : la fermeture (``FLAT``) et l'inversion. Une ouverture, un
+        changement de taille dans le même sens et la republication périodique ne sont jamais retardés. Le moteur peut
+        ouvrir puis fermer en quelques secondes ; sans ce délai, un worker connecté paierait deux fois les frais et le
+        glissement pour chaque aller-retour. Contrepartie assumée : pendant le délai, l'exposition externe peut différer de
+        celle du moteur (elle reste ouverte alors que le moteur est déjà sorti). Le kill switch et le moteur silencieux
+        ne passent jamais par ici : ils réduisent l'exposition tout de suite.
+        """
+        last = self._last.get(instrument)
+        if (
+            self._cfg.min_hold_s <= 0 or last is None or last.direction is SignalDirection.FLAT
+            or direction is last.direction or now - last.opened_at >= self._cfg.min_hold_s
+        ):
+            self._held.discard(instrument)
+            return direction, pct
+        if instrument not in self._held:
+            self._held.add(instrument)
+            _log.info(
+                "bridge_hold instrument=%s : le moteur demande %s mais %s est publié depuis %.0fs (< %.0fs), cible conservée",
+                instrument, direction.value, last.direction.value, now - last.opened_at, self._cfg.min_hold_s,
+            )
+        return last.direction, last.pct
+
+    def _publish(self, instrument: str, direction: SignalDirection, pct: Decimal, reason: str, now: float) -> str | None:
+        symbol = self._symbols[instrument]
+        if symbol is None:
+            return None
+        signal = self._build(symbol, direction, pct)
+        if not self._sink.publish(signal):
+            _log.warning("bridge_signal_dropped instrument=%s", instrument)
+            self._publish_failures += 1
+            if self._publish_failures >= self._cfg.publish_failure_threshold:
+                self._begin(
+                    "publish_failing",
+                    f"le bus refuse les publications ({self._publish_failures} d'affilée, dernier : {instrument}) : "
+                    "les workers ne reçoivent plus rien et gardent leur dernière cible jusqu'à leur homme mort.",
+                )
+            return None
+        self._publish_failures = 0
+        self._end("publish_failing", "le bus accepte de nouveau les publications.")
+        previous = self._last.get(instrument)
+        opened_at = previous.opened_at if previous is not None and previous.direction is direction and direction is not SignalDirection.FLAT else now
+        self._last[instrument] = _Published(direction, pct, now, opened_at)
+        _log.info("bridge_signal instrument=%s %s %s%% venue=%s reason=%s", instrument, direction.value, pct, self._cfg.venue.value, reason)
+        return f"{instrument}:{direction.value}:{pct}:{reason}"
+
+    def _starting_within_grace(self, view: EngineView | None, now: float) -> bool:
+        """``True`` si le moteur est en démarrage et que le délai de grâce de démarrage n'est pas écoulé.
+
+        Deux cas : le moteur annonce ``STARTING`` (``core.heartbeat``, écrit avant le chargement des modèles), ou il n'a JAMAIS été vu prêt depuis
+        le démarrage du pont et son heartbeat n'existe pas encore (lancement à froid : le pont part avant le moteur). Un Redis illisible
+        n'entre pas ici : c'est une panne, pas un démarrage.
+        """
+        grace = self._cfg.engine_startup_grace_s
+        if view is None or grace <= 0:
+            return False
+        if view.engine_alive and view.engine_state in HOLD_STATES:
+            if self._starting_since is None:
+                self._starting_since = now
+            return now - self._starting_since < grace
+        if not view.engine_alive and not self._engine_ready_seen:
+            return now - self._started_at < grace
+        return False
+
+    async def step(self) -> list[str]:
+        """Un cycle : lit le moteur, décide, publie ce qui doit l'être. Renvoie les publications faites (« instrument:dir:pct:raison »)."""
+        now = self._clock()
+        view: EngineView | None
+        try:
+            view = await self._reader.read()
+        except Exception as exc:  # noqa: BLE001 -- état illisible : on ne devine pas, on laisse jouer le délai de grâce
+            _log.warning("bridge_engine_state_unreadable %s: %s", type(exc).__name__, exc)
+            view = None
+
+        healthy = view is not None and view.engine_alive and view.engine_state not in HOLD_STATES
+        if healthy:
+            self._engine_ready_seen = True
+            self._starting_since = None
+        starting = self._starting_within_grace(view, now)
+        if healthy or starting:
+            self._unhealthy_since = None  # un moteur qui s'initialise n'est pas un moteur muet : le compteur de silence ne tourne pas
+        elif self._unhealthy_since is None:
+            self._unhealthy_since = now
+        down_for = 0.0 if self._unhealthy_since is None else now - self._unhealthy_since
+
+        flatten_reason: str | None = None
+        if view is not None and not view.system_safe and self._cfg.flatten_on_halt:
+            flatten_reason = "kill_switch"
+            self._begin("kill_switch", f"KILL SWITCH du moteur actif : le pont publie FLAT sur tous les instruments. Tenu avant : {self._held_exposure()}.")
+        elif starting:
+            if now - self._last_starting_log >= 15.0:
+                self._last_starting_log = now
+                _log.warning(
+                    "bridge_engine_starting : moteur en initialisation (état %s), rien n'est publié ni aucune alerte envoyée ; borne %.0fs",
+                    view.engine_state if view is not None and view.engine_state in HOLD_STATES else "jamais vu", self._cfg.engine_startup_grace_s,
+                )
+            return []  # la kill switch a déjà été traitée au-dessus : seul le silence d'un moteur qui démarre est toléré
+        elif not healthy and down_for >= self._cfg.engine_grace_s and self._cfg.flatten_when_engine_down:
+            flatten_reason = "engine_down"
+            self._begin(
+                "engine_down",
+                f"MOTEUR muet depuis {down_for:.0f}s (grâce {self._cfg.engine_grace_s:.0f}s) : le pont publie FLAT sur tous les instruments. "
+                f"Tenu avant : {self._held_exposure()}.",
+            )
+        elif not healthy:
+            return []  # dans le délai de grâce : on garde la dernière cible, on ne publie rien
+        if view is not None and view.system_safe:
+            self._end("kill_switch", "kill switch levé : le pont republie l'état du moteur.")
+        if healthy:
+            self._end("engine_down", "le moteur est revenu : le pont republie son état.")
+
+        published: list[str] = []
+        by_instrument = {p.instrument: p for p in (view.positions if view is not None else ())}
+        for instrument in self._cfg.instruments:
+            if self._symbols[instrument] is None:
+                continue
+            if flatten_reason is not None:
+                direction, pct, reason = SignalDirection.FLAT, Decimal(0), flatten_reason
+            else:
+                assert view is not None
+                position = by_instrument.get(instrument)
+                last = self._last.get(instrument)
+                same_side = last is not None and position is not None and last.direction.value == position.status
+                target = desired_target(position, view.equity, self._cfg, last.pct if same_side and last is not None else None)
+                if target is None:
+                    if instrument not in self._warned:
+                        self._warned.add(instrument)
+                        _log.warning("bridge_no_equity instrument=%s : position ouverte mais equity inconnue, rien n'est publié", instrument)
+                    self._begin(
+                        f"no_equity:{instrument}",
+                        f"position ouverte sur {instrument} mais equity du moteur inconnue : taille indéterminable, rien n'est publié "
+                        "(les workers gardent leur dernière cible).",
+                    )
+                    continue
+                self._warned.discard(instrument)
+                self._end(f"no_equity:{instrument}", f"equity du moteur de nouveau connue : {instrument} republié.")
+                (direction, pct), reason = self._apply_min_hold(instrument, *target, now), "engine_state"
+            if self._should_publish(instrument, direction, pct, now):
+                entry = self._publish(instrument, direction, pct, reason, now)
+                if entry is not None:
+                    published.append(entry)
+        return published
+
+    async def run(self, stop: asyncio.Event | None = None) -> None:
+        stop = stop if stop is not None else asyncio.Event()
+        while not stop.is_set():
+            try:
+                await self.step()
+            except Exception:  # noqa: BLE001 -- un cycle raté ne doit jamais arrêter le pont
+                _log.exception("bridge_step_failed")
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=self._cfg.poll_s)
+            except asyncio.TimeoutError:
+                pass
+
+
+class RedisEngineReader:
+    """Lit l'état du moteur dans Redis (``client.execute(commande, ...)`` : ``core.redis_client.RedisClient``)."""
+
+    def __init__(self, client: Any, system_safe: Callable[[], Any]) -> None:
+        self._client = client
+        self._system_safe = system_safe  # coroutine ``core.security.is_system_safe``
+
+    async def read(self) -> EngineView:
+        raw_positions, raw_equity, heartbeat, raw_state = await asyncio.gather(
+            self._client.execute("get", ACTIVE_POSITIONS_KEY),
+            self._client.execute("lindex", EQUITY_CURVE_KEY, 0),
+            self._client.execute("exists", ENGINE_HEARTBEAT_KEY),
+            self._client.execute("get", ENGINE_STATE_KEY),
+        )
+        positions = tuple(_parse_positions(raw_positions))
+        equity = _parse_equity(raw_equity)
+        return EngineView(positions, equity, bool(heartbeat), bool(await self._system_safe()), _parse_engine_state(raw_state))
+
+
+def _parse_engine_state(raw: Any) -> str | None:
+    """``engine:state`` (JSON ``{"state": ...}``) -> l'état, ou ``None`` si la clé est absente ou illisible (traité comme « prêt »)."""
+    if raw in (None, ""):
+        return None
+    try:
+        state = json.loads(raw)["state"]
+    except (ValueError, KeyError, TypeError):
+        return None
+    return state if isinstance(state, str) else None
+
+
+def _parse_positions(raw: Any) -> Sequence[EnginePosition]:
+    if raw is None:
+        return []
+    out = []
+    for item in json.loads(raw):
+        status = str(item.get("status", ""))
+        if status not in ("LONG", "SHORT"):
+            continue
+        price = Decimal(str(item.get("current_price") or item.get("entry_price") or 0))
+        out.append(EnginePosition(str(item["instrument"]), status, abs(Decimal(str(item["units"]))), price))
+    return out
+
+
+def _parse_equity(raw: Any) -> Decimal | None:
+    if raw is None:
+        return None
+    balance = json.loads(raw).get("balance")
+    return None if balance is None else Decimal(str(balance))

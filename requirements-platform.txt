@@ -1,0 +1,20 @@
+# Runtime dependencies of Dockerfile.platform: the bridge (scripts/run_platform_bridge.py) and the platform workers
+# (workers/*). Not the engine's requirements.txt (torch, xgboost, ... : none of that runs here).
+#
+# Same bounds as requirements.txt for the shared packages, so that the bridge and the engine agree on versions.
+#
+# The bridge imports core.config / core.redis_client / core.security (to read the engine's state and the global kill
+# switch), hence pydantic-settings, structlog and redis.
+redis>=5.0.0,<6.0.0
+pyzmq>=25.1.0,<28.0.0
+# Flux WebSocket privés des fills (workers/common/ws_tracker.py). Même borne que requirements.txt.
+websockets>=13.0,<16.0.0
+pydantic>=2.7.0,<3.0.0
+pydantic-settings>=2.3.0,<3.0.0
+python-dotenv>=1.0.0,<2.0.0
+structlog>=24.1.0,<25.0.0
+
+# Hyperliquid worker only (imported lazily by workers/hyperliquid/client.py, along with eth-account which it depends
+# on). NOT verified: the adapter was written against the SDK's source and tested against a fake; no call has been
+# made against the real service, and 0.24.0 is the latest version on the index, not a version the adapter was run with.
+hyperliquid-python-sdk>=0.20.0,<0.25.0

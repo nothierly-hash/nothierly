@@ -1,0 +1,104 @@
+# "Immutable Core" gate. Single job, single pinned base image (python:3.12-slim,
+# via Dockerfile -- see that file's own comment on why 3.12 and not 3.11/alpine:
+# prebuilt-wheel coverage for torch/pyzmq/xgboost/grpcio). Deliberately no
+# runner-side `actions/setup-python` and no OS/Python version matrix: adding
+# either would reintroduce, inside CI itself, the exact "runs on my machine but
+# not in prod" drift this pipeline exists to kill. Everything Python-related
+# happens inside the Docker image under test, not on the bare runner.
+name: Nothierly CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# A new push to the same PR/branch supersedes the one in flight -- no point
+# burning minutes finishing a build for a diff that's already stale.
+concurrency:
+  group: nothierly-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    # Real, per the brief's own ask -- but disclosed honestly: today's
+    # tests/ suite mocks Redis entirely via `fakeredis` (verified: see
+    # tests/test_redis_client.py and 50 other files importing it), so
+    # nothing in the current suite actually calls out to this service. It's
+    # wired up as a real fixture for any test that opts in via
+    # REDIS_HOST/REDIS_PORT (below) or for integration tests added later --
+    # not because the suite needs it today.
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # --- Layer + pip cache segregation ---------------------------------
+      # GitHub Actions' own cache backend (type=gha) caches Docker BuildKit
+      # layers across runs, keyed per stage (separate scopes below) --
+      # this is what actually makes the `pip install -r requirements*.txt`
+      # layer a cache hit on a docs-only or test-only change, since that
+      # layer only invalidates when requirements*.txt itself changes, not on
+      # every push. No separate actions/cache for a bare pip download cache:
+      # nothing here runs pip on the runner itself, only inside these
+      # image builds, so that cache would sit unused.
+      - name: Build test image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          target: test
+          tags: nothierly:test
+          load: true
+          cache-from: type=gha,scope=nothierly-test
+          cache-to: type=gha,mode=max,scope=nothierly-test
+
+      # Runs pytest inside the exact image just built -- see Dockerfile's
+      # `test` stage CMD for the actual pytest invocation (coverage flags,
+      # --cov-fail-under). --network host: the job's `redis` service
+      # container is reachable at localhost:6379 from the runner; host
+      # networking is what makes it reachable from inside this container too
+      # (ubuntu-latest only -- would need a different bridge on macOS/Windows
+      # runners, moot here since this job is Linux-only by design).
+      # "85 tests" from the brief is not independently verified here -- no
+      # local Docker to run the count. What is verified: 52 files under
+      # tests/ reference gate/porte logic, 8 reference fail-closed behavior.
+      # pytest's own exit code is the real gate; if the true count differs
+      # from 85, this still fails correctly on any actual test failure.
+      - name: Run test suite
+        run: |
+          docker run --rm --network host \
+            -e REDIS_HOST=localhost \
+            -e REDIS_PORT=6379 \
+            nothierly:test
+
+      # Verifies the actual production target (final stage, non-root user,
+      # no test deps) builds clean. Not run -- this job has no live
+      # exchange/broker credentials to give it, and doesn't need any to prove
+      # the image assembles correctly.
+      - name: Build production image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          target: nothierly-runtime
+          tags: nothierly:latest
+          load: true
+          cache-from: type=gha,scope=nothierly-prod
+          cache-to: type=gha,mode=max,scope=nothierly-prod
+
+      - name: Verify production image runs as non-root
+        run: |
+          docker run --rm nothierly:latest id -u | grep -qv '^0$'

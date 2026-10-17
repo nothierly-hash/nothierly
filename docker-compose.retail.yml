@@ -1,0 +1,148 @@
+# Retail Gateway -- the B2C signup/auth microservice's OWN, fully standalone Compose stack.
+#
+# **This is the real air-gap enforcement mechanism, not just a docstring claim**: deliberately a
+# SEPARATE file from docker-compose.yml/docker-compose.prod.yml (the trading core's own
+# manifests), with its own Postgres, its own Redis, its own network, and no `depends_on`/network
+# link to any trading-core service. Launched independently:
+#
+#   docker compose -f docker-compose.retail.yml -p nothierly-retail --env-file .env.retail up -d
+#
+# Never combined with `-f docker-compose.yml -f docker-compose.retail.yml` the way
+# docker-compose.prod.yml is layered onto docker-compose.yml (that file's own header explains why
+# an overlay is right there: same services, additional production concerns). Doing that here
+# would put both stacks on Compose's one default network and reintroduce exactly the shared-
+# processor/shared-event-loop coupling the mission's own brief forbids -- these two stacks are
+# meant to never resolve each other's service names at all.
+#
+# Real, disclosed data-flow exception: retail-postgres is reachable from OUTSIDE this stack for
+# exactly one purpose -- scripts/export_performance_snapshot.py (in the main trading repo) opens
+# an outbound connection INTO retail-postgres to write public_performance_snapshot rows. That
+# script does not run inside this stack and this stack has no code path that reaches back INTO
+# the trading core. See retail_gateway/main.py's module docstring for the full argument.
+
+x-retail-logging: &retail-logging
+  driver: "json-file"
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  retail-postgres:
+    image: postgres:16-alpine
+    container_name: nothierly-retail-postgres
+    restart: unless-stopped
+    logging: *retail-logging
+    environment:
+      - POSTGRES_USER=${RETAIL_DB_USER:?Set RETAIL_DB_USER}
+      - POSTGRES_PASSWORD=${RETAIL_DB_PASSWORD:?Set RETAIL_DB_PASSWORD}
+      - POSTGRES_DB=${RETAIL_DB_DATABASE:-retail_gateway}
+    # Published to the host (unlike the trading core's timescaledb, which is internal-only) --
+    # this is the one real, disclosed exception above: the trading-side export script needs to
+    # reach this database from outside this Compose project. Restrict via a real firewall rule
+    # or Postgres `pg_hba.conf`/host allowlist in production, not relied on being "just" a
+    # container port mapping.
+    ports:
+      - "${RETAIL_DB_HOST_PORT:-5433}:5432"
+    volumes:
+      - retail_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${RETAIL_DB_USER} -d ${RETAIL_DB_DATABASE:-retail_gateway}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  retail-redis:
+    image: redis:7-alpine
+    container_name: nothierly-retail-redis
+    command: redis-server --requirepass ${RETAIL_REDIS_PASSWORD:?Set RETAIL_REDIS_PASSWORD} --appendonly yes
+    restart: unless-stopped
+    logging: *retail-logging
+    expose:
+      - "6379"
+    volumes:
+      - retail_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${RETAIL_REDIS_PASSWORD}", "--no-auth-warning", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  retail-api:
+    build:
+      context: .
+      dockerfile: retail_gateway/Dockerfile
+    container_name: nothierly-retail-api
+    command: ["uvicorn", "retail_gateway.main:app", "--host", "0.0.0.0", "--port", "8100"]
+    ports:
+      - "${RETAIL_API_HOST_PORT:-8100}:8100"
+    env_file:
+      - .env.retail
+    environment:
+      RETAIL_DB_HOST: retail-postgres
+      RETAIL_DB_PORT: "5432"
+      RETAIL_REDIS_HOST: retail-redis
+      RETAIL_REDIS_PORT: "6379"
+    depends_on:
+      retail-postgres:
+        condition: service_healthy
+      retail-redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8100/health', timeout=3).status == 200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+    logging: *retail-logging
+
+  retail-email-worker:
+    # Name unchanged (still keyed off the original welcome-email task) even though this same
+    # worker process now also consumes the Identity Gateway's send_otp_email/send_otp_sms tasks
+    # -- one Celery app (retail_gateway.tasks), one worker service; the OTP tasks need no
+    # separate queue/service of their own. Set RETAIL_SMS_* in .env.retail for real Twilio
+    # delivery -- unset, this worker logs OTP SMS instead of sending it (see sms_provider.py).
+    build:
+      context: .
+      dockerfile: retail_gateway/Dockerfile
+    container_name: nothierly-retail-email-worker
+    command: ["celery", "-A", "retail_gateway.tasks", "worker", "--loglevel=info", "--concurrency=2"]
+    env_file:
+      - .env.retail
+    environment:
+      RETAIL_DB_HOST: retail-postgres
+      RETAIL_DB_PORT: "5432"
+      RETAIL_REDIS_HOST: retail-redis
+      RETAIL_REDIS_PORT: "6379"
+    depends_on:
+      retail-redis:
+        condition: service_healthy
+    restart: unless-stopped
+    logging: *retail-logging
+
+  retail-frontend:
+    build:
+      context: ./retail_frontend
+      # A real Next.js build-time requirement, not a runtime `environment:` -- see
+      # retail_frontend/Dockerfile's own comment: NEXT_PUBLIC_* vars are inlined into the
+      # client JS bundle by `npm run build`, so this must be a build ARG. Points at retail-api's
+      # HOST-published port (RETAIL_API_HOST_PORT above), not the internal container name/port:
+      # this value ships inside the page a visitor's own browser runs, which cannot resolve
+      # Compose's internal DNS. Changing it means rebuilding this image, not just restarting it.
+      args:
+        NEXT_PUBLIC_RETAIL_API_BASE_URL: ${RETAIL_PUBLIC_API_URL:-http://127.0.0.1:8100}
+    container_name: nothierly-retail-frontend
+    ports:
+      - "${RETAIL_FRONTEND_HOST_PORT:-3000}:3000"
+    depends_on:
+      - retail-api
+    restart: unless-stopped
+    logging: *retail-logging
+
+networks:
+  default:
+    name: nothierly_retail_net
+
+volumes:
+  retail_postgres_data:
+  retail_redis_data:
