@@ -270,6 +270,7 @@ from core.quant_math import (
 )
 from core.redis_client import RedisUnavailableError
 from core.schemas import (
+    ALPHA_ENGINE_ASSET_RISK_OVERRIDE_REDIS_KEY_PREFIX,
     ALPHA_ENGINE_ASSET_STATUS_REDIS_KEY_PREFIX,
     EMERGENCY_HALT_TOPIC,
     HEARTBEAT_REDIS_KEY_PREFIX,
@@ -613,6 +614,18 @@ _POISEUILLE_EXECUTION_HORIZON: Final[float] = 1.0
 # -- Gate 6 addition (2026-09-13, "Arsenal Interdisciplinaire") -- reuses this class's own
 # correlation_threshold (see PortfolioRiskParityManager's constructor) as the percolation edge
 # threshold, informational only -- see _gate_6_portfolio_risk_parity's own docstring.
+
+
+class AssetRiskOverrideUnreadableError(Exception):
+    """The per-asset risk override exists but could not be read or parsed: the entry is refused rather than assumed unrestricted."""
+
+
+@dataclass(frozen=True)
+class AssetRiskOverride:
+    """Per-asset limits written by the dashboard's Asset Universe Control. ``None`` = that limit is not set (no override on it)."""
+
+    max_spread: float | None
+    max_units: float | None
 
 
 @dataclass(frozen=True)
@@ -2327,6 +2340,38 @@ class ExecutionAgent(BaseAgent):
             raw = raw.decode("utf-8", errors="replace")
         return bool(raw == "OFF")
 
+    async def _read_asset_risk_override(self, instrument: str) -> AssetRiskOverride | None:
+        """Read ``alpha_engine_asset_risk_override:<instrument>`` (JSON ``{"max_allowable_spread", "max_position_size"}``, written by Asset Universe Control).
+
+        ``None`` = no override (key absent, or no Redis client). A limit is only set when its value parses to a finite number > 0 (the page documents
+        ``max_position_size = 0`` as "no override"). **Fails closed**, like the per-asset kill switch: an unreadable key, a Redis error or a payload that
+        cannot be parsed raises :class:`AssetRiskOverrideUnreadableError`, and the callers refuse the entry: an operator's risk limit that cannot be read
+        must not silently mean "no limit".
+        """
+        if self._redis_client is None:
+            return None
+        try:
+            raw = await asyncio.wait_for(
+                self._redis_client.execute("get", f"{ALPHA_ENGINE_ASSET_RISK_OVERRIDE_REDIS_KEY_PREFIX}{instrument}"), timeout=2.0
+            )
+        except (RedisUnavailableError, asyncio.TimeoutError) as exc:
+            raise AssetRiskOverrideUnreadableError("redis unavailable") from exc
+        if raw is None:
+            return None
+        try:
+            payload = json.loads(raw)
+            if not isinstance(payload, dict):
+                raise TypeError("payload is not an object")
+            limits: dict[str, float | None] = {}
+            for key in ("max_allowable_spread", "max_position_size"):
+                value = float(payload.get(key, 0.0))
+                if not math.isfinite(value) or value < 0:
+                    raise ValueError(f"{key} must be finite and >= 0")
+                limits[key] = value if value > 0 else None
+        except (TypeError, ValueError) as exc:
+            raise AssetRiskOverrideUnreadableError("malformed override payload") from exc
+        return AssetRiskOverride(limits["max_allowable_spread"], limits["max_position_size"])
+
     async def _is_onchain_tsunami_lock_active(self) -> bool:
         """Real check of :data:`ONCHAIN_TSUNAMI_LOCK_REDIS_KEY` -- "Protocole Fort Knox" (2026-09-17).
 
@@ -2428,6 +2473,25 @@ class ExecutionAgent(BaseAgent):
             )
             gates.extend(self._pending_gates(3, "Non evalue -- Porte 8 (Control State) a rejete en premier."))
             gates[-1] = GateResult(8, _GATE_NAMES[7], "FAILED", "ASSET OFF -- kill switch par actif (Asset Universe Control).")
+            report = GateReport(instrument, direction, time.time(), tuple(gates), "REJECTED")
+            await self._publish_gate_report(report)
+            return report, None, None, 0.0
+
+        # Per-asset risk override (Asset Universe Control), entries only: refuse when the live spread exceeds the operator's ceiling for this instrument.
+        # The size cap is applied in calculate_position_size. An unreadable override refuses the entry (fail closed), see _read_asset_risk_override.
+        try:
+            override = await self._read_asset_risk_override(instrument)
+        except AssetRiskOverrideUnreadableError as exc:
+            override_failure: str | None = f"override de risque illisible ({exc}) -- entree refusee par precaution."
+        else:
+            override_failure = None
+            live_spread = self._last_spreads.get(instrument)
+            if override is not None and override.max_spread is not None and live_spread is not None and live_spread > override.max_spread:
+                override_failure = f"spread courant {live_spread:.6f} > plafond d'override {override.max_spread:.6f} (Asset Universe Control)."
+        if override_failure is not None:
+            self._log.warning("consensus_entry_skipped_asset_risk_override", agent_id=self.agent_id, instrument=instrument, detail=override_failure)
+            gates.extend(self._pending_gates(3, "Non evalue -- Porte 8 (Control State) a rejete en premier."))
+            gates[-1] = GateResult(8, _GATE_NAMES[7], "FAILED", f"ASSET RISK OVERRIDE -- {override_failure}")
             report = GateReport(instrument, direction, time.time(), tuple(gates), "REJECTED")
             await self._publish_gate_report(report)
             return report, None, None, 0.0
@@ -3230,6 +3294,16 @@ class ExecutionAgent(BaseAgent):
         if capped_by_max_units:
             assert max_position_units is not None  # narrows for mypy; capped_by_max_units already guarantees this
             position_size = max_position_units
+
+        try:
+            asset_override = await self._read_asset_risk_override(instrument)
+        except AssetRiskOverrideUnreadableError:
+            self._log.warning("position_size_zero_asset_override_unreadable", agent_id=self.agent_id, instrument=instrument)
+            return 0.0  # an unreadable per-asset limit must not mean "no limit": size zero makes Gate 3 refuse the entry
+        if asset_override is not None and asset_override.max_units is not None and position_size > asset_override.max_units:
+            position_size = asset_override.max_units
+            capped_by_max_units = True
+            max_position_units = asset_override.max_units
 
         self._log.info(
             "position_size_calculated",
