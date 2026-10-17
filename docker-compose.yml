@@ -344,6 +344,11 @@ services:
       REDIS_HOST: redis-broker
       REDIS_PORT: "6379"
       REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD}
+      # Order Audit Trail (src/dashboard/ems_pages/audit_trail.py) queries TimescaleDB from THIS process. Without these two lines the dashboard used the
+      # default 127.0.0.1 (this container itself) and showed "TimescaleDB n'est pas joignable" while the database was healthy. User/password/database
+      # still come from the env_file above.
+      TIMESCALE_HOST: timescaledb
+      TIMESCALE_PORT: "5432"
       # This container's own copy of p2p_api.py's real internal client key (the P2P Premium
       # Scanner page sends it as X-API-Key against the now-authenticated production endpoint --
       # see src/dashboard/ems_pages/p2p_premium_scanner.py). Only this raw value lives here; only
@@ -352,6 +357,8 @@ services:
       P2P_API_INTERNAL_KEY: ${P2P_API_INTERNAL_KEY:-}
     depends_on:
       redis-broker:
+        condition: service_healthy
+      timescaledb:
         condition: service_healthy
     healthcheck:
       # Streamlit's own real built-in endpoint (verified live: GET
