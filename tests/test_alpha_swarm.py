@@ -226,3 +226,44 @@ async def test_swarm_run_does_not_push_to_redis_for_an_unknown_symbol(redis_clie
     assert result.rejected_reason is not None
     raw = await redis_client.execute("lrange", ALPHA_SWARM_PROPOSALS_REDIS_KEY, 0, -1)
     assert raw == []
+
+
+# =============================================================================
+# The isolated sandbox must still reach installed libraries (user-site installs, as in the Docker images)
+# =============================================================================
+
+
+def test_the_sandbox_gets_only_library_directories_never_the_project_or_the_cwd() -> None:
+    from pathlib import Path
+
+    from ai_agents.alpha_swarm import third_party_site_paths
+
+    paths = third_party_site_paths()
+    assert paths and all(Path(p).name in ("site-packages", "dist-packages") for p in paths)
+    project_root = str(Path(__file__).resolve().parents[1])
+    assert project_root not in paths and "" not in paths  # la stratégie générée ne doit pas pouvoir importer les modules du projet
+
+
+def test_the_harness_extends_the_path_before_importing_polars_and_the_parent_passes_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    import json
+    import subprocess
+
+    from ai_agents import alpha_swarm
+
+    template = alpha_swarm._HARNESS_TEMPLATE
+    assert template.index("sys.path.extend") < template.index("import polars")  # sans quoi `python -I` ne trouverait pas polars installé en user-site
+
+    seen: dict[str, str] = {}
+    real_run = subprocess.run
+
+    def spy(*args: object, **kwargs: object) -> object:
+        env = kwargs["env"]
+        assert isinstance(env, dict)
+        seen.update(env)
+        return real_run(*args, **kwargs)  # type: ignore[call-overload]
+
+    monkeypatch.setattr(subprocess, "run", spy)
+    hypothesis = Hypothesis(strategy_name="sma_crossover", rationale="test", generated_code=_STRATEGY_TEMPLATES["sma_crossover"], source="template_fallback")
+    result = run_backtest_in_sandbox(hypothesis, symbol="BTCUSDT", bar_interval="1m", timeout_seconds=60)
+    assert result.ok is True, result.error
+    assert json.loads(seen[alpha_swarm._SANDBOX_SITE_PATHS_ENV]) == alpha_swarm.third_party_site_paths()

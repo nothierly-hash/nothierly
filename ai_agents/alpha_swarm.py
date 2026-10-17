@@ -393,8 +393,13 @@ class BacktestResult(BaseModel):
     error: str | None = None
 
 
+_SANDBOX_SITE_PATHS_ENV: Final[str] = "NOTHIERLY_SANDBOX_SITE_PATHS"
+
 _HARNESS_TEMPLATE: Final[str] = '''
-import sys, json
+import os, sys, json
+# `python -I` ignores PYTHONPATH and the user site, so a package installed with `pip --user` (the Docker image's layout) would not import. The parent passes
+# its third-party site-packages directories (libraries only: never the project root or the working directory) through this plain environment variable.
+sys.path.extend(json.loads(os.environ.get("NOTHIERLY_SANDBOX_SITE_PATHS", "[]")))
 import polars as pl
 
 {strategy_code}
@@ -480,6 +485,16 @@ def _load_real_price_bars(symbol: str, *, bar_interval: str = "1m") -> Any:
 _BAR_INTERVAL_PERIODS_PER_YEAR: Final[dict[str, int]] = {"1m": 525_600, "5m": 105_120, "1h": 8_760}
 
 
+def third_party_site_paths() -> list[str]:
+    """The parent's installed-library directories (``site-packages``/``dist-packages`` only), for the isolated sandbox subprocess.
+
+    Deliberately narrow: the project root, the working directory and any ``PYTHONPATH`` entry are NOT included, so the sandboxed strategy still cannot import
+    the project's own modules. Only the installed third-party libraries (polars, numpy...) become importable, which ``python -I`` otherwise hides whenever they
+    live in a user site (``pip install --user``, as in this project's Docker images).
+    """
+    return [entry for entry in sys.path if entry and os.path.basename(entry.rstrip("/\\")) in ("site-packages", "dist-packages")]
+
+
 def run_backtest_in_sandbox(
     hypothesis: Hypothesis, *, symbol: str = "BTCUSDT", bar_interval: str = "1m", timeout_seconds: float = 30.0
 ) -> BacktestResult:
@@ -528,10 +543,12 @@ def run_backtest_in_sandbox(
         harness_path.write_text(harness_source, encoding="utf-8")
         bars.write_parquet(data_path)
 
+        sandbox_env = os.environ.copy()
+        sandbox_env[_SANDBOX_SITE_PATHS_ENV] = json.dumps(third_party_site_paths())
         try:
             completed = subprocess.run(
                 [sys.executable, "-I", str(harness_path), str(data_path)],
-                capture_output=True, text=True, timeout=timeout_seconds, cwd=tmp_dir, env=os.environ.copy(),
+                capture_output=True, text=True, timeout=timeout_seconds, cwd=tmp_dir, env=sandbox_env,
             )
         except subprocess.TimeoutExpired:
             _log.warning("alpha_swarm_backtest_sandbox_timeout", strategy_name=hypothesis.strategy_name)
