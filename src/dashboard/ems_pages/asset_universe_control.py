@@ -11,8 +11,9 @@ already gates every real cycle on (see that module's docstring point 14).
 **What is actually wired (2026-10, verified in the code)**: the per-asset **kill switch** (``ALPHA_ENGINE_ASSET_STATUS_REDIS_KEY_PREFIX``) is now read
 by :class:`~src.agents.execution.agent.ExecutionAgent`'s entry gates (Gate 8, ``_is_asset_disabled``): an ``OFF`` asset refuses every NEW entry, and never
 blocks the exit of an open position. It fails closed (an unreadable key refuses the entry). **Not wired**: the dynamic **risk override**
-(``ALPHA_ENGINE_ASSET_RISK_OVERRIDE_REDIS_KEY_PREFIX``) is still read by nothing, and ``AlphaMarketMakerAgent`` still ignores both keys; the page says so
-next to each control instead of implying otherwise.
+(``ALPHA_ENGINE_ASSET_RISK_OVERRIDE_REDIS_KEY_PREFIX``) is now ALSO read by ``ExecutionAgent``: a spread ceiling refuses new entries (Gate 8) and a size cap
+bounds Gate 3's sizing (the stricter of it and the global cap wins); both are entries-only and fail closed on an unreadable override. ``AlphaMarketMakerAgent``
+still ignores both keys; the page says so next to each control instead of implying otherwise.
 
 The text below predates that wiring and still describes the original gap for both keys:
 
@@ -68,7 +69,7 @@ st.caption(
 )
 st.info(
     "**État du câblage.** ✅ Le kill-switch par actif est lu par l'agent d'exécution : un actif sur OFF n'accepte plus de nouvelle entrée "
-    "(les sorties restent toujours possibles). ❌ L'override de risque (spread/taille) n'est lu par aucun moteur. "
+    "(les sorties restent toujours possibles). ✅ L'override de risque (spread/taille) est lu par l'agent d'exécution (nouvelles entrées seulement). "
     "❌ L'Alpha Market Maker ne lit encore aucun de ces deux réglages.",
     icon="ℹ️",
 )
@@ -196,10 +197,9 @@ for snap in snapshots:
         st.caption(f"Session : {snap.session_status} · fenêtre hebdomadaire réelle (voir `core/session_manager.py`).")
 
         # ---- Override de risque dynamique -- lit tout override déjà écrit, sinon retombe sur la config statique du registre.
-        st.warning(
-            "⚠️ **Override de risque : pas encore câblé.** Ces valeurs sont enregistrées dans Redis, mais aucun moteur ne les lit : "
-            "elles ne modifient aujourd'hui ni le spread maximal ni la taille de position réellement appliqués.",
-            icon="⚠️",
+        st.caption(
+            "✅ Lu par l'agent d'exécution : un spread courant au-dessus du plafond refuse toute NOUVELLE entrée, et la taille de position max plafonne la taille calculée "
+            "(0 = pas de plafond). Les sorties ne sont jamais bloquées. ⚠️ L'Alpha Market Maker ne lit pas encore ce réglage."
         )
         existing_override = safe_get_json(r, f"{ALPHA_ENGINE_ASSET_RISK_OVERRIDE_REDIS_KEY_PREFIX}{snap.symbol}")
         default_spread = float(existing_override["max_allowable_spread"]) if existing_override else float(entry.max_allowable_spread)
