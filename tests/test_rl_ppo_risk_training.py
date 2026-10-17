@@ -442,3 +442,21 @@ async def test_the_agent_kill_switch_stops_a_buy_hungry_policy_in_a_toxic_market
     await _set_vpin(agent, 0.97)
     await agent._run_signal_cycle()
     assert [s["signal"] for s in sent] == [1, 0]  # sain : elle achète ; toxique : plus d'ouverture (HOLD)
+
+
+def test_an_archive_mixing_bucket_sizes_is_refused_unless_one_size_is_chosen(tmp_path: Path) -> None:
+    """Deux VPIN de seaux differents ne se comparent pas : le melange silencieux est interdit, le choix explicite filtre."""
+    archive = VpinArchive(tmp_path / "mixed.sqlite3")
+    for i in range(5):  # ancien seau de 100 000 : VPIN sature
+        archive.submit(BucketRecord("BTCUSDT", 1_000_000 + i * 1000, Decimal("0.95"), Decimal(60), Decimal(40), Decimal(100_000), 50))
+    for i in range(5):  # nouveau seau de 5 M : VPIN etale
+        archive.submit(BucketRecord("BTCUSDT", 2_000_000 + i * 1000, Decimal("0.40"), Decimal(60), Decimal(40), Decimal(5_000_000), 50))
+    assert archive.close() == 0
+    with pytest.raises(ValueError, match="plusieurs tailles de seau"):
+        tp.load_vpin_series(tmp_path / "mixed.sqlite3", "BTCUSDT", 0.0, 10_000.0)
+    times, values = tp.load_vpin_series(tmp_path / "mixed.sqlite3", "BTCUSDT", 0.0, 10_000.0, bucket_size=5_000_000)
+    assert len(times) == 5 and set(values.tolist()) == {0.4}
+    _, old = tp.load_vpin_series(tmp_path / "mixed.sqlite3", "BTCUSDT", 0.0, 10_000.0, bucket_size=100_000)
+    assert set(old.tolist()) == {0.95}
+    with pytest.raises(ValueError, match="aucun VPIN"):
+        tp.load_vpin_series(tmp_path / "mixed.sqlite3", "BTCUSDT", 0.0, 10_000.0, bucket_size=123)

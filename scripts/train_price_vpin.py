@@ -114,7 +114,9 @@ def run(args: argparse.Namespace) -> int:
     loaded = np.load(args.bars)
     bars = {k: loaded[k] for k in ("bar_end_s", "close", "buy_notional", "sell_notional")}
     symbol = args.symbol or str(loaded["symbol"])
-    times, values = tp.load_vpin_series(args.vpin_db, symbol, float(bars["bar_end_s"][0]) - 7200.0, float(bars["bar_end_s"][-1]) + 60.0)
+    times, values = tp.load_vpin_series(
+        args.vpin_db, symbol, float(bars["bar_end_s"][0]) - 7200.0, float(bars["bar_end_s"][-1]) + 60.0, args.vpin_bucket_size
+    )
     data = prepare_dataset(bars, times, values)
     train, val, test = chronological_split(len(data.prices), (args.train_frac, args.val_frac, args.test_frac), args.embargo_bars)
     mean, std = normalization(data, train)
@@ -168,6 +170,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--bars", type=Path, required=True)
     parser.add_argument("--vpin-db", type=Path, required=True)
     parser.add_argument("--symbol", default=None, help="défaut : celui du fichier de barres")
+    parser.add_argument("--vpin-bucket-size", type=float, default=None, help="taille de seau (USDT) à utiliser ; obligatoire si l'archive en mélange plusieurs")
     parser.add_argument("--train-frac", type=float, default=0.6)
     parser.add_argument("--val-frac", type=float, default=0.2)
     parser.add_argument("--test-frac", type=float, default=0.2)

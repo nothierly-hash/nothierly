@@ -509,7 +509,7 @@ def test_the_command_line_builds_the_documented_defaults(monkeypatch: pytest.Mon
     assert isinstance(seen["feed"], BinanceAggTradeFeed) and isinstance(seen["sink"], vt.LogOnlySink) and seen["ran"]
     assert sorted(seen["calcs"]) == ["BTCUSDT", "ETHUSDT"]
     calc = seen["calcs"]["BTCUSDT"]
-    assert (calc.bucket_size, calc.window_size) == (D(100_000), 50)  # VOLUME_BUCKET_SIZE et WINDOW_SIZE par défaut
+    assert (calc.bucket_size, calc.window_size) == (D(5_000_000), 50)  # VOLUME_BUCKET_SIZE et WINDOW_SIZE par défaut
     custom = _run_cli(monkeypatch, "--dry-run", "--source", "hyperliquid", "--symbols", "btcusdt", "--bucket-size", "5000", "--window", "20")
     assert isinstance(custom["feed"], HyperliquidTradesFeed) and custom["calcs"]["BTCUSDT"].window_size == 20 and custom["calcs"]["BTCUSDT"].bucket_size == D(5000)
     bybit = _run_cli(monkeypatch, "--dry-run", "--source", "bybit", "--network", "testnet")

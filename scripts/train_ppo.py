@@ -444,10 +444,15 @@ VPIN_MAX_AGE_S: float = 600.0
 MIN_TRAINING_ROWS: int = 200
 
 
-def load_vpin_series(path: Path, symbol: str, start_s: float, end_s: float) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+def load_vpin_series(
+    path: Path, symbol: str, start_s: float, end_s: float, bucket_size: float | None = None
+) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
     """Séries ``(instants en secondes, VPIN)`` de ``symbol`` dans ``[start_s, end_s]``, lues dans l'archive du tracker (lecture seule).
 
     Seuls les seaux dont ``vpin_value`` est connu (fenêtre pleine) sont retenus. ``symbol`` est comparé sans casse ni séparateurs (``BTC/USDT`` = ``BTCUSDT``).
+
+    **Taille de seau.** Deux VPIN calculés avec des seaux différents ne se comparent pas (un seau 50 fois plus petit sature l'indicateur). ``bucket_size`` ne garde que les
+    seaux de cette taille ; sans lui, une archive qui mélange plusieurs tailles pour ce symbole est REFUSÉE (``ValueError``) au lieu d'être mélangée en silence.
     """
     if not path.is_file():
         raise FileNotFoundError(f"archive VPIN introuvable : {path}")
@@ -455,12 +460,16 @@ def load_vpin_series(path: Path, symbol: str, start_s: float, end_s: float) -> t
     conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
     try:
         rows = conn.execute(
-            "SELECT timestamp_ms, symbol, vpin_value FROM vpin_buckets WHERE vpin_value IS NOT NULL AND timestamp_ms >= ? AND timestamp_ms <= ? ORDER BY timestamp_ms, id",
+            "SELECT timestamp_ms, symbol, vpin_value, bucket_size FROM vpin_buckets WHERE vpin_value IS NOT NULL AND timestamp_ms >= ? AND timestamp_ms <= ? ORDER BY timestamp_ms, id",
             (int(start_s * 1000), int(end_s * 1000)),
         ).fetchall()
     finally:
         conn.close()
-    kept = [(ts / 1000.0, float(v)) for ts, sym, v in rows if "".join(ch for ch in str(sym).upper() if ch.isalnum()) == wanted]
+    same_symbol = [(ts / 1000.0, float(v), float(size)) for ts, sym, v, size in rows if "".join(ch for ch in str(sym).upper() if ch.isalnum()) == wanted]
+    sizes = sorted({size for _, _, size in same_symbol})
+    if bucket_size is None and len(sizes) > 1:
+        raise ValueError(f"{symbol!r} : plusieurs tailles de seau dans l'archive ({', '.join(f'{x:,.0f}' for x in sizes)}) : indiquer laquelle utiliser (bucket_size), les mélanger fausserait le VPIN")
+    kept = [(t, v) for t, v, size in same_symbol if bucket_size is None or size == float(bucket_size)]
     if not kept:
         raise ValueError(f"aucun VPIN calculé pour {symbol!r} dans {path} sur cette fenêtre")
     times, values = zip(*kept)
@@ -503,6 +512,7 @@ async def _fetch_aligned_dataset(
     lookback_days: int,
     symbol: str,
     vpin_db: Path | None = None,
+    vpin_bucket_size: float | None = None,
 ) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], npt.NDArray[np.float64] | None]:
     """Fetch and align TimescaleDB data into ``(features, prices)`` arrays for ONE symbol.
 
@@ -566,7 +576,9 @@ async def _fetch_aligned_dataset(
     times_s: npt.NDArray[np.float64] = np.asarray(
         (pd.to_datetime(aligned["time"], utc=True) - pd.Timestamp("1970-01-01", tz="UTC")) / pd.Timedelta(seconds=1), dtype=np.float64
     )
-    vpin_times, vpin_values = load_vpin_series(vpin_db, symbol, float(times_s.min()) - 2 * VPIN_WINDOW_S - VPIN_MAX_AGE_S, float(times_s.max()))
+    vpin_times, vpin_values = load_vpin_series(
+        vpin_db, symbol, float(times_s.min()) - 2 * VPIN_WINDOW_S - VPIN_MAX_AGE_S, float(times_s.max()), vpin_bucket_size
+    )
     vpin_features, run = attach_vpin_features(times_s, vpin_times, vpin_values)
     _log.info("ppo_vpin_aligned", rows_total=len(features), rows_kept=run.stop - run.start,
               vpin_p50=float(np.percentile(vpin_values, 50)), vpin_p90=float(np.percentile(vpin_values, 90)), vpin_p99=float(np.percentile(vpin_values, 99)))
@@ -638,6 +650,7 @@ async def run_training_pipeline(
     config: PPOConfig | None = None,
     vpin_db: Path | None = None,
     risk_shaping: RiskShapingConfig | None = None,
+    vpin_bucket_size: float | None = None,
 ) -> Path:
     """Fetch data, train, export -- the full offline PPO pipeline.
 
@@ -655,7 +668,7 @@ async def run_training_pipeline(
         Path to the exported TorchScript ``.pt`` file.
     """
     shaping = risk_shaping if risk_shaping is not None else RiskShapingConfig()
-    features, prices, vpin_features = await _fetch_aligned_dataset(lookback_days, symbol, vpin_db)
+    features, prices, vpin_features = await _fetch_aligned_dataset(lookback_days, symbol, vpin_db, vpin_bucket_size)
     _log.info("ppo_dataset_ready", timesteps=len(features), uses_vpin=vpin_features is not None)
 
     base = config if config is not None else PPOConfig()
@@ -679,6 +692,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--value-loss", choices=["mse", "huber"], default="huber", help="Critic loss. Huber is robust to the rare extreme returns of fat-tailed stops.")
     parser.add_argument("--huber-delta", type=float, default=1.0)
     parser.add_argument("--vpin-db", type=Path, default=None, help="vpin_history.sqlite3 : adds VPIN, velocity and acceleration to the observation (9 values instead of 6).")
+    parser.add_argument("--vpin-bucket-size", type=float, default=None, help="only use VPIN buckets of this size (USDT notional). Required when the archive mixes several sizes for the symbol.")
     parser.add_argument("--vpin-threshold", type=float, default=0.7, help="VPIN above which holding a position is taxed.")
     parser.add_argument("--toxicity-weight", type=float, default=0.01, help="lambda of the toxicity tax (reward units per unit of VPIN excess); needs --vpin-db. 0 = off.")
     parser.add_argument("--safe-harbor-bonus", type=float, default=0.0, help="Reward for being flat while VPIN exceeds the threshold; needs --vpin-db.")
@@ -720,6 +734,7 @@ def main() -> None:
             config=PPOConfig(gamma=args.gamma, value_loss=args.value_loss, huber_delta=args.huber_delta),
             vpin_db=args.vpin_db,
             risk_shaping=_shaping_from_args(args),
+            vpin_bucket_size=args.vpin_bucket_size,
         )
     )
 

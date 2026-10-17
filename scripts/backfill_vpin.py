@@ -6,7 +6,7 @@
     python scripts/backfill_vpin.py --symbol BTCUSDT --start 2026-10-01 --end 2026-10-03 --download-dir data --yes-download
 
 **Même méthode que le tracker en direct** (``workers/market_data/vpin_tracker.py``) : la classe ``VolumeBucketVpin`` elle-même, mêmes seaux (``--bucket-size``,
-100 000 USDT par défaut) et même fenêtre (``--window``, 50), côté du PRENEUR = ``not is_buyer_maker`` (comme ``m == false`` dans le flux en direct), identifiants de
+5 000 000 USDT par défaut : 100 000 saturait le VPIN sur BTC, voir le tracker) et même fenêtre (``--window``, 50), côté du PRENEUR = ``not is_buyer_maker`` (comme ``m == false`` dans le flux en direct), identifiants de
 trade déjà vus ignorés, fenêtre remise à zéro après un trou de plus de ``--max-gap-s`` (30 s). Les seaux fermés sont écrits dans une archive SQLite de MÊME
 format que celle du tracker (``VpinArchive``), à part de l'archive en direct : l'historique sert à entraîner, les données du Shadow Run (postérieures) à tester.
 
@@ -47,7 +47,7 @@ from workers.market_data.vpin import VolumeBucketVpin  # noqa: E402
 from workers.market_data.vpin_archive import BucketRecord, VpinArchive  # noqa: E402
 
 BASE_URL: Final[str] = "https://data.binance.vision/data/futures/um/daily/aggTrades"
-DEFAULT_BUCKET_SIZE: Final[Decimal] = Decimal(100_000)
+DEFAULT_BUCKET_SIZE: Final[Decimal] = Decimal(5_000_000)
 DEFAULT_WINDOW: Final[int] = 50
 DEFAULT_MAX_GAP_S: Final[float] = 30.0
 BAR_S: Final[float] = 60.0

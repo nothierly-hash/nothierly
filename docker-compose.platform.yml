@@ -148,6 +148,9 @@ services:
 
   # VPIN en temps réel à partir des trades PUBLICS : aucune clé d'exchange, donc pas de platform.env. Écrit market:vpin:<SYMBOLE> dans
   # le Redis du moteur ; le moteur n'a ainsi aucun accès sortant. Un seul démon par symbole (Binance OU Hyperliquid, jamais les deux).
+  # Taille de seau VPIN (notionnel USDT). 100 000 etait ~1/114 000 du volume quotidien de BTCUSDT (~11 Md$/jour) : le VPIN sortait a 0,85 en moyenne, 98 % des seaux au-dessus
+  # de 0,7 -- un indicateur sature qui ne separe plus rien (mesure sur 28 jours reconstitues et sur 48 h d'archive en direct). 5 M$ : ~2 700 seaux/jour, moyenne 0,41, aucun
+  # seau au-dessus de 0,7. L'archive garde la taille de chaque seau : ne JAMAIS entrainer sur un melange (train_ppo/train_price_vpin exigent --vpin-bucket-size).
   nothierly-vpin-tracker:
     <<: *platform-hardening
     build: *platform-build
@@ -163,7 +166,7 @@ services:
       - BTCUSDT
       - ETHUSDT
       - --bucket-size
-      - "100000"
+      - "5000000"
       - --window
       - "50"
     environment:
@@ -178,6 +181,7 @@ services:
   # Même démon sur le flux PUBLIC d'Hyperliquid (aucune clé). Symboles = noms de pièces Hyperliquid (BTC, ETH) : la clé Redis (market:vpin:BTC) et la
   # colonne `symbol` de l'archive diffèrent de celles de Binance (BTCUSDT), donc aucun conflit avec le tracker ci-dessus. Flux non vérifié contre le
   # vrai serveur (voir le docstring de workers/market_data/vpin_tracker.py) : lire ses logs au premier démarrage.
+  # 1 M$ : volume ~4x plus faible que Binance, meme logique de dimensionnement (un seau toutes les ~1-2 min, ~1 500 a 2 700 seaux/jour). A recalibrer sur son archive.
   nothierly-vpin-tracker-hyperliquid:
     <<: *platform-hardening
     build: *platform-build
@@ -193,7 +197,7 @@ services:
       - BTC
       - ETH
       - --bucket-size
-      - "100000"
+      - "1000000"
       - --window
       - "50"
     environment:
@@ -208,6 +212,7 @@ services:
   # Même démon sur le flux PUBLIC linéaire de Bybit (perpétuels USDT, mainnet : lecture publique, aucune clé). --symbol-suffix BYBIT : sans lui, BTCUSDT de
   # Bybit écraserait celui de Binance (même clé Redis market:vpin:BTCUSDT, même colonne `symbol` de l'archive) ; ici : market:vpin:BTCUSDTBYBIT.
   # Flux non vérifié contre le vrai serveur (le format vient de la documentation Bybit v5) : lire ses logs au premier démarrage.
+  # 1 M$ : Bybit a ~1/4 du volume de Binance (cadence mesuree : 753 seaux/h sur ETH a 100 000), meme logique de dimensionnement. A recalibrer sur son archive.
   nothierly-vpin-tracker-bybit:
     <<: *platform-hardening
     build: *platform-build
@@ -225,7 +230,7 @@ services:
       - --symbol-suffix
       - BYBIT
       - --bucket-size
-      - "100000"
+      - "1000000"
       - --window
       - "50"
     environment:

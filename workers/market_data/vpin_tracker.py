@@ -1,6 +1,6 @@
 """Démon asynchrone : VPIN en temps réel à partir des trades publics, écrit dans Redis pour le moteur.
 
-    python -m workers.market_data.vpin_tracker --source binance --symbols BTCUSDT ETHUSDT --bucket-size 100000 --window 50
+    python -m workers.market_data.vpin_tracker --source binance --symbols BTCUSDT ETHUSDT --bucket-size 5000000 --window 50
 
 Aucune authentification : les flux de trades sont publics. Le démon n'a ni clé d'exchange ni droit de trading ; il lit un flux
 public et écrit une clé Redis (``market:vpin:<SYMBOLE>``, par exemple ``market:vpin:BTCUSDT`` = ``0.653421``). Il a besoin d'un
@@ -488,7 +488,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="VPIN en temps réel à partir des trades publics, écrit dans Redis (market:vpin:<SYMBOLE>).")
     parser.add_argument("--source", choices=["binance", "hyperliquid", "bybit"], default="binance")
     parser.add_argument("--symbols", nargs="+", default=["BTCUSDT", "ETHUSDT"], help="noms de clé Redis, ex. BTCUSDT (Hyperliquid : BTCUSDT -> pièce BTC)")
-    parser.add_argument("--bucket-size", type=Decimal, default=Decimal(100_000), help="notionnel d'un seau (VOLUME_BUCKET_SIZE)")
+    parser.add_argument("--bucket-size", type=Decimal, default=Decimal(5_000_000), help="notionnel d un seau (VOLUME_BUCKET_SIZE) ; 5 M$ convient a BTC/ETH sur Binance (100 000 sature le VPIN), ~1 M$ pour une place 4x moins liquide ; (VOLUME_BUCKET_SIZE)")
     parser.add_argument("--window", type=int, default=50, help="nombre de seaux de la moyenne glissante (WINDOW_SIZE)")
     parser.add_argument("--network", choices=["mainnet", "testnet"], default="mainnet", help="Hyperliquid et Bybit seulement")
     parser.add_argument("--ws-base-url", default=None, help="adresse WebSocket (Binance : base, sans /market ; Hyperliquid et Bybit : adresse complète)")
