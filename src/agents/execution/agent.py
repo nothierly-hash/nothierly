@@ -270,6 +270,7 @@ from core.quant_math import (
 )
 from core.redis_client import RedisUnavailableError
 from core.schemas import (
+    ALPHA_ENGINE_ASSET_STATUS_REDIS_KEY_PREFIX,
     EMERGENCY_HALT_TOPIC,
     HEARTBEAT_REDIS_KEY_PREFIX,
     ONCHAIN_TSUNAMI_LOCK_REDIS_KEY,
@@ -2303,6 +2304,29 @@ class ExecutionAgent(BaseAgent):
         """Every gate from ``from_number`` through 8, marked ``PENDING`` -- never silently ``PASSED``."""
         return [GateResult(n, _GATE_NAMES[n - 1], "PENDING", reason) for n in range(from_number, 9)]
 
+    async def _is_asset_disabled(self, instrument: str) -> bool:
+        """Real per-asset kill switch: is ``alpha_engine_asset_status:<instrument>`` set to ``OFF`` (written by the dashboard's Asset Universe Control)?
+
+        **Entries only.** It is consulted by :meth:`_validate_execution_gates`, never by an exit path: switching an asset OFF must stop NEW risk, never
+        trap an open position (the same rule as the RL action mask, where SELL is never masked).
+
+        **Fails closed, unlike the tsunami lock**: this key is an explicit operator decision, so "I could not read it" must not silently mean "it is ON".
+        A Redis error or timeout therefore refuses the entry (and is logged); only a genuinely absent key, or one set to anything but ``OFF``, lets it through.
+        No Redis client at all (a standalone agent with no persistence) means no switch was ever configured: not disabled.
+        """
+        if self._redis_client is None:
+            return False
+        try:
+            raw = await asyncio.wait_for(
+                self._redis_client.execute("get", f"{ALPHA_ENGINE_ASSET_STATUS_REDIS_KEY_PREFIX}{instrument}"), timeout=2.0
+            )
+        except (RedisUnavailableError, asyncio.TimeoutError):
+            self._log.warning("asset_kill_switch_unreadable_refusing_entry", agent_id=self.agent_id, instrument=instrument)
+            return True
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="replace")
+        return bool(raw == "OFF")
+
     async def _is_onchain_tsunami_lock_active(self) -> bool:
         """Real check of :data:`ONCHAIN_TSUNAMI_LOCK_REDIS_KEY` -- "Protocole Fort Knox" (2026-09-17).
 
@@ -2390,6 +2414,20 @@ class ExecutionAgent(BaseAgent):
             )
             gates.extend(self._pending_gates(3, "Non evalue -- Porte 8 (Control State) a rejete en premier."))
             gates[-1] = GateResult(8, _GATE_NAMES[7], "FAILED", "OFF -- rejet total (kill switch operateur sur cet agent).")
+            report = GateReport(instrument, direction, time.time(), tuple(gates), "REJECTED")
+            await self._publish_gate_report(report)
+            return report, None, None, 0.0
+
+        # Per-asset kill switch (Asset Universe Control): same Gate 8 reporting as OFF above, same reasoning (a real operator veto, checked before any
+        # price/balance lookup). Entries only -- see _is_asset_disabled.
+        if await self._is_asset_disabled(instrument):
+            self._log.warning(
+                "consensus_entry_skipped_asset_off",
+                agent_id=self.agent_id, instrument=instrument,
+                detail="This instrument's per-asset kill switch is OFF (Asset Universe Control) -- refusing every new entry on it.",
+            )
+            gates.extend(self._pending_gates(3, "Non evalue -- Porte 8 (Control State) a rejete en premier."))
+            gates[-1] = GateResult(8, _GATE_NAMES[7], "FAILED", "ASSET OFF -- kill switch par actif (Asset Universe Control).")
             report = GateReport(instrument, direction, time.time(), tuple(gates), "REJECTED")
             await self._publish_gate_report(report)
             return report, None, None, 0.0
