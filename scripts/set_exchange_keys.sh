@@ -16,11 +16,16 @@ case "$venue" in
   hyperliquid) fields=("HL_ACCOUNT_ADDRESS:visible:^0x[0-9a-fA-F]{40}$" "HL_AGENT_SECRET:secret:^(0x)?[0-9a-fA-F]{64}$") ;;
   bybit)       fields=("BYBIT_API_KEY:secret:^[A-Za-z0-9]{8,64}$" "BYBIT_API_SECRET:secret:^[A-Za-z0-9]{16,128}$") ;;
   binance)     fields=("BINANCE_API_KEY:secret:^[A-Za-z0-9]{16,128}$" "BINANCE_API_SECRET:secret:^[A-Za-z0-9]{16,128}$") ;;
-  *) echo "usage : $0 hyperliquid|bybit|binance" >&2; exit 2 ;;
+  # Flux de prix en LECTURE SEULE du moteur : ecrits dans .env (lu par nothierly-agents), avec l'interrupteur qui les active.
+  oanda)       fields=("OANDA_ACCOUNT_ID:visible:^[0-9]{3}-[0-9]{3}-[0-9]+-[0-9]{3}$" "OANDA_API_TOKEN:secret:^[A-Za-z0-9-]{20,100}$"); target=.env; switch="NOTHIERLY_FOREX_FEED=oanda" ;;
+  alpaca)      fields=("ALPACA_API_KEY:secret:^[A-Za-z0-9]{12,40}$" "ALPACA_API_SECRET:secret:^[A-Za-z0-9]{24,80}$"); target=.env; switch="NOTHIERLY_STOCK_FEED=alpaca" ;;
+  *) echo "usage : $0 hyperliquid|bybit|binance|oanda|alpaca" >&2; exit 2 ;;
 esac
+target="${target:-platform.env}"
+switch="${switch:-}"
 
 cd "$(dirname "$0")/.."
-[ -f platform.env ] || { echo "[keys] ÉCHEC : platform.env absent (lancer d'abord scripts/setup_shadow_env.sh)" >&2; exit 1; }
+[ -f "$target" ] || { echo "[keys] ÉCHEC : $target absent (lancer d'abord scripts/setup_shadow_env.sh)" >&2; exit 1; }
 
 set_var() {  # fichier clé valeur : remplace la ligne (sans sed : une clé peut contenir n'importe quel caractère)
   local tmp
@@ -31,7 +36,7 @@ set_var() {  # fichier clé valeur : remplace la ligne (sans sed : une clé peut
   rm -f "$tmp"
 }
 
-echo "[keys] plateforme : $venue (TESTNET uniquement). La saisie est masquée ; rien n'est affiché."
+echo "[keys] plateforme : $venue (TESTNET / PRACTICE / PAPER uniquement). La saisie est masquée ; rien n'est affiché."
 declare -A values=()
 for spec in "${fields[@]}"; do
   name="${spec%%:*}"; rest="${spec#*:}"; mode="${rest%%:*}"; pattern="${rest#*:}"
@@ -43,10 +48,11 @@ for spec in "${fields[@]}"; do
   values["$name"]="$value"
 done
 
-chmod 600 platform.env
+chmod 600 "$target"
 for spec in "${fields[@]}"; do
   name="${spec%%:*}"
-  set_var platform.env "$name" "${values[$name]}"
+  set_var "$target" "$name" "${values[$name]}"
 done
-echo "[keys] enregistré dans platform.env (droits 600) :"
+[ -z "$switch" ] || set_var "$target" "${switch%%=*}" "${switch#*=}"  # active le flux (non secret)
+echo "[keys] enregistré dans $target (droits 600) :"
 for spec in "${fields[@]}"; do echo "  ${spec%%:*}=<enregistré>"; done
