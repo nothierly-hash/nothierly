@@ -8,6 +8,14 @@ ASSET_UNIVERSE` and :class:`core.session_manager.MarketSessionManager` --
 the exact same registry and pure functions
 :class:`~src.agents.alpha_engine.agent.AlphaMarketMakerAgent` itself
 already gates every real cycle on (see that module's docstring point 14).
+**What is actually wired (2026-10, verified in the code)**: the per-asset **kill switch** (``ALPHA_ENGINE_ASSET_STATUS_REDIS_KEY_PREFIX``) is now read
+by :class:`~src.agents.execution.agent.ExecutionAgent`'s entry gates (Gate 8, ``_is_asset_disabled``): an ``OFF`` asset refuses every NEW entry, and never
+blocks the exit of an open position. It fails closed (an unreadable key refuses the entry). **Not wired**: the dynamic **risk override**
+(``ALPHA_ENGINE_ASSET_RISK_OVERRIDE_REDIS_KEY_PREFIX``) is still read by nothing, and ``AlphaMarketMakerAgent`` still ignores both keys; the page says so
+next to each control instead of implying otherwise.
+
+The text below predates that wiring and still describes the original gap for both keys:
+
 This page's per-asset kill switch and dynamic risk override, however,
 write to two **new** Redis keys
 (:data:`~core.schemas.ALPHA_ENGINE_ASSET_STATUS_REDIS_KEY_PREFIX`,
@@ -57,6 +65,12 @@ st.title("🌐 Asset Universe Control")
 st.caption(
     "Surveillance et bridage individuel de chaque actif du registre cross-asset -- "
     "Crypto, FX, Commodities. Un seul registre (`core/asset_universe.py`), zéro branche par actif."
+)
+st.info(
+    "**État du câblage.** ✅ Le kill-switch par actif est lu par l'agent d'exécution : un actif sur OFF n'accepte plus de nouvelle entrée "
+    "(les sorties restent toujours possibles). ❌ L'override de risque (spread/taille) n'est lu par aucun moteur. "
+    "❌ L'Alpha Market Maker ne lit encore aucun de ces deux réglages.",
+    icon="ℹ️",
 )
 
 r = get_redis_client()
@@ -166,7 +180,10 @@ for snap in snapshots:
         with toggle_col:
             new_on = st.toggle(
                 "Actif activé", value=snap.kill_switch_on, key=f"kill_switch_{snap.symbol}",
-                help="OFF : l'Alpha Engine rejette tout nouvel ordre sur cet actif (écrit un vrai état dans Redis).",
+                help=(
+                    "OFF : l'agent d'exécution (consensus RL + XGBoost) refuse toute NOUVELLE entrée sur cet actif (porte 8). "
+                    "Une position déjà ouverte n'est PAS fermée par ce bouton, et l'Alpha Market Maker ne lit pas encore cet état."
+                ),
             )
             if new_on != snap.kill_switch_on:
                 r.set(f"{ALPHA_ENGINE_ASSET_STATUS_REDIS_KEY_PREFIX}{snap.symbol}", "ON" if new_on else "OFF")
@@ -179,6 +196,11 @@ for snap in snapshots:
         st.caption(f"Session : {snap.session_status} · fenêtre hebdomadaire réelle (voir `core/session_manager.py`).")
 
         # ---- Override de risque dynamique -- lit tout override déjà écrit, sinon retombe sur la config statique du registre.
+        st.warning(
+            "⚠️ **Override de risque : pas encore câblé.** Ces valeurs sont enregistrées dans Redis, mais aucun moteur ne les lit : "
+            "elles ne modifient aujourd'hui ni le spread maximal ni la taille de position réellement appliqués.",
+            icon="⚠️",
+        )
         existing_override = safe_get_json(r, f"{ALPHA_ENGINE_ASSET_RISK_OVERRIDE_REDIS_KEY_PREFIX}{snap.symbol}")
         default_spread = float(existing_override["max_allowable_spread"]) if existing_override else float(entry.max_allowable_spread)
         default_position_size = float(existing_override["max_position_size"]) if existing_override else 0.0
