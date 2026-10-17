@@ -77,6 +77,7 @@ from src.agents.execution.reconciliation import ReconcilerConfig
 from src.agents.macro.agent import MacroAgent
 from src.agents.macro_order_execution.agent import MacroOrderExecutionAgent
 from src.agents.market_data.agent import MarketDataAgent
+from src.agents.market_data.quote_agent import AlpacaQuoteSource, OandaQuoteSource, QuoteMarketDataAgent, QuoteSource
 from src.agents.nlp.agent import NlpAgent
 from src.agents.rl_signal.agent import RlSignalAgent
 from src.agents.supervisor.agent import XgboostSignalAgent
@@ -241,6 +242,52 @@ def _resolve_rl_kill_switch_vpin(environ: Mapping[str, str] | None = None) -> fl
     return value
 
 
+_FOREX_FEED_ENV: Final[str] = "NOTHIERLY_FOREX_FEED"
+_STOCK_FEED_ENV: Final[str] = "NOTHIERLY_STOCK_FEED"
+_STOCK_SYMBOLS_ENV: Final[str] = "NOTHIERLY_STOCK_SYMBOLS"
+_DEFAULT_STOCK_SYMBOLS: Final[tuple[str, ...]] = ("AAPL", "MSFT", "SPY")
+_STOCK_SYMBOL_RE: Final[re.Pattern[str]] = re.compile(r"^[A-Z][A-Z.]{0,5}$")
+
+
+def _is_placeholder(value: str) -> bool:
+    """A value that is empty or one of this project's throw-away placeholders (``shadow-run-placeholder``, ``test-placeholder``...): never a real credential."""
+    lowered = value.strip().lower()
+    return not lowered or "placeholder" in lowered or lowered in ("changeme", "change_me")
+
+
+def _resolve_quote_sources(
+    environ: Mapping[str, str] | None = None, *, oanda_account_id: str = "", oanda_token: str = "", oanda_environment: str = "practice",
+) -> list[QuoteSource]:
+    """Live price feeds to start, from the environment: ``NOTHIERLY_FOREX_FEED=oanda`` (EUR_USD, XAU_USD) and ``NOTHIERLY_STOCK_FEED=alpaca`` (``NOTHIERLY_STOCK_SYMBOLS``).
+
+    Both are READ-ONLY market data. Off by default. Fail fast: an unknown feed name, a selected feed with missing or placeholder credentials, or an unreadable symbol list
+    raises ``ValueError`` (a feed that silently does not start would leave the pages empty with no explanation). Credentials are never echoed in an error.
+    """
+    env = os.environ if environ is None else environ
+    sources: list[QuoteSource] = []
+    forex = env.get(_FOREX_FEED_ENV, "").strip().lower()
+    if forex:
+        if forex != "oanda":
+            raise ValueError(f"{_FOREX_FEED_ENV}={forex!r} : seule la valeur 'oanda' est prise en charge")
+        if _is_placeholder(oanda_account_id) or _is_placeholder(oanda_token):
+            raise ValueError(f"{_FOREX_FEED_ENV}=oanda exige OANDA_ACCOUNT_ID et OANDA_API_TOKEN reels (compte practice gratuit) : valeurs vides ou fictives")
+        sources.append(OandaQuoteSource(oanda_account_id, oanda_token, list(_FOREX_INSTRUMENTS), environment=oanda_environment))
+    stock = env.get(_STOCK_FEED_ENV, "").strip().lower()
+    if stock:
+        if stock != "alpaca":
+            raise ValueError(f"{_STOCK_FEED_ENV}={stock!r} : seule la valeur 'alpaca' est prise en charge")
+        key, secret = env.get("ALPACA_API_KEY", ""), env.get("ALPACA_API_SECRET", "")
+        if _is_placeholder(key) or _is_placeholder(secret):
+            raise ValueError(f"{_STOCK_FEED_ENV}=alpaca exige ALPACA_API_KEY et ALPACA_API_SECRET reels (compte paper gratuit) : valeurs vides ou fictives")
+        raw = env.get(_STOCK_SYMBOLS_ENV, "").strip()
+        symbols = [item.strip().upper() for item in raw.split(",") if item.strip()] if raw else list(_DEFAULT_STOCK_SYMBOLS)
+        bad = [item for item in symbols if not _STOCK_SYMBOL_RE.match(item)]
+        if bad or not symbols:
+            raise ValueError(f"{_STOCK_SYMBOLS_ENV} : symbole illisible {bad[0]!r}" if bad else f"{_STOCK_SYMBOLS_ENV} : liste vide")
+        sources.append(AlpacaQuoteSource(key, secret, symbols))
+    return sources
+
+
 def _resolve_rl_policy_model_path(environ: Mapping[str, str] | None = None) -> Path | None:
     """The PPO policy to use (explicit environment path, else the newest ``ppo_policy_<timestamp>.pt``), or ``None`` for the untrained skeleton.
 
@@ -398,9 +445,13 @@ async def main() -> None:
     supervisor_model_path, supervisor_scaler_path = _resolve_supervisor_model_paths()
     rl_policy_model_path = _resolve_rl_policy_model_path()
     rl_kill_switch_vpin = _resolve_rl_kill_switch_vpin()
+    quote_sources = _resolve_quote_sources(
+        oanda_account_id=settings.oanda.account_id, oanda_token=settings.oanda.api_token.get_secret_value(), oanda_environment=settings.oanda.environment,
+    )
 
     agents: list[
         MarketDataAgent
+        | QuoteMarketDataAgent
         | MacroAgent
         | NlpAgent
         | XgboostSignalAgent
@@ -419,6 +470,10 @@ async def main() -> None:
                 manage_own_redis=False,
             )
             for crypto_symbol in _CRYPTO_INSTRUMENTS
+        ),
+        *(
+            QuoteMarketDataAgent(source, manage_own_signals=False, zmq_context=shared_zmq_context, manage_own_redis=False)
+            for source in quote_sources
         ),
         MacroAgent(
             manage_own_signals=False,
