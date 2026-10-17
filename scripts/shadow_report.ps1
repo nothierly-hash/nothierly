@@ -9,7 +9,8 @@
 param(
     [string]$ServerHost = "18.181.218.79",
     [string]$User = "ubuntu",
-    [string]$Key = "$env:USERPROFILE\.ssh\nothierly_dash"
+    [string]$Key = "$env:USERPROFILE\.ssh\nothierly_dash",
+    [double]$Hours = 24   # fenetre du bilan en heures ; 0 = toute l'archive
 )
 
 $ErrorActionPreference = "Stop"
@@ -31,6 +32,7 @@ function Invoke-Remote([string]$Label, [string]$Command) {
 
 Invoke-Remote "1/2 git pull" "git -C $repo pull origin red-team-audit"
 $run = "docker run --rm -v nothierly_shadow_data:/data -v ${repo}:/src:ro -w /src -e PYTHONDONTWRITEBYTECODE=1 -e NOTHIERLY_DATA_DIR=/data python:3.12-slim python -m workers.market_data.shadow_report --db /data/vpin_history.sqlite3"
-Invoke-Remote "2/2 rapport VPIN (lecture seule)" $run
+if ($Hours -gt 0) { $run += " --hours $Hours" }
+Invoke-Remote "2/2 rapport VPIN (lecture seule, fenetre : $Hours h)" $run
 Write-Host ""
 Write-Host "[rapport] termine. Copie-moi tout ce qui est affiche entre '== 2/2' et cette ligne." -ForegroundColor Green
