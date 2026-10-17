@@ -31,6 +31,13 @@ from sklearn.preprocessing import StandardScaler
 
 ROOT = Path(__file__).resolve().parents[1]
 
+# These tests inspect the repository itself (Dockerfile, .dockerignore, git's index). The CI test image holds only the code and the tests, not
+# those files, so there they would fail for a reason unrelated to the code under test: skip them when the files are absent.
+_needs_repo_files = pytest.mark.skipif(
+    not all((ROOT / name).exists() for name in ("Dockerfile", ".dockerignore", ".git")),
+    reason="needs the repository checkout (Dockerfile, .dockerignore, .git), absent from the CI test image",
+)
+
 
 def _load(name: str, relative: str) -> ModuleType:
     spec = importlib.util.spec_from_file_location(name, ROOT / relative)
@@ -239,6 +246,7 @@ def _dockerfile_copy_sources() -> list[tuple[str, str]]:
     return sources
 
 
+@_needs_repo_files
 def test_the_dockerfile_names_no_model_file_and_copies_the_directory() -> None:
     sources = _dockerfile_copy_sources()
     model_sources = [src for src, _ in sources if src.startswith("models")]
@@ -246,6 +254,7 @@ def test_the_dockerfile_names_no_model_file_and_copies_the_directory() -> None:
     assert not re.search(r"supervisor_(model|scaler)_\d", (ROOT / "Dockerfile").read_text(encoding="utf-8").replace("supervisor_model_<ts>", "").replace("supervisor_scaler_<ts>", ""))
 
 
+@_needs_repo_files
 @pytest.mark.parametrize("artifacts", [[], ["supervisor_model_20261014_120000.json", "supervisor_scaler_20261014_120000.pkl", "ppo_policy_20261014_120000.pt", "metalabel_weights.json", "metalabel_weights.meta.json"]])
 def test_the_models_copy_source_exists_in_the_build_context_with_or_without_any_model(artifacts: list[str]) -> None:
     """Contexte d'une copie fraîche du dépôt (seul ``models/.gitkeep`` suivi par git) puis avec des artefacts : la source du COPY existe, et seuls les
@@ -259,6 +268,7 @@ def test_the_models_copy_source_exists_in_the_build_context_with_or_without_any_
     assert "models/brouillon.bin" not in kept and "models/notes.txt" not in kept
 
 
+@_needs_repo_files
 def test_the_gitkeep_that_guarantees_the_directory_is_tracked_by_git() -> None:
     import subprocess
 
