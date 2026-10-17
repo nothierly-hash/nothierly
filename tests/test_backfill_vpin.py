@@ -158,3 +158,12 @@ def test_a_download_with_a_wrong_checksum_is_deleted(tmp_path: Path, monkeypatch
     with pytest.raises(ValueError, match="somme de contrôle"):
         bf.download_verified("https://x/fichier.zip", bad)
     assert not bad.exists()  # un fichier non vérifié n'est jamais conservé
+
+
+def test_a_fast_pass_never_loses_buckets_even_with_a_tiny_writer_queue(tmp_path: Path) -> None:
+    """Régression : la file de l'archive (50 000 par défaut) abandonne en silence quand elle est pleine ; l'historique doit attendre, pas perdre."""
+    rows = _rows(600, qty=60.0)  # un seau par ligne environ (6 000 USDT) : des centaines de seaux, bien plus que la file de test
+    archive = VpinArchive(tmp_path / "a.sqlite3", queue_size=4)
+    counters = bf.backfill(rows, symbol="BTCUSDT", archive=archive, bucket_size=Decimal(6_000), window=5)
+    assert archive.close() == 0 and archive.dropped == 0
+    assert counters["buckets"] > 200 and len(_archive_rows(tmp_path / "a.sqlite3")) == counters["buckets"]

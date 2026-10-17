@@ -30,6 +30,7 @@ import csv
 import hashlib
 import io
 import sys
+import time
 import urllib.request
 import zipfile
 from collections.abc import Iterable, Iterator, Sequence
@@ -143,6 +144,7 @@ def backfill(
     state: dict[str, int] | None = None,
 ) -> dict[str, int]:
     """Passe les lignes de trades (dans l'ordre) dans le calcul VPIN et les barres ; renvoie des compteurs. ``state`` permet d'enchaîner plusieurs fichiers."""
+    archive.start()  # le thread d'ecriture doit tourner : sans lui la file se remplit et la passe attend indefiniment (ou perdait les seaux avant l'attente)
     calc = VolumeBucketVpin(bucket_size, window)
     counters = state if state is not None else {}
     for key in ("trades", "skipped_ids", "bad_rows", "gaps", "buckets"):
@@ -173,7 +175,12 @@ def backfill(
             bars.add(time_ms, price, qty, is_buy)
         for reading in calc.add_trade(price, qty, is_buy, time_ms):
             counters["buckets"] += 1
-            archive.submit(BucketRecord(symbol, reading.closed_at_ms, reading.vpin, reading.buy_volume, reading.sell_volume, bucket_size, window))
+            record = BucketRecord(symbol, reading.closed_at_ms, reading.vpin, reading.buy_volume, reading.sell_volume, bucket_size, window)
+            # Contrairement au tracker en direct (qui ne doit jamais bloquer sa boucle et abandonne si la file est pleine), l'historique ATTEND : sans cette attente,
+            # une passe rapide perdrait presque tous ses seaux (file de 50 000) sans le dire.
+            while not archive.submit(record):
+                archive.dropped -= 1  # ce refus n'est pas une perte : on réessaie
+                time.sleep(0.001)
     counters["last_id"], counters["last_time_ms"] = last_id, last_time
     return counters
 
@@ -198,8 +205,8 @@ def run(
 
     counters = backfill(all_rows(), symbol=symbol, archive=archive, bucket_size=bucket_size, window=window, max_gap_s=max_gap_s, bars=bars)
     lost = archive.close()
-    if lost:
-        raise RuntimeError(f"{lost} seaux n'ont pas pu être écrits dans l'archive : sortie incomplète, relancer.")
+    if lost or archive.dropped:
+        raise RuntimeError(f"{lost + archive.dropped} seaux n'ont pas pu être écrits dans l'archive : sortie incomplète, relancer.")
     result = bars.result()
     arrays: dict[str, Any] = {"symbol": np.array(symbol), "bar_s": np.array(BAR_S), **result}
     np.savez_compressed(out_bars, **arrays)
